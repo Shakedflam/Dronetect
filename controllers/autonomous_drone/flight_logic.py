@@ -194,6 +194,7 @@ def navigation_disturbances(
     target: Position,
     yaw: float,
     horizontal_tolerance: float,
+    yaw_gain: float = 0.4,
 ) -> tuple[float, float]:
     """Return the yaw and forward-pitch commands for a horizontal target."""
     dx = target[0] - position[0]
@@ -204,7 +205,7 @@ def navigation_disturbances(
     desired_yaw = math.atan2(dy, dx)
     #normalize angle to [-pi, pi]
     angle_left = (desired_yaw - yaw + math.pi) % (2.0 * math.pi) - math.pi
-    yaw_command = 0.4 * angle_left / (2.0 * math.pi)
+    yaw_command = yaw_gain * angle_left / (2.0 * math.pi)
 
     # The drone sample pitches forward most strongly after it faces the target.
     alignment_command = math.log10(max(abs(angle_left), 1e-6))

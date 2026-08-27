@@ -143,10 +143,10 @@ def test_navigation_moves_forward_when_facing_a_distant_target():
 
 def test_boost_forward_pitch_uses_higher_forward_speed_gain():
     normal_pitch = -1.0
-    faster_pitch = boost_forward_pitch(normal_pitch, forward_speed_gain=1.8)
+    faster_pitch = boost_forward_pitch(normal_pitch, forward_speed_gain=3.2)
 
     assert faster_pitch < normal_pitch
-    assert faster_pitch == pytest.approx(-1.8)
+    assert faster_pitch == pytest.approx(-3.2)
 
 
 def test_navigation_turns_toward_a_target_to_the_left():
@@ -159,6 +159,25 @@ def test_navigation_turns_toward_a_target_to_the_left():
 
     assert yaw_command > 0.0
     assert pitch_command > -1.0
+
+
+def test_navigation_yaw_gain_makes_turns_more_decisive():
+    gentle_yaw, _ = navigation_disturbances(
+        position=(0.0, 0.0, 2.5),
+        target=(0.0, 5.0, 2.5),
+        yaw=0.0,
+        horizontal_tolerance=0.5,
+        yaw_gain=0.4,
+    )
+    stronger_yaw, _ = navigation_disturbances(
+        position=(0.0, 0.0, 2.5),
+        target=(0.0, 5.0, 2.5),
+        yaw=0.0,
+        horizontal_tolerance=0.5,
+        yaw_gain=1.2,
+    )
+
+    assert stronger_yaw == pytest.approx(gentle_yaw * 3.0)
 
 
 def test_navigation_stops_forward_motion_inside_target_tolerance():

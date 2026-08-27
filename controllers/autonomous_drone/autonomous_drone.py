@@ -52,7 +52,9 @@ class AutonomousDrone(Supervisor):
     #power increase to correct pitch (leaning forward or backward)
     K_PITCH_P = 30.0
     # Stronger forward pitch command during waypoint flight.
-    K_FORWARD_SPEED_GAIN = 1.8
+    K_FORWARD_SPEED_GAIN = 3.2
+    # Faster turns toward distant waypoints before forward flight begins.
+    K_NAVIGATION_YAW_GAIN = 1.2
 
     def __init__(self) -> None:
         super().__init__()
@@ -63,7 +65,7 @@ class AutonomousDrone(Supervisor):
                 x_bounds=(-60.0, -30.0),
                 y_bounds=(5.0, 20.0),
                 z_bounds=(13.0, 18.0),
-                horizontal_tolerance=0.75,
+                horizontal_tolerance=1.2,
                 vertical_tolerance=0.5,
                 landing_rate=1.0,
             )
@@ -152,6 +154,7 @@ class AutonomousDrone(Supervisor):
                 target,
                 yaw,
                 self.logic.config.horizontal_tolerance,
+                self.K_NAVIGATION_YAW_GAIN,
             )
             pitch_disturbance = boost_forward_pitch(
                 pitch_disturbance,
