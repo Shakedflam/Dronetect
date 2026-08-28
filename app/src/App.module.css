@@ -1,0 +1,11 @@
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+}
+
+.mapPane {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}

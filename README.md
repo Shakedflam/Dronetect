@@ -87,8 +87,39 @@ the project, run **Developer: Reload Window** from the VS Code command palette.
    of opening the HTML Robot Window in an external browser.
 11. Use **Simulation > Reset Simulation**, then press **Run**, to restart.
 
-After editing either Python file, save it and reset the simulation so Webots
-starts a fresh controller process.
+After editing controller Python files, save them and reset the simulation so
+Webots starts fresh controller processes.
+
+## Configure background actors
+
+The simulation includes autonomous non-Dronetect drones and birds so future
+camera-based detection can be tested against moving distractors. They are
+spawned by a separate scenario supervisor and use their own controllers; the
+Dronetect drone controller is not given their positions or types.
+
+Before starting or resetting Webots, edit:
+
+```text
+config\simulation_scenario.json
+```
+
+The default scenario starts three traffic drones and six birds already airborne:
+
+```json
+{
+  "traffic_drones": {
+    "count": 3
+  },
+  "birds": {
+    "count": 6
+  }
+}
+```
+
+Negative counts are treated as zero, and missing values fall back to the
+defaults above. Traffic drones use a pre-placed pool of 12 same-model Mavic2Pro
+nodes for reliable Webots visibility, so values above 12 require adding more
+pool nodes to the world. The main Dronetect drone still starts from the ground.
 
 ## Expected behavior
 

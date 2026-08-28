@@ -1,0 +1,37 @@
+/**
+ * Design tokens for the dark "command center" look. Kept as plain CSS
+ * variables (no CSS-in-JS, no Tailwind) so every component's CSS module can
+ * reference the same palette/spacing without extra tooling.
+ */
+:root {
+  /* surfaces */
+  --color-bg: #0b0f14;
+  --color-panel: rgba(15, 20, 27, 0.9);
+  --color-panel-border: rgba(255, 255, 255, 0.1);
+  --color-divider: #1c232c;
+  --color-divider-hover: #2a3542;
+
+  /* text */
+  --color-text: #e6edf3;
+  --color-text-muted: #8b98a5;
+
+  /* accents */
+  --color-accent-red: #ff4d4d;
+  --color-accent-amber: #ffb020;
+  --color-accent-green: #34d058;
+  --color-accent-blue: #4aa3ff;
+
+  /* fonts */
+  --font-ui: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Mono', 'Consolas', monospace;
+
+  /* spacing */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+
+  /* shape */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+}

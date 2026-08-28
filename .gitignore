@@ -65,6 +65,7 @@ android/.gradle/
 ios/Pods/
 *.apk
 *.ipa
+app/undefined/*
 
 # Drone/media artifacts
 flight_logs/

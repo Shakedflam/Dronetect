@@ -1,0 +1,62 @@
+.bar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  min-height: 72px;
+  padding: var(--space-sm) var(--space-lg);
+  background: var(--color-panel);
+  border-top: 1px solid var(--color-panel-border);
+}
+
+.contextualGroup {
+  display: flex;
+  gap: var(--space-sm);
+}
+
+.button {
+  min-width: 96px;
+  min-height: 48px;
+  padding: var(--space-sm) var(--space-lg);
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  color: var(--color-text);
+  transition: filter 0.15s ease, transform 0.05s ease;
+}
+
+.button:hover {
+  filter: brightness(1.1);
+}
+
+.button:active {
+  transform: scale(0.98);
+}
+
+.rth {
+  background: var(--color-accent-red);
+  border-color: var(--color-accent-red);
+  color: #1a0505;
+}
+
+.follow {
+  background: transparent;
+  border-color: var(--color-accent-green);
+  color: var(--color-accent-green);
+}
+
+.ignore {
+  background: transparent;
+  border-color: var(--color-text-muted);
+  color: var(--color-text-muted);
+}
+
+.engage {
+  background: var(--color-accent-amber);
+  border-color: var(--color-accent-amber);
+  color: #241a00;
+}

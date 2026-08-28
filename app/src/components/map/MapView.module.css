@@ -1,0 +1,145 @@
+.wrapper {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: var(--color-bg);
+}
+
+.map {
+  width: 100%;
+  height: 100%;
+  background: #0e1217;
+}
+
+.acquiring {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+}
+
+.droneIcon {
+  background: none;
+  border: none;
+}
+
+.droneIconDot {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--color-accent-red);
+  box-shadow: 0 0 6px rgba(255, 77, 77, 0.9);
+}
+
+.droneIconPulse {
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--color-accent-red);
+  opacity: 0.35;
+  animation: pulse 1.8s ease-out infinite;
+}
+
+@keyframes pulse {
+  0% {
+    transform: scale(0.4);
+    opacity: 0.5;
+  }
+  100% {
+    transform: scale(1.6);
+    opacity: 0;
+  }
+}
+
+.homeIcon {
+  background: none;
+  border: none;
+}
+
+.homeIconDot {
+  position: absolute;
+  top: -3px;
+  left: -3px;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--color-panel);
+  border: 1.5px solid var(--color-accent-green);
+  color: var(--color-accent-green);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.homeIconLabel {
+  position: absolute;
+  top: 22px;
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
+  background: var(--color-panel);
+  border: 1px solid var(--color-panel-border);
+  color: var(--color-accent-green);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+}
+
+.homeArrowIcon {
+  background: none;
+  border: none;
+}
+
+.homeArrowGlyph {
+  display: inline-block;
+  font-size: 16px;
+  line-height: 1;
+  color: #ffb020;
+  text-shadow: 0 0 4px rgba(255, 176, 32, 0.8);
+}
+
+.homeDistanceTooltip {
+  background: var(--color-panel) !important;
+  border: 1px solid var(--color-panel-border) !important;
+  color: #ffb020 !important;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  box-shadow: none !important;
+}
+
+.homeDistanceTooltip::before {
+  display: none;
+}
+
+.recenterButton {
+  position: absolute;
+  left: 50%;
+  bottom: var(--space-md);
+  transform: translateX(-50%);
+  z-index: 1000;
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-panel-border);
+  background: var(--color-panel);
+  color: var(--color-text);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.recenterButton:hover {
+  background: var(--color-divider-hover);
+}

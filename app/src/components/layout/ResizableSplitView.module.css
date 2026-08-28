@@ -1,0 +1,41 @@
+.container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.pane {
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.divider {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-divider);
+  cursor: row-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.divider:hover,
+.dividerActive {
+  background: var(--color-divider-hover);
+}
+
+.divider:focus-visible {
+  outline: 2px solid var(--color-accent-blue);
+  outline-offset: -2px;
+}
+
+.dividerGrip {
+  width: 48px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--color-text-muted);
+  opacity: 0.6;
+}
