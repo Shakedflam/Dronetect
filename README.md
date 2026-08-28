@@ -18,6 +18,12 @@ physical GPS, computer vision, or external autopilot stack.
   text shown in the top-right Webots overlay.
 - `controllers/autonomous_drone/world_markers.py` — home and target marker
   positioning in the Webots world.
+- `gateway/` — the local Edge Gateway WebSocket server and documented message
+  protocol used between drone adapters and tablet clients.
+- `adapters/simulator/` — the Webots simulator adapter that publishes
+  telemetry and receives gateway commands.
+- `services/` — shared backend helpers for GPS conversion, telemetry payloads,
+  and supported command names.
 - `tests/test_flight_logic.py` — deterministic tests that do not require Webots
   to be running.
 - `tests/test_hud.py` — HUD formatting and telemetry math tests.
@@ -90,6 +96,84 @@ the project, run **Developer: Reload Window** from the VS Code command palette.
 After editing controller Python files, save them and reset the simulation so
 Webots starts fresh controller processes.
 
+## Run the edge gateway
+
+Start the local gateway from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m gateway.server
+```
+
+By default it listens on:
+
+```text
+ws://127.0.0.1:8765/ws
+```
+
+Override the bind address with `DRONTECT_GATEWAY_HOST` and
+`DRONTECT_GATEWAY_PORT`. The simulator adapter can override its outbound URL
+with `DRONTECT_SIMULATOR_WS_URL`.
+
+Use the same `/ws` endpoint with a required role query parameter:
+
+```text
+ws://127.0.0.1:8765/ws?role=simulator
+ws://127.0.0.1:8765/ws?role=tablet
+```
+
+Only one simulator may be connected at a time. Multiple tablet clients may
+connect and receive telemetry.
+
+Simulator telemetry is broadcast to all connected tablet clients:
+
+```json
+{
+  "type": "telemetry",
+  "timestamp": 1720000000.123,
+  "source": "simulator",
+  "data": {
+    "gps": { "lat": 32.0853548, "lng": 34.7816696 },
+    "altitudeM": 14.8,
+    "headingDeg": 91.4,
+    "speedMps": 4.2,
+    "batteryPercent": 100,
+    "state": "FLYING_RANDOMLY"
+  }
+}
+```
+
+The simulator keeps Webots local meter coordinates internally. Before
+telemetry is sent, local `x` is converted to longitude, local `y` is converted
+to latitude, and local `z` is sent only as altitude. The WGS84 home point is
+`32.085300, 34.781800`.
+
+Tablet clients send commands through the gateway:
+
+```json
+{
+  "type": "command",
+  "commandId": "client-generated-id",
+  "command": "return_home",
+  "params": {}
+}
+```
+
+Supported commands are `return_home`, `new_mission`, `camera_tilt_up`, and
+`camera_tilt_down`. Accepted commands receive:
+
+```json
+{
+  "type": "command_ack",
+  "commandId": "client-generated-id",
+  "status": "accepted"
+}
+```
+
+Invalid messages receive structured errors with `type`, `code`, and `message`.
+Video streaming is not implemented yet; future WebRTC signaling and media relay
+belong under `gateway/webrtc/` while preserving this command and telemetry
+contract.
+
 ## Configure background actors
 
 The simulation includes autonomous non-Dronetect drones and birds so future
@@ -124,11 +208,13 @@ pool nodes to the world. The main Dronetect drone still starts from the ground.
 ## Expected behavior
 
 1. The drone waits at home for one second.
-2. It rises vertically to 15 metres so it clears the rural scenery.
+2. It rises quickly to 15 metres with DJI Mini 4 Pro-inspired climb authority
+   so it clears the rural scenery.
 3. It selects one random target over the manor/road area, within X `-60..-30`,
    Y `5..20`, and Z `13..18` metres.
-4. During horizontal flight it uses a modest forward-speed gain so it travels
-   faster without simply adding vertical motor power.
+4. During horizontal flight it uses a DJI Mini 4 Pro-inspired high-level
+   kinematic flight profile with bounded horizontal speed, acceleration, climb,
+   descent, and yaw rate instead of relying on raw motor-gain tuning.
 5. Reaching that target automatically starts Return Home.
 6. Pressing `H` replaces the active target with home early.
 7. Above home, it descends gradually, stops its motors, and enters `LANDED`.

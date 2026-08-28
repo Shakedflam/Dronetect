@@ -39,6 +39,24 @@ class FlightConfig:
     landed_height: float = 0.12
 
 
+@dataclass(frozen=True, slots=True)
+class KinematicFlightConfig:
+    max_horizontal_speed_mps: float = 14.0
+    horizontal_acceleration_mps2: float = 6.0
+    max_ascent_speed_mps: float = 5.0
+    max_descent_speed_mps: float = 3.0
+    max_yaw_rate_rad_s: float = math.radians(150.0)
+
+
+@dataclass(frozen=True, slots=True)
+class KinematicFlightStep:
+    position: Position
+    yaw: float
+    horizontal_speed_mps: float
+    speed_mps: float
+    vertical_speed_mps: float
+
+
 class FlightLogic:
     """Select targets and flight states without controlling motors directly."""
 
@@ -223,3 +241,103 @@ def boost_forward_pitch(
 
     gain = max(0.1, forward_speed_gain)
     return pitch_command * gain
+
+
+def ramp_command(current: float, target: float, max_delta: float) -> float:
+    """Move a command toward its target without exceeding one-step change."""
+    delta = target - current
+    if abs(delta) <= max_delta:
+        return target
+    return current + math.copysign(max_delta, delta)
+
+
+def advance_kinematic_flight(
+    *,
+    position: Position,
+    target: Position,
+    yaw: float,
+    horizontal_speed_mps: float,
+    dt: float,
+    config: KinematicFlightConfig | None = None,
+) -> KinematicFlightStep:
+    """Advance a DJI-like high-level flight model toward a target pose.
+
+    This intentionally controls position/yaw directly instead of raw propeller
+    thrust. It models the kind of bounded speed commands a real DJI adapter
+    would send to the aircraft's own flight controller.
+    """
+    if dt <= 0.0:
+        return KinematicFlightStep(position, yaw, horizontal_speed_mps, 0.0, 0.0)
+
+    cfg = config or KinematicFlightConfig()
+    dx = target[0] - position[0]
+    dy = target[1] - position[1]
+    dz = target[2] - position[2]
+    horizontal_distance = math.hypot(dx, dy)
+
+    desired_yaw = math.atan2(dy, dx) if horizontal_distance > 1e-9 else yaw
+    next_yaw = move_angle_toward(
+        yaw,
+        desired_yaw,
+        cfg.max_yaw_rate_rad_s * dt,
+    )
+
+    desired_horizontal_speed = min(
+        cfg.max_horizontal_speed_mps,
+        horizontal_distance / dt,
+    )
+    commanded_horizontal_speed = ramp_command(
+        horizontal_speed_mps,
+        desired_horizontal_speed,
+        cfg.horizontal_acceleration_mps2 * dt,
+    )
+    horizontal_step = min(horizontal_distance, commanded_horizontal_speed * dt)
+    if horizontal_distance > 1e-9:
+        next_x = position[0] + dx / horizontal_distance * horizontal_step
+        next_y = position[1] + dy / horizontal_distance * horizontal_step
+    else:
+        next_x = position[0]
+        next_y = position[1]
+
+    vertical_limit = (
+        cfg.max_ascent_speed_mps if dz >= 0.0 else cfg.max_descent_speed_mps
+    )
+    vertical_step = clamp_magnitude(dz, vertical_limit * dt)
+    next_position = (next_x, next_y, position[2] + vertical_step)
+    actual_horizontal_speed = horizontal_step / dt
+    vertical_speed_mps = vertical_step / dt
+    speed_mps = distance_3d(position, next_position) / dt
+
+    return KinematicFlightStep(
+        position=next_position,
+        yaw=next_yaw,
+        horizontal_speed_mps=actual_horizontal_speed,
+        speed_mps=speed_mps,
+        vertical_speed_mps=vertical_speed_mps,
+    )
+
+
+def move_angle_toward(current: float, target: float, max_delta: float) -> float:
+    delta = normalized_angle(target - current)
+    if abs(delta) <= max_delta:
+        return target
+    return current + math.copysign(max_delta, delta)
+
+
+def normalized_angle(angle: float) -> float:
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def clamp_magnitude(value: float, maximum_magnitude: float) -> float:
+    limit = max(0.0, maximum_magnitude)
+    if abs(value) <= limit:
+        return value
+    return math.copysign(limit, value)
+
+
+def distance_3d(first: Position, second: Position) -> float:
+    return math.sqrt(
+        (second[0] - first[0]) ** 2
+        + (second[1] - first[1]) ** 2
+        + (second[2] - first[2]) ** 2
+    )

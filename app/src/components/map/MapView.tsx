@@ -4,7 +4,7 @@ import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import type { Coordinates, DronePosition } from '../../types/drone';
 import { useLocation } from '../../hooks/useLocation';
-import { mockHome } from '../../mock/mockLocation';
+import { HOME_REFERENCE } from '../../config/homeReference';
 import { bearingDeg, euclideanDistanceMeters } from '../../utils/geo';
 import styles from './MapView.module.css';
 
@@ -98,9 +98,10 @@ function LiveTrackingControl({ position, home }: { position: DronePosition; home
 
 /**
  * Renders the interactive map and the drone's live position. Position comes
- * exclusively from useLocation()/LocationService — this component never
- * touches mock data directly, so pointing LocationService at real GPS later
- * requires no change here.
+ * exclusively from useLocation()/LocationService, which is backed by the
+ * live gateway connection — this component never touches mock data
+ * directly. The home marker is a static display anchor (HOME_REFERENCE),
+ * not live telemetry — see config/homeReference.ts.
  */
 export function MapView() {
   const position = useLocation();
@@ -113,11 +114,11 @@ export function MapView() {
     );
   }
 
-  const homeBearing = bearingDeg(position, mockHome);
-  const homeDistanceM = euclideanDistanceMeters(position, mockHome);
+  const homeBearing = bearingDeg(position, HOME_REFERENCE);
+  const homeDistanceM = euclideanDistanceMeters(position, HOME_REFERENCE);
   const arrowPosition: [number, number] = [
-    position.lat + (mockHome.lat - position.lat) * HOME_ARROW_T,
-    position.lng + (mockHome.lng - position.lng) * HOME_ARROW_T,
+    position.lat + (HOME_REFERENCE.lat - position.lat) * HOME_ARROW_T,
+    position.lng + (HOME_REFERENCE.lng - position.lng) * HOME_ARROW_T,
   ];
 
   return (
@@ -134,7 +135,7 @@ export function MapView() {
         <Polyline
           positions={[
             [position.lat, position.lng],
-            [mockHome.lat, mockHome.lng],
+            [HOME_REFERENCE.lat, HOME_REFERENCE.lng],
           ]}
           pathOptions={{ color: '#ffb020', weight: 2, dashArray: '6 6', opacity: 0.85 }}
         />
@@ -143,9 +144,9 @@ export function MapView() {
             {formatDistance(homeDistanceM)}
           </Tooltip>
         </Marker>
-        <Marker position={[mockHome.lat, mockHome.lng]} icon={homeIcon} />
+        <Marker position={[HOME_REFERENCE.lat, HOME_REFERENCE.lng]} icon={homeIcon} />
         <Marker position={[position.lat, position.lng]} icon={droneIcon} />
-        <LiveTrackingControl position={position} home={mockHome} />
+        <LiveTrackingControl position={position} home={HOME_REFERENCE} />
       </MapContainer>
     </div>
   );

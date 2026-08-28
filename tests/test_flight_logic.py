@@ -3,11 +3,14 @@ import random
 import pytest
 
 from controllers.autonomous_drone.flight_logic import (
+    advance_kinematic_flight,
     boost_forward_pitch,
     FlightConfig,
     FlightLogic,
     FlightState,
+    KinematicFlightConfig,
     navigation_disturbances,
+    ramp_command,
 )
 
 
@@ -147,6 +150,68 @@ def test_boost_forward_pitch_uses_higher_forward_speed_gain():
 
     assert faster_pitch < normal_pitch
     assert faster_pitch == pytest.approx(-3.2)
+
+
+def test_ramp_command_limits_single_step_change():
+    assert ramp_command(0.0, -6.0, 0.5) == pytest.approx(-0.5)
+    assert ramp_command(-5.8, -6.0, 0.5) == pytest.approx(-6.0)
+    assert ramp_command(-1.0, 1.0, 0.25) == pytest.approx(-0.75)
+
+
+def test_kinematic_flight_accelerates_toward_fast_horizontal_speed():
+    step = advance_kinematic_flight(
+        position=(0.0, 0.0, 15.0),
+        target=(100.0, 0.0, 15.0),
+        yaw=0.0,
+        horizontal_speed_mps=0.0,
+        dt=1.0,
+    )
+
+    assert step.position == pytest.approx((6.0, 0.0, 15.0))
+    assert step.horizontal_speed_mps == pytest.approx(6.0)
+    assert step.speed_mps == pytest.approx(6.0)
+
+
+def test_kinematic_flight_caps_horizontal_speed():
+    step = advance_kinematic_flight(
+        position=(0.0, 0.0, 15.0),
+        target=(100.0, 0.0, 15.0),
+        yaw=0.0,
+        horizontal_speed_mps=14.0,
+        dt=1.0,
+    )
+
+    assert step.position == pytest.approx((14.0, 0.0, 15.0))
+    assert step.horizontal_speed_mps == pytest.approx(14.0)
+
+
+def test_kinematic_flight_uses_dji_like_ascent_speed():
+    step = advance_kinematic_flight(
+        position=(0.0, 0.0, 0.0),
+        target=(0.0, 0.0, 15.0),
+        yaw=0.0,
+        horizontal_speed_mps=0.0,
+        dt=1.0,
+    )
+
+    assert step.position == pytest.approx((0.0, 0.0, 5.0))
+    assert step.speed_mps == pytest.approx(5.0)
+    assert step.vertical_speed_mps == pytest.approx(5.0)
+
+
+def test_kinematic_flight_turns_with_configured_yaw_rate():
+    config = KinematicFlightConfig(max_yaw_rate_rad_s=1.0)
+
+    step = advance_kinematic_flight(
+        position=(0.0, 0.0, 15.0),
+        target=(0.0, 100.0, 15.0),
+        yaw=0.0,
+        horizontal_speed_mps=0.0,
+        dt=0.25,
+        config=config,
+    )
+
+    assert step.yaw == pytest.approx(0.25)
 
 
 def test_navigation_turns_toward_a_target_to_the_left():

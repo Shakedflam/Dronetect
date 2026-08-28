@@ -7,15 +7,37 @@ interface ActionBarProps {
 }
 
 /**
- * Permanent control bar. RTH is always available. Follow/Ignore/Engage only
- * appear once the operator has selected a detected target (App owns that
- * selection state) — they act on whichever target is currently selected.
+ * Permanent control bar. RTH/New Mission/camera tilt are always available —
+ * these are the drone-wide commands the gateway currently supports.
+ * Follow/Ignore/Engage only appear once the operator has selected a
+ * detected target (App owns that selection state); they have no gateway
+ * equivalent yet and remain mocked.
  */
 export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps) {
   const hasSelection = selectedTargetId !== null;
 
   function handleReturnToHome() {
-    void droneCommandService.returnToHome();
+    droneCommandService.returnToHome().catch((error: unknown) => {
+      console.error('[ActionBar] returnToHome failed', error);
+    });
+  }
+
+  function handleNewMission() {
+    droneCommandService.newMission().catch((error: unknown) => {
+      console.error('[ActionBar] newMission failed', error);
+    });
+  }
+
+  function handleCameraTiltUp() {
+    droneCommandService.cameraTiltUp().catch((error: unknown) => {
+      console.error('[ActionBar] cameraTiltUp failed', error);
+    });
+  }
+
+  function handleCameraTiltDown() {
+    droneCommandService.cameraTiltDown().catch((error: unknown) => {
+      console.error('[ActionBar] cameraTiltDown failed', error);
+    });
   }
 
   function handleFollow() {
@@ -36,13 +58,36 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
 
   return (
     <div className={styles.bar}>
-      <button
-        type="button"
-        className={`${styles.button} ${styles.rth}`}
-        onClick={handleReturnToHome}
-      >
-        RTH
-      </button>
+      <div className={styles.primaryGroup}>
+        <button
+          type="button"
+          className={`${styles.button} ${styles.rth}`}
+          onClick={handleReturnToHome}
+        >
+          RTH
+        </button>
+        <button
+          type="button"
+          className={`${styles.button} ${styles.mission}`}
+          onClick={handleNewMission}
+        >
+          NEW MISSION
+        </button>
+        <button
+          type="button"
+          className={`${styles.button} ${styles.tilt}`}
+          onClick={handleCameraTiltUp}
+        >
+          TILT UP
+        </button>
+        <button
+          type="button"
+          className={`${styles.button} ${styles.tilt}`}
+          onClick={handleCameraTiltDown}
+        >
+          TILT DOWN
+        </button>
+      </div>
 
       {hasSelection && (
         <div className={styles.contextualGroup}>

@@ -10,6 +10,11 @@
   border-top: 1px solid var(--color-panel-border);
 }
 
+.primaryGroup {
+  display: flex;
+  gap: var(--space-sm);
+}
+
 .contextualGroup {
   display: flex;
   gap: var(--space-sm);
@@ -59,4 +64,16 @@
   background: var(--color-accent-amber);
   border-color: var(--color-accent-amber);
   color: #241a00;
+}
+
+.mission {
+  background: transparent;
+  border-color: var(--color-accent-green);
+  color: var(--color-accent-green);
+}
+
+.tilt {
+  background: transparent;
+  border-color: var(--color-text-muted);
+  color: var(--color-text-muted);
 }

@@ -14,6 +14,14 @@ function formatAltitude(altitudeM: number): string {
   return `${altitudeM.toFixed(0)} m`;
 }
 
+function formatBattery(percent: number): string {
+  return `${Math.round(percent)}%`;
+}
+
+function formatState(state: string): string {
+  return state.replace(/_/g, ' ');
+}
+
 function formatEta(etaSeconds: number): string {
   const minutes = Math.floor(etaSeconds / 60);
   const seconds = etaSeconds % 60;
@@ -37,7 +45,7 @@ function HudRow({ label, value }: HudRowProps) {
 /**
  * Compact telemetry readout overlaid on the map's top-right corner.
  * Position comes from useLocation() (GPS), everything else from
- * useTelemetry() — both are mock-backed for now but swap independently.
+ * useTelemetry() — both are backed by the live gateway connection.
  */
 export function DroneHUD() {
   const position = useLocation();
@@ -51,10 +59,16 @@ export function DroneHUD() {
         <>
           <HudRow label="SPEED" value={formatSpeed(telemetry.speedMps)} />
           <HudRow label="ALTITUDE" value={formatAltitude(telemetry.altitudeM)} />
+          <HudRow label="BATTERY" value={formatBattery(telemetry.batteryPercent)} />
+          <HudRow label="STATE" value={formatState(telemetry.state)} />
           <HudRow label="LATITUDE" value={formatCoordinate(position.lat)} />
           <HudRow label="LONGITUDE" value={formatCoordinate(position.lng)} />
-          <HudRow label="DESTINATION" value={telemetry.destinationName} />
-          <HudRow label="ETA" value={formatEta(telemetry.etaSeconds)} />
+          {telemetry.destinationName !== undefined && (
+            <HudRow label="DESTINATION" value={telemetry.destinationName} />
+          )}
+          {telemetry.etaSeconds !== undefined && (
+            <HudRow label="ETA" value={formatEta(telemetry.etaSeconds)} />
+          )}
         </>
       ) : (
         <div className={styles.connecting}>CONNECTING…</div>

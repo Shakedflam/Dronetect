@@ -12,18 +12,24 @@
 """Webots adapter for the autonomous generic-quadcopter proof of concept."""
 
 import math
+from pathlib import Path
+import sys
 from typing import cast
 
-from controller import Camera, GPS, Gyro, InertialUnit, Motor, Supervisor
+from controller import Camera, GPS, InertialUnit, Motor, Supervisor
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+from adapters.simulator.client import SimulatorGatewayClient
 from camera_control import CameraGimbal
 from flight_logic import (
-    boost_forward_pitch,
+    advance_kinematic_flight,
     FlightConfig,
     FlightLogic,
     FlightState,
+    KinematicFlightConfig,
     Position,
-    navigation_disturbances,
 )
 from hud import (
     HUD_STYLE,
@@ -32,6 +38,9 @@ from hud import (
     format_telemetry_hud,
     signed_angle_to_target_degrees,
 )
+from services.commands import CommandName
+from services.gps import LocalPosition
+from services.telemetry import build_simulator_telemetry
 from world_markers import WorldMarkers
 
 
@@ -41,20 +50,14 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
 
 
 class AutonomousDrone(Supervisor):
-    #power needed to hover
-    K_VERTICAL_THRUST = 68.5
-    #adds small upward bias- drone does not sink easily
-    K_VERTICAL_OFFSET = 0.6
-    #power increase when the drone is too low or too high
-    K_VERTICAL_P = 3.0
-    #power increase to correct roll
-    K_ROLL_P = 50.0
-    #power increase to correct pitch (leaning forward or backward)
-    K_PITCH_P = 30.0
-    # Stronger forward pitch command during waypoint flight.
-    K_FORWARD_SPEED_GAIN = 3.2
-    # Faster turns toward distant waypoints before forward flight begins.
-    K_NAVIGATION_YAW_GAIN = 1.2
+    K_VISUAL_PROPELLER_SPEED = 68.5
+    KINEMATIC_FLIGHT_CONFIG = KinematicFlightConfig(
+        max_horizontal_speed_mps=14.0,
+        horizontal_acceleration_mps2=6.0,
+        max_ascent_speed_mps=5.0,
+        max_descent_speed_mps=3.0,
+        max_yaw_rate_rad_s=math.radians(150.0),
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -72,14 +75,17 @@ class AutonomousDrone(Supervisor):
         )
 
         self.markers = WorldMarkers(self)
+        self.self_node = self.getSelf()
+        self.translation = self.self_node.getField("translation")
+        self.rotation = self.self_node.getField("rotation")
+        if self.translation is None or self.rotation is None:
+            raise RuntimeError("Autonomous drone requires translation and rotation fields.")
 
         self.camera = cast(Camera, self.getDevice("camera"))
         #orientation: roll, pitch, yaw
         self.imu = cast(InertialUnit, self.getDevice("inertial unit"))
         self.gps = cast(GPS, self.getDevice("gps"))
-        #angular velocity around roll, pitch, yaw axes
-        self.gyro = cast(Gyro, self.getDevice("gyro"))
-        for sensor in (self.camera, self.imu, self.gps, self.gyro):
+        for sensor in (self.camera, self.imu, self.gps):
             sensor.enable(self.time_step)
 
         self.keyboard = self.getKeyboard()
@@ -101,9 +107,12 @@ class AutonomousDrone(Supervisor):
 
         self._announced_state = None
         self._announced_random_target = None
-        self._previous_position: Position | None = None
         self._elapsed_time = 0.0
         self._last_hud_update_time = -1.0
+        self._horizontal_speed_mps = 0.0
+        self._kinematic_yaw: float | None = None
+        self.gateway_client = SimulatorGatewayClient()
+        self.gateway_client.start()
 
     def run(self) -> None:
         print(
@@ -120,18 +129,19 @@ class AutonomousDrone(Supervisor):
                 float(gps_values[2]),
             )
             roll, pitch, yaw = self.imu.getRollPitchYaw()
-            roll_rate, pitch_rate, _ = self.gyro.getValues()
-            speed_mps, vertical_speed_mps = self._update_motion_estimate(
-                position,
-                dt,
-            )
 
             if self.logic.home is None:
                 self.logic.initialize_home(position)
                 print(f"Home captured at {self._format_position(position)}")
 
             self._handle_keyboard(position)
+            self._handle_gateway_commands(position)
             self.logic.update(position, dt)
+            position, yaw, speed_mps, vertical_speed_mps = self._apply_kinematic_flight(
+                position,
+                yaw,
+                dt,
+            )
             self._update_markers()
             self._announce_changes()
             self._update_hud(
@@ -142,73 +152,12 @@ class AutonomousDrone(Supervisor):
                 pitch,
                 yaw,
             )
-
-            if self.logic.state in {FlightState.IDLE, FlightState.LANDED}:
-                self._stop_motors()
-                continue
-
-            target = self.logic.target
-            assert target is not None
-            yaw_input, pitch_disturbance = navigation_disturbances(
+            self._publish_gateway_telemetry(
                 position,
-                target,
+                speed_mps,
                 yaw,
-                self.logic.config.horizontal_tolerance,
-                self.K_NAVIGATION_YAW_GAIN,
             )
-            pitch_disturbance = boost_forward_pitch(
-                pitch_disturbance,
-                self.K_FORWARD_SPEED_GAIN,
-            )
-
-            roll_input = self.K_ROLL_P * clamp(roll, -1.0, 1.0) + roll_rate
-            pitch_input = (
-                self.K_PITCH_P * clamp(pitch, -1.0, 1.0)
-                + pitch_rate
-                + pitch_disturbance
-            )
-            #How far from target alltitude
-            altitude_error = clamp(
-                target[2] - position[2] + self.K_VERTICAL_OFFSET,
-                -1.0,
-                1.0,
-            )
-            vertical_input = self.K_VERTICAL_P * altitude_error**3
-
-            front_left = (
-                self.K_VERTICAL_THRUST
-                + vertical_input
-                - yaw_input
-                + pitch_input
-                - roll_input
-            )
-            front_right = (
-                self.K_VERTICAL_THRUST
-                + vertical_input
-                + yaw_input
-                + pitch_input
-                + roll_input
-            )
-            rear_left = (
-                self.K_VERTICAL_THRUST
-                + vertical_input
-                + yaw_input
-                - pitch_input
-                - roll_input
-            )
-            rear_right = (
-                self.K_VERTICAL_THRUST
-                + vertical_input
-                - yaw_input
-                - pitch_input
-                + roll_input
-            )
-            self._set_motor_velocities(
-                front_left,
-                -front_right,
-                -rear_left,
-                rear_right,
-            )
+            self._set_visual_motor_velocities()
 
     def _handle_keyboard(self, position: Position) -> None:
         key = self.keyboard.getKey()
@@ -232,6 +181,26 @@ class AutonomousDrone(Supervisor):
                 print(f"Camera pitch down: {pitch:.2f}")
             key = self.keyboard.getKey()
 
+    def _handle_gateway_commands(self, position: Position) -> None:
+        for message in self.gateway_client.drain_commands():
+            command = message["command"]
+            if command == CommandName.RETURN_HOME:
+                if self.logic.request_return_home():
+                    print("Gateway command return_home accepted.")
+                else:
+                    print(f"Gateway command return_home ignored while {self.logic.state.value}.")
+            elif command == CommandName.NEW_MISSION:
+                waypoint = self.logic.request_new_target(position)
+                print(f"Gateway command new_mission: {self._format_position(waypoint)}")
+            elif command == CommandName.CAMERA_TILT_UP:
+                pitch = self.camera_gimbal.tilt_up()
+                self.camera_pitch_motor.setPosition(pitch)
+                print(f"Gateway command camera_tilt_up: {pitch:.2f}")
+            elif command == CommandName.CAMERA_TILT_DOWN:
+                pitch = self.camera_gimbal.tilt_down()
+                self.camera_pitch_motor.setPosition(pitch)
+                print(f"Gateway command camera_tilt_down: {pitch:.2f}")
+
     def _update_markers(self) -> None:
         self.markers.update(
             self.logic.home,
@@ -254,19 +223,42 @@ class AutonomousDrone(Supervisor):
     def _stop_motors(self) -> None:
         self._set_motor_velocities(0.0, 0.0, 0.0, 0.0)
 
-    def _update_motion_estimate(
+    def _set_visual_motor_velocities(self) -> None:
+        speed = self.K_VISUAL_PROPELLER_SPEED
+        self._set_motor_velocities(speed, -speed, -speed, speed)
+
+    def _apply_kinematic_flight(
         self,
         position: Position,
+        yaw: float,
         dt: float,
-    ) -> tuple[float, float]:
-        previous = self._previous_position
-        self._previous_position = position
-        if previous is None or dt <= 0.0:
-            return (0.0, 0.0)
+    ) -> tuple[Position, float, float, float]:
+        if self._kinematic_yaw is None:
+            self._kinematic_yaw = yaw
 
+        if self.logic.state in {FlightState.IDLE, FlightState.LANDED}:
+            self._horizontal_speed_mps = 0.0
+            return (position, self._kinematic_yaw, 0.0, 0.0)
+
+        target = self.logic.target
+        assert target is not None
+        step = advance_kinematic_flight(
+            position=position,
+            target=target,
+            yaw=self._kinematic_yaw,
+            horizontal_speed_mps=self._horizontal_speed_mps,
+            dt=dt,
+            config=self.KINEMATIC_FLIGHT_CONFIG,
+        )
+        self.translation.setSFVec3f(list(step.position))
+        self.rotation.setSFRotation([0.0, 0.0, 1.0, step.yaw])
+        self._kinematic_yaw = step.yaw
+        self._horizontal_speed_mps = step.horizontal_speed_mps
         return (
-            distance_3d(previous, position) / dt,
-            (position[2] - previous[2]) / dt,
+            step.position,
+            step.yaw,
+            step.speed_mps,
+            step.vertical_speed_mps,
         )
 
     def _update_hud(
@@ -329,6 +321,24 @@ class AutonomousDrone(Supervisor):
             0,
             HUD_STYLE.font,
         )
+
+    def _publish_gateway_telemetry(
+        self,
+        position: Position,
+        speed_mps: float,
+        yaw: float,
+    ) -> None:
+        telemetry = build_simulator_telemetry(
+            position_local=LocalPosition(
+                x=position[0],
+                y=position[1],
+                z=position[2],
+            ),
+            heading_deg=(math.degrees(yaw) + 360.0) % 360.0,
+            speed_mps=speed_mps,
+            state=self.logic.state.value,
+        )
+        self.gateway_client.publish_telemetry(telemetry)
 
     def _set_motor_velocities(
         self,

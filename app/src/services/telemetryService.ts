@@ -1,22 +1,33 @@
 import type { TelemetryData } from '../types/drone';
-import { getMockTelemetry } from '../mock/mockTelemetry';
-import { createPollingSource, type Unsubscribe } from './internal/pollingSource';
+import { gatewayConnection } from './internal/gatewayConnection';
+import type { Unsubscribe } from './internal/pollingSource';
 
 /**
- * Abstraction over the flight-instrument readout (speed, altitude,
- * destination, ETA). Deliberately separate from LocationService — the HUD
- * combines both, but a real backend may well expose them on different
- * channels (e.g. telemetry over MQTT, GPS over its own link).
+ * Abstraction over the flight-instrument readout (speed, altitude, battery,
+ * state). Deliberately separate from LocationService — the HUD combines
+ * both, but they're conceptually distinct even though the gateway currently
+ * happens to send them on the same telemetry message.
+ *
+ * The gateway's telemetry payload has no destination/ETA concept, so those
+ * fields are simply never populated here — see `TelemetryData`.
  */
 export interface TelemetryService {
   subscribe(listener: (telemetry: TelemetryData) => void): Unsubscribe;
 }
 
-const POLL_INTERVAL_MS = 1000;
-
-function createMockTelemetryService(): TelemetryService {
-  const source = createPollingSource(getMockTelemetry, POLL_INTERVAL_MS);
-  return { subscribe: source.subscribe };
+function createGatewayTelemetryService(): TelemetryService {
+  return {
+    subscribe(listener) {
+      return gatewayConnection.subscribeTelemetry((message) => {
+        listener({
+          speedMps: message.data.speedMps,
+          altitudeM: message.data.altitudeM,
+          batteryPercent: message.data.batteryPercent,
+          state: message.data.state,
+        });
+      });
+    },
+  };
 }
 
-export const telemetryService: TelemetryService = createMockTelemetryService();
+export const telemetryService: TelemetryService = createGatewayTelemetryService();
