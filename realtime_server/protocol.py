@@ -1,4 +1,4 @@
-"""JSON message protocol for the Drontect edge gateway."""
+"""JSON message protocol for the Drontect realtime server."""
 
 from __future__ import annotations
 
@@ -14,9 +14,10 @@ MESSAGE_TYPE_COMMAND = "command"
 MESSAGE_TYPE_COMMAND_ACK = "command_ack"
 MESSAGE_TYPE_ERROR = "error"
 
+ROLE_DRONE = "drone"
 ROLE_SIMULATOR = "simulator"
 ROLE_TABLET = "tablet"
-SUPPORTED_ROLES = frozenset({ROLE_SIMULATOR, ROLE_TABLET})
+SUPPORTED_ROLES = frozenset({ROLE_DRONE, ROLE_SIMULATOR, ROLE_TABLET})
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,11 +55,13 @@ def encode_message(message: dict[str, Any]) -> str:
 
 
 def validate_role(role: str | None) -> str:
+    if role == ROLE_SIMULATOR:
+        return ROLE_DRONE
     if role in SUPPORTED_ROLES:
         return role
     raise ProtocolError(
         "invalid_role",
-        "WebSocket role must be 'simulator' or 'tablet'.",
+        "WebSocket role must be 'drone' or 'tablet'.",
         details={"role": role},
     )
 

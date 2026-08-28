@@ -21,7 +21,7 @@ from controller import Camera, GPS, InertialUnit, Motor, Supervisor
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from adapters.simulator.client import SimulatorGatewayClient
+from adapters.simulator.client import SimulatorRealtimeClient
 from camera_control import CameraGimbal
 from flight_logic import (
     advance_kinematic_flight,
@@ -111,8 +111,8 @@ class AutonomousDrone(Supervisor):
         self._last_hud_update_time = -1.0
         self._horizontal_speed_mps = 0.0
         self._kinematic_yaw: float | None = None
-        self.gateway_client = SimulatorGatewayClient()
-        self.gateway_client.start()
+        self.realtime_client = SimulatorRealtimeClient()
+        self.realtime_client.start()
 
     def run(self) -> None:
         print(
@@ -135,7 +135,7 @@ class AutonomousDrone(Supervisor):
                 print(f"Home captured at {self._format_position(position)}")
 
             self._handle_keyboard(position)
-            self._handle_gateway_commands(position)
+            self._handle_realtime_commands(position)
             self.logic.update(position, dt)
             position, yaw, speed_mps, vertical_speed_mps = self._apply_kinematic_flight(
                 position,
@@ -152,7 +152,7 @@ class AutonomousDrone(Supervisor):
                 pitch,
                 yaw,
             )
-            self._publish_gateway_telemetry(
+            self._publish_realtime_telemetry(
                 position,
                 speed_mps,
                 yaw,
@@ -181,25 +181,25 @@ class AutonomousDrone(Supervisor):
                 print(f"Camera pitch down: {pitch:.2f}")
             key = self.keyboard.getKey()
 
-    def _handle_gateway_commands(self, position: Position) -> None:
-        for message in self.gateway_client.drain_commands():
+    def _handle_realtime_commands(self, position: Position) -> None:
+        for message in self.realtime_client.drain_commands():
             command = message["command"]
             if command == CommandName.RETURN_HOME:
                 if self.logic.request_return_home():
-                    print("Gateway command return_home accepted.")
+                    print("Realtime command return_home accepted.")
                 else:
-                    print(f"Gateway command return_home ignored while {self.logic.state.value}.")
+                    print(f"Realtime command return_home ignored while {self.logic.state.value}.")
             elif command == CommandName.NEW_MISSION:
                 waypoint = self.logic.request_new_target(position)
-                print(f"Gateway command new_mission: {self._format_position(waypoint)}")
+                print(f"Realtime command new_mission: {self._format_position(waypoint)}")
             elif command == CommandName.CAMERA_TILT_UP:
                 pitch = self.camera_gimbal.tilt_up()
                 self.camera_pitch_motor.setPosition(pitch)
-                print(f"Gateway command camera_tilt_up: {pitch:.2f}")
+                print(f"Realtime command camera_tilt_up: {pitch:.2f}")
             elif command == CommandName.CAMERA_TILT_DOWN:
                 pitch = self.camera_gimbal.tilt_down()
                 self.camera_pitch_motor.setPosition(pitch)
-                print(f"Gateway command camera_tilt_down: {pitch:.2f}")
+                print(f"Realtime command camera_tilt_down: {pitch:.2f}")
 
     def _update_markers(self) -> None:
         self.markers.update(
@@ -322,7 +322,7 @@ class AutonomousDrone(Supervisor):
             HUD_STYLE.font,
         )
 
-    def _publish_gateway_telemetry(
+    def _publish_realtime_telemetry(
         self,
         position: Position,
         speed_mps: float,
@@ -338,7 +338,7 @@ class AutonomousDrone(Supervisor):
             speed_mps=speed_mps,
             state=self.logic.state.value,
         )
-        self.gateway_client.publish_telemetry(telemetry)
+        self.realtime_client.publish_telemetry(telemetry)
 
     def _set_motor_velocities(
         self,

@@ -18,11 +18,11 @@ export interface TelemetryData {
   altitudeM: number;
   /** Battery charge, 0-100. */
   batteryPercent: number;
-  /** Flight-state machine value from the gateway, e.g. IDLE, FLYING_RANDOMLY, RETURNING_HOME. */
+  /** Flight-state machine value from the realtime server, e.g. IDLE, FLYING_RANDOMLY, RETURNING_HOME. */
   state: string;
-  /** Mock-only field with no gateway equivalent; absent on live telemetry. */
+  /** Mock-only field with no realtime server equivalent; absent on live telemetry. */
   destinationName?: string;
-  /** Mock-only field with no gateway equivalent; absent on live telemetry. */
+  /** Mock-only field with no realtime server equivalent; absent on live telemetry. */
   etaSeconds?: number;
 }
 

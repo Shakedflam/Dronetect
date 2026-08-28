@@ -8,7 +8,7 @@ from queue import Empty, Queue
 from threading import Event, Thread
 from typing import Any
 
-from gateway.protocol import (
+from realtime_server.protocol import (
     encode_message,
     parse_json_message,
     validate_command_message,
@@ -16,20 +16,20 @@ from gateway.protocol import (
 
 try:
     from websockets.asyncio.client import connect
-except ImportError:  # The simulator should still fly if gateway deps are absent.
+except ImportError:  # The simulator should still fly if server deps are absent.
     connect = None
 
 
-DEFAULT_GATEWAY_URL = "ws://127.0.0.1:8765/ws?role=simulator"
+DEFAULT_SERVER_URL = "ws://127.0.0.1:8765/ws?role=drone"
 RECONNECT_DELAY_S = 1.0
 QUEUE_TIMEOUT_S = 0.1
 
 
-class SimulatorGatewayClient:
-    """Non-blocking gateway client for Webots' synchronous control loop."""
+class SimulatorRealtimeClient:
+    """Non-blocking realtime server client for Webots' synchronous loop."""
 
     def __init__(self, url: str | None = None) -> None:
-        self.url = url or os.getenv("DRONTECT_SIMULATOR_WS_URL", DEFAULT_GATEWAY_URL)
+        self.url = url or os.getenv("DRONTECT_SIMULATOR_WS_URL", DEFAULT_SERVER_URL)
         self._outgoing: Queue[dict[str, Any]] = Queue(maxsize=10)
         self._commands: Queue[dict[str, Any]] = Queue()
         self._stop = Event()
@@ -41,7 +41,7 @@ class SimulatorGatewayClient:
 
         self._thread = Thread(
             target=self._run_loop,
-            name="drontect-simulator-gateway-client",
+            name="drontect-simulator-realtime-client",
             daemon=True,
         )
         self._thread.start()

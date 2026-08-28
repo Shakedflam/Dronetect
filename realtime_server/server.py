@@ -1,4 +1,4 @@
-"""Local edge gateway WebSocket server."""
+"""Local realtime WebSocket server."""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ from urllib.parse import parse_qs, urlsplit
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
-from gateway.protocol import (
-    ROLE_SIMULATOR,
+from realtime_server.drone_sdk import DroneSdkConnection, WebSocketDroneSdkAdapter
+from realtime_server.protocol import (
+    ROLE_DRONE,
     ROLE_TABLET,
     ProtocolError,
     command_ack,
@@ -18,7 +19,6 @@ from gateway.protocol import (
     parse_json_message,
     validate_command_message,
     validate_role,
-    validate_telemetry_message,
 )
 
 
@@ -27,11 +27,11 @@ DEFAULT_PORT = 8765
 WS_PATH = "/ws"
 
 
-class EdgeGateway:
-    """Routes telemetry from one simulator to any connected tablet clients."""
+class RealtimeServer:
+    """Routes telemetry from one drone source to any connected tablet clients."""
 
     def __init__(self) -> None:
-        self.simulator: ServerConnection | None = None
+        self.drone: DroneSdkConnection | None = None
         self.tablets: set[ServerConnection] = set()
 
     async def handler(self, websocket: ServerConnection) -> None:
@@ -42,13 +42,20 @@ class EdgeGateway:
             await websocket.close(code=1008, reason=exc.code)
             return
 
-        if role == ROLE_SIMULATOR:
-            await self._handle_simulator(websocket)
+        if role == ROLE_DRONE:
+            await self._handle_drone(WebSocketDroneSdkAdapter(websocket))
         else:
             await self._handle_tablet(websocket)
 
     def _role_from_request(self, websocket: ServerConnection) -> str:
-        request_path = websocket.request.path
+        request = websocket.request
+        if request is None:
+            raise ProtocolError(
+                "missing_request",
+                "WebSocket handshake request is unavailable.",
+            )
+
+        request_path = request.path
         parsed = urlsplit(request_path)
         if parsed.path != WS_PATH:
             raise ProtocolError(
@@ -60,26 +67,24 @@ class EdgeGateway:
         role = query.get("role", [None])[0]
         return validate_role(role)
 
-    async def _handle_simulator(self, websocket: ServerConnection) -> None:
-        if self.simulator is not None and self.simulator is not websocket:
-            await websocket.send(
-                encode_message(
-                    ProtocolError(
-                        "simulator_already_connected",
-                        "Only one simulator connection is supported.",
-                    ).to_message()
+    async def _handle_drone(self, drone: DroneSdkConnection) -> None:
+        if self.drone is not None and self.drone is not drone:
+            await drone.send_error(
+                ProtocolError(
+                    "drone_already_connected",
+                    "Only one drone connection is supported.",
                 )
             )
-            await websocket.close(code=1008, reason="simulator_already_connected")
+            await drone.close(code=1008, reason="drone_already_connected")
             return
 
-        self.simulator = websocket
+        self.drone = drone
         try:
-            async for raw in websocket:
-                await self._route_simulator_message(str(raw))
+            async for telemetry in drone.iter_telemetry():
+                await self._route_drone_telemetry(telemetry)
         finally:
-            if self.simulator is websocket:
-                self.simulator = None
+            if self.drone is drone:
+                self.drone = None
 
     async def _handle_tablet(self, websocket: ServerConnection) -> None:
         self.tablets.add(websocket)
@@ -89,14 +94,7 @@ class EdgeGateway:
         finally:
             self.tablets.discard(websocket)
 
-    async def _route_simulator_message(self, raw: str) -> None:
-        try:
-            telemetry = validate_telemetry_message(parse_json_message(raw))
-        except ProtocolError as exc:
-            if self.simulator is not None:
-                await self.simulator.send(encode_message(exc.to_message()))
-            return
-
+    async def _route_drone_telemetry(self, telemetry: dict) -> None:
         await self._broadcast_to_tablets(encode_message(telemetry))
 
     async def _route_tablet_message(
@@ -110,12 +108,12 @@ class EdgeGateway:
             await tablet.send(encode_message(exc.to_message()))
             return
 
-        if self.simulator is None:
+        if self.drone is None:
             await tablet.send(
                 encode_message(
                     ProtocolError(
-                        "simulator_unavailable",
-                        "No simulator is connected to receive commands.",
+                        "drone_unavailable",
+                        "No drone is connected to receive commands.",
                         command_id=command["commandId"],
                     ).to_message()
                 )
@@ -123,14 +121,14 @@ class EdgeGateway:
             return
 
         try:
-            await self.simulator.send(encode_message(command))
+            await self.drone.send_command(command)
         except ConnectionClosed:
-            self.simulator = None
+            self.drone = None
             await tablet.send(
                 encode_message(
                     ProtocolError(
-                        "simulator_unavailable",
-                        "Simulator disconnected before receiving the command.",
+                        "drone_unavailable",
+                        "Drone disconnected before receiving the command.",
                         command_id=command["commandId"],
                     ).to_message()
                 )
@@ -149,17 +147,17 @@ class EdgeGateway:
         self.tablets.difference_update(disconnected)
 
 
-async def run_gateway(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
-    gateway = EdgeGateway()
-    async with serve(gateway.handler, host, port):
-        print(f"Drontect edge gateway listening on ws://{host}:{port}{WS_PATH}")
+async def run_realtime_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+    realtime_server = RealtimeServer()
+    async with serve(realtime_server.handler, host, port):
+        print(f"Drontect realtime server listening on ws://{host}:{port}{WS_PATH}")
         await asyncio.Future()
 
 
 def main() -> None:
-    host = os.getenv("DRONTECT_GATEWAY_HOST", DEFAULT_HOST)
-    port = int(os.getenv("DRONTECT_GATEWAY_PORT", str(DEFAULT_PORT)))
-    asyncio.run(run_gateway(host, port))
+    host = os.getenv("DRONTECT_REALTIME_HOST", DEFAULT_HOST)
+    port = int(os.getenv("DRONTECT_REALTIME_PORT", str(DEFAULT_PORT)))
+    asyncio.run(run_realtime_server(host, port))
 
 
 if __name__ == "__main__":

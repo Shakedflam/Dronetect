@@ -1,4 +1,4 @@
-"""Command names shared by tablet clients, gateway, and drone adapters."""
+"""Command names shared by tablet clients, realtime server, and drone adapters."""
 
 from __future__ import annotations
 

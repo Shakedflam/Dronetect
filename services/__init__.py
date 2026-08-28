@@ -1,1 +1,1 @@
-"""Backend service helpers shared by adapters and the edge gateway."""
+"""Backend service helpers shared by adapters and the realtime server."""

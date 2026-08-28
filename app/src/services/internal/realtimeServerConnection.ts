@@ -1,7 +1,7 @@
 import type { Unsubscribe } from './pollingSource';
 
 /**
- * Owns the single live WebSocket link to the edge gateway
+ * Owns the single live WebSocket link to the edge realtime server
  * (`/ws?role=tablet`). Unlike `pollingSource.ts`'s per-metric lazy-start
  * timers, this connects eagerly on module load and stays connected for the
  * app's lifetime — telemetry and command sending both need the same live
@@ -23,21 +23,21 @@ export interface TelemetryMessage {
   };
 }
 
-/** Exactly the command names the gateway/simulator currently support. */
-export type GatewayCommandName = 'return_home' | 'new_mission' | 'camera_tilt_up' | 'camera_tilt_down';
+/** Exactly the command names the realtime server/simulator currently support. */
+export type RealtimeServerCommandName = 'return_home' | 'new_mission' | 'camera_tilt_up' | 'camera_tilt_down';
 
-export interface GatewayConnection {
+export interface RealtimeServerConnection {
   subscribeTelemetry(listener: (message: TelemetryMessage) => void): Unsubscribe;
   subscribeStatus(listener: (status: ConnectionStatus) => void): Unsubscribe;
-  sendCommand(command: GatewayCommandName, params?: Record<string, unknown>): Promise<void>;
+  sendCommand(command: RealtimeServerCommandName, params?: Record<string, unknown>): Promise<void>;
 }
 
 const RECONNECT_DELAY_MS = 1000;
 const COMMAND_TIMEOUT_MS = 5000;
-const DEFAULT_GATEWAY_ORIGIN = 'ws://127.0.0.1:8765';
+const DEFAULT_REALTIME_SERVER_ORIGIN = 'ws://127.0.0.1:8765';
 
-function resolveGatewayUrl(): string {
-  const origin = import.meta.env.VITE_GATEWAY_WS_URL || DEFAULT_GATEWAY_ORIGIN;
+function resolveRealtimeServerUrl(): string {
+  const origin = import.meta.env.VITE_REALTIME_SERVER_WS_URL || DEFAULT_REALTIME_SERVER_ORIGIN;
   return `${origin}/ws?role=tablet`;
 }
 
@@ -69,7 +69,7 @@ function isTelemetryMessage(value: unknown): value is TelemetryMessage {
   );
 }
 
-function createGatewayConnection(): GatewayConnection {
+function createRealtimeServerConnection(): RealtimeServerConnection {
   const telemetryListeners = new Set<(message: TelemetryMessage) => void>();
   const statusListeners = new Set<(status: ConnectionStatus) => void>();
   const pendingCommands = new Map<string, PendingCommand>();
@@ -96,12 +96,12 @@ function createGatewayConnection(): GatewayConnection {
     try {
       parsed = JSON.parse(event.data);
     } catch {
-      console.warn('[gatewayConnection] received malformed JSON, ignoring', event.data);
+      console.warn('[realtimeServerConnection] received malformed JSON, ignoring', event.data);
       return;
     }
 
     if (typeof parsed !== 'object' || parsed === null || !('type' in parsed)) {
-      console.warn('[gatewayConnection] received message with no type, ignoring', parsed);
+      console.warn('[realtimeServerConnection] received message with no type, ignoring', parsed);
       return;
     }
 
@@ -110,7 +110,7 @@ function createGatewayConnection(): GatewayConnection {
     switch (message.type) {
       case 'telemetry': {
         if (!isTelemetryMessage(message)) {
-          console.warn('[gatewayConnection] telemetry message failed shape check, ignoring', message);
+          console.warn('[realtimeServerConnection] telemetry message failed shape check, ignoring', message);
           return;
         }
         telemetryListeners.forEach((listener) => listener(message));
@@ -128,7 +128,7 @@ function createGatewayConnection(): GatewayConnection {
       }
       case 'error': {
         const commandId = message.commandId;
-        const errorText = typeof message.message === 'string' ? message.message : 'Gateway error';
+        const errorText = typeof message.message === 'string' ? message.message : 'Realtime server error';
         const errorCode = typeof message.code === 'string' ? message.code : undefined;
         const fullMessage = errorCode ? `${errorText} (${errorCode})` : errorText;
 
@@ -141,11 +141,11 @@ function createGatewayConnection(): GatewayConnection {
             return;
           }
         }
-        console.error('[gatewayConnection] gateway error', message);
+        console.error('[realtimeServerConnection] realtime server error', message);
         return;
       }
       default:
-        console.warn('[gatewayConnection] unknown message type, ignoring', message);
+        console.warn('[realtimeServerConnection] unknown message type, ignoring', message);
     }
   }
 
@@ -156,9 +156,9 @@ function createGatewayConnection(): GatewayConnection {
 
   function connect(): void {
     try {
-      socket = new WebSocket(resolveGatewayUrl());
+      socket = new WebSocket(resolveRealtimeServerUrl());
     } catch (error) {
-      console.warn('[gatewayConnection] failed to open WebSocket, retrying', error);
+      console.warn('[realtimeServerConnection] failed to open WebSocket, retrying', error);
       scheduleReconnect();
       return;
     }
@@ -171,7 +171,7 @@ function createGatewayConnection(): GatewayConnection {
     socket.onmessage = handleMessage;
 
     socket.onclose = () => {
-      rejectAllPending('Gateway connection closed');
+      rejectAllPending('Realtime server connection closed');
       socket = null;
       scheduleReconnect();
     };
@@ -196,14 +196,14 @@ function createGatewayConnection(): GatewayConnection {
     sendCommand(command, params = {}) {
       return new Promise((resolve, reject) => {
         if (!socket || socket.readyState !== WebSocket.OPEN) {
-          reject(new Error('Gateway not connected'));
+          reject(new Error('Realtime server not connected'));
           return;
         }
 
         const commandId = crypto.randomUUID();
         const timeoutHandle = setTimeout(() => {
           pendingCommands.delete(commandId);
-          reject(new Error(`Command "${command}" timed out waiting for gateway response`));
+          reject(new Error(`Command "${command}" timed out waiting for realtime server response`));
         }, COMMAND_TIMEOUT_MS);
 
         pendingCommands.set(commandId, { resolve, reject, timeoutHandle });
@@ -214,4 +214,4 @@ function createGatewayConnection(): GatewayConnection {
   };
 }
 
-export const gatewayConnection: GatewayConnection = createGatewayConnection();
+export const realtimeServerConnection: RealtimeServerConnection = createRealtimeServerConnection();

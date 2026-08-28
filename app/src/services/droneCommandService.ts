@@ -1,12 +1,12 @@
-import { gatewayConnection } from './internal/gatewayConnection';
+import { realtimeServerConnection } from './internal/realtimeServerConnection';
 
 /**
  * Abstraction over the high-level commands the operator can issue.
- * returnToHome/newMission/cameraTiltUp/cameraTiltDown are real gateway
- * commands, sent over the shared `gatewayConnection`. followTarget/
- * ignoreTarget/engageTarget have no gateway equivalent (the protocol only
- * supports the four commands above) and remain mocked until the backend
- * grows support for them.
+ * returnToHome/newMission/cameraTiltUp/cameraTiltDown are real realtime
+ * server commands, sent over the shared `realtimeServerConnection`.
+ * followTarget/ignoreTarget/engageTarget have no realtime server equivalent
+ * (the protocol only supports the four commands above) and remain mocked
+ * until the backend grows support for them.
  */
 export interface DroneCommandService {
   returnToHome(): Promise<void>;
@@ -27,10 +27,10 @@ function mockCommand(label: string): Promise<void> {
 
 function createDroneCommandService(): DroneCommandService {
   return {
-    returnToHome: () => gatewayConnection.sendCommand('return_home'),
-    newMission: () => gatewayConnection.sendCommand('new_mission'),
-    cameraTiltUp: () => gatewayConnection.sendCommand('camera_tilt_up'),
-    cameraTiltDown: () => gatewayConnection.sendCommand('camera_tilt_down'),
+    returnToHome: () => realtimeServerConnection.sendCommand('return_home'),
+    newMission: () => realtimeServerConnection.sendCommand('new_mission'),
+    cameraTiltUp: () => realtimeServerConnection.sendCommand('camera_tilt_up'),
+    cameraTiltDown: () => realtimeServerConnection.sendCommand('camera_tilt_down'),
     followTarget: (targetId) => mockCommand(`FOLLOW target=${targetId}`),
     ignoreTarget: (targetId) => mockCommand(`IGNORE target=${targetId}`),
     engageTarget: (targetId) => mockCommand(`ENGAGE target=${targetId}`),

@@ -99,7 +99,7 @@ function LiveTrackingControl({ position, home }: { position: DronePosition; home
 /**
  * Renders the interactive map and the drone's live position. Position comes
  * exclusively from useLocation()/LocationService, which is backed by the
- * live gateway connection — this component never touches mock data
+ * live realtime server connection — this component never touches mock data
  * directly. The home marker is a static display anchor (HOME_REFERENCE),
  * not live telemetry — see config/homeReference.ts.
  */

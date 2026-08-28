@@ -8,10 +8,10 @@ interface ActionBarProps {
 
 /**
  * Permanent control bar. RTH/New Mission/camera tilt are always available —
- * these are the drone-wide commands the gateway currently supports.
+ * these are the drone-wide commands the realtime server currently supports.
  * Follow/Ignore/Engage only appear once the operator has selected a
- * detected target (App owns that selection state); they have no gateway
- * equivalent yet and remain mocked.
+ * detected target (App owns that selection state); they have no realtime
+ * server equivalent yet and remain mocked.
  */
 export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps) {
   const hasSelection = selectedTargetId !== null;

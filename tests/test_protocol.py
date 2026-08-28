@@ -1,11 +1,13 @@
 import pytest
 
-from gateway.protocol import (
+from realtime_server.protocol import (
+    ROLE_DRONE,
     ProtocolError,
     command_ack,
     encode_message,
     parse_json_message,
     validate_command_message,
+    validate_role,
     validate_telemetry_message,
 )
 from services.gps import LocalPosition
@@ -82,3 +84,8 @@ def test_command_ack_uses_same_command_id():
         "commandId": "cmd-1",
         "status": "accepted",
     }
+
+
+def test_drone_role_is_canonical_and_simulator_role_is_legacy_alias():
+    assert validate_role("drone") == ROLE_DRONE
+    assert validate_role("simulator") == ROLE_DRONE

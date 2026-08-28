@@ -1,4 +1,4 @@
-"""Normalized telemetry payloads for the edge gateway."""
+"""Normalized telemetry payloads for the realtime server."""
 
 from __future__ import annotations
 

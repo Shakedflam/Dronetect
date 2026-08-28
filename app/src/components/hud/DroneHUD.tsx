@@ -45,7 +45,7 @@ function HudRow({ label, value }: HudRowProps) {
 /**
  * Compact telemetry readout overlaid on the map's top-right corner.
  * Position comes from useLocation() (GPS), everything else from
- * useTelemetry() — both are backed by the live gateway connection.
+ * useTelemetry() — both are backed by the live realtime server connection.
  */
 export function DroneHUD() {
   const position = useLocation();
