@@ -1,0 +1,13 @@
+{
+  "source_target_fps": 30,
+  "ui_max_width": 960,
+  "ui_max_height": 540,
+  "ui_jpeg_quality": 72,
+  "vision_frame_interval": 5,
+  "vision_max_width": 960,
+  "vision_max_height": 540,
+  "vision_jpeg_quality": 92,
+  "vision_server_frames_url": "ws://127.0.0.1:8870/frames",
+  "vision_server_diagnostics_host": "127.0.0.1",
+  "vision_server_diagnostics_port": 8871
+}

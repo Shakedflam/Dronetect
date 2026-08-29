@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
+from config.video import VideoConfig, load_video_config
 from realtime_server.drone_sdk import DroneSdkConnection, WebSocketDroneSdkAdapter
 from realtime_server.protocol import (
     ROLE_DRONE,
@@ -20,6 +21,15 @@ from realtime_server.protocol import (
     validate_command_message,
     validate_role,
 )
+from realtime_server.video_pipeline import (
+    ROLE_VIEWER,
+    VIDEO_INGEST_PATH,
+    VIDEO_WEBRTC_PATH,
+    VideoPipeline,
+    validate_video_role,
+)
+from realtime_server.video_source import VideoSourceConnection, WebSocketVideoSourceAdapter
+from services.video import VIDEO_MAX_PACKET_BYTES, VideoPacketError
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -30,11 +40,30 @@ WS_PATH = "/ws"
 class RealtimeServer:
     """Routes telemetry from one drone source to any connected tablet clients."""
 
-    def __init__(self) -> None:
+    def __init__(self, video_config: VideoConfig | None = None) -> None:
         self.drone: DroneSdkConnection | None = None
+        self.video_source: VideoSourceConnection | None = None
+        self.video_pipeline = VideoPipeline(video_config or load_video_config())
+        self._video_pipeline_started = False
         self.tablets: set[ServerConnection] = set()
 
     async def handler(self, websocket: ServerConnection) -> None:
+        try:
+            request_path = self._request_path(websocket)
+        except ProtocolError as exc:
+            await websocket.send(encode_message(exc.to_message()))
+            await websocket.close(code=1008, reason=exc.code)
+            return
+
+        parsed = urlsplit(request_path)
+
+        if parsed.path == VIDEO_INGEST_PATH:
+            await self._handle_video_ingest(websocket, parsed.query)
+            return
+        if parsed.path == VIDEO_WEBRTC_PATH:
+            await self._handle_video_webrtc(websocket, parsed.query)
+            return
+
         try:
             role = self._role_from_request(websocket)
         except ProtocolError as exc:
@@ -47,15 +76,22 @@ class RealtimeServer:
         else:
             await self._handle_tablet(websocket)
 
-    def _role_from_request(self, websocket: ServerConnection) -> str:
+    def start_background_tasks(self) -> None:
+        if not self._video_pipeline_started:
+            self.video_pipeline.start()
+            self._video_pipeline_started = True
+
+    def _request_path(self, websocket: ServerConnection) -> str:
         request = websocket.request
         if request is None:
             raise ProtocolError(
                 "missing_request",
                 "WebSocket handshake request is unavailable.",
             )
+        return request.path
 
-        request_path = request.path
+    def _role_from_request(self, websocket: ServerConnection) -> str:
+        request_path = self._request_path(websocket)
         parsed = urlsplit(request_path)
         if parsed.path != WS_PATH:
             raise ProtocolError(
@@ -85,6 +121,50 @@ class RealtimeServer:
         finally:
             if self.drone is drone:
                 self.drone = None
+
+    async def _handle_video_ingest(self, websocket: ServerConnection, query: str) -> None:
+        try:
+            role = validate_video_role(
+                parse_qs(query).get("role", [None])[0],
+                expected=ROLE_DRONE,
+            )
+        except ProtocolError as exc:
+            await websocket.send(encode_message(exc.to_message()))
+            await websocket.close(code=1008, reason=exc.code)
+            return
+
+        if role != ROLE_DRONE:
+            await websocket.close(code=1008, reason="invalid_role")
+            return
+
+        self.start_background_tasks()
+        await self._handle_video_source(WebSocketVideoSourceAdapter(websocket))
+
+    async def _handle_video_webrtc(self, websocket: ServerConnection, query: str) -> None:
+        try:
+            validate_video_role(parse_qs(query).get("role", [None])[0], expected=ROLE_VIEWER)
+        except ProtocolError as exc:
+            await websocket.send(encode_message(exc.to_message()))
+            await websocket.close(code=1008, reason=exc.code)
+            return
+
+        self.start_background_tasks()
+        await self.video_pipeline.handle_webrtc_viewer(websocket)
+
+    async def _handle_video_source(self, source: VideoSourceConnection) -> None:
+        if self.video_source is not None and self.video_source is not source:
+            await source.close(code=1008, reason="video_source_already_connected")
+            return
+
+        self.video_source = source
+        try:
+            async for frame in source.iter_frames():
+                await self.video_pipeline.publish(frame)
+        except VideoPacketError:
+            await source.close(code=1008, reason="invalid_video_frame")
+        finally:
+            if self.video_source is source:
+                self.video_source = None
 
     async def _handle_tablet(self, websocket: ServerConnection) -> None:
         self.tablets.add(websocket)
@@ -149,7 +229,8 @@ class RealtimeServer:
 
 async def run_realtime_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
     realtime_server = RealtimeServer()
-    async with serve(realtime_server.handler, host, port):
+    realtime_server.start_background_tasks()
+    async with serve(realtime_server.handler, host, port, max_size=VIDEO_MAX_PACKET_BYTES):
         print(f"Drontect realtime server listening on ws://{host}:{port}{WS_PATH}")
         await asyncio.Future()
 

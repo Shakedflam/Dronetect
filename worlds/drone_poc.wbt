@@ -380,8 +380,8 @@ Mavic2Pro {
   supervisor TRUE
   cameraSlot [
     Camera {
-      width 640
-      height 360
+      width 960
+      height 540
       near 0.2
     }
   ]

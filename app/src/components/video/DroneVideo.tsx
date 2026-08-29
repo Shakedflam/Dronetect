@@ -1,5 +1,7 @@
+import { useEffect, useRef } from 'react';
 import type { DetectedTarget } from '../../types/drone';
 import { useLocation } from '../../hooks/useLocation';
+import { useVideoStream } from '../../hooks/useVideoStream';
 import { DetectionOverlay } from './DetectionOverlay';
 import { CompassStrip } from './CompassStrip';
 import styles from './DroneVideo.module.css';
@@ -11,20 +13,34 @@ interface DroneVideoProps {
 }
 
 /**
- * Camera feed area. Today it's a placeholder — later this swaps for a
- * <video>/<canvas> element streaming the real feed. The detection overlay
- * is already layered on top via absolute positioning so that swap won't
- * require restructuring this component.
+ * Camera feed area. Renders the live WebRTC feed once useVideoStream()
+ * has a track; falls back to a placeholder until then. The detection
+ * overlay stays layered on top via absolute positioning either way.
  */
 export function DroneVideo({ targets, selectedTargetId, onSelectTarget }: DroneVideoProps) {
   const position = useLocation();
+  const stream = useVideoStream();
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.srcObject = stream;
+    return () => {
+      video.srcObject = null;
+    };
+  }, [stream]);
 
   return (
     <div className={styles.wrapper}>
-      <div className={styles.feedPlaceholder}>
-        <div className={styles.scanlines} />
-        <span className={styles.feedLabel}>MOCK FEED — CAMERA NOT CONNECTED</span>
-      </div>
+      {stream ? (
+        <video ref={videoRef} className={styles.videoFeed} autoPlay playsInline muted />
+      ) : (
+        <div className={styles.feedPlaceholder}>
+          <div className={styles.scanlines} />
+          <span className={styles.feedLabel}>CONNECTING TO CAMERA FEED…</span>
+        </div>
+      )}
       <DetectionOverlay
         targets={targets}
         selectedTargetId={selectedTargetId}

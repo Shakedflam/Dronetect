@@ -1,0 +1,122 @@
+"""Minimal local vision frame receiver and diagnostics server."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+
+from websockets.asyncio.server import ServerConnection, serve
+
+from config.video import VideoConfig, load_video_config
+from services.video import VIDEO_MAX_PACKET_BYTES, VideoPacketError, decode_video_frame
+from vision_server.diagnostics import VisionDiagnostics
+
+
+DEFAULT_FRAME_HOST = "127.0.0.1"
+DEFAULT_FRAME_PORT = 8870
+FRAMES_PATH = "/frames"
+
+
+class VisionServer:
+    def __init__(self, config: VideoConfig | None = None) -> None:
+        self.config = config or load_video_config()
+        self.diagnostics = VisionDiagnostics()
+        self._last_log_count = 0
+
+    async def frame_handler(self, websocket: ServerConnection) -> None:
+        request = websocket.request
+        if request is None or request.path != FRAMES_PATH:
+            await websocket.close(code=1008, reason="invalid_path")
+            return
+
+        async for packet in websocket:
+            if isinstance(packet, str):
+                continue
+            try:
+                frame = decode_video_frame(bytes(packet))
+            except VideoPacketError:
+                continue
+            self.diagnostics.record(frame)
+            self._log_progress()
+
+    async def diagnostics_handler(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            request_line = await reader.readline()
+            parts = request_line.decode("ascii", errors="ignore").split()
+            path = parts[1] if len(parts) >= 2 else "/"
+            body = (
+                json.dumps(self.diagnostics.to_dict(), separators=(",", ":"))
+                if path == "/diagnostics"
+                else json.dumps({"error": "not_found"}, separators=(",", ":"))
+            ).encode("utf-8")
+            status = "200 OK" if path == "/diagnostics" else "404 Not Found"
+            writer.write(
+                b"\r\n".join(
+                    [
+                        f"HTTP/1.1 {status}".encode("ascii"),
+                        b"Content-Type: application/json",
+                        f"Content-Length: {len(body)}".encode("ascii"),
+                        b"Connection: close",
+                        b"",
+                        body,
+                    ]
+                )
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    def _log_progress(self) -> None:
+        if self.diagnostics.received_count - self._last_log_count < 30:
+            return
+        self._last_log_count = self.diagnostics.received_count
+        print(
+            "vision_server received "
+            f"{self.diagnostics.received_count} frames; "
+            f"latest frame_id={self.diagnostics.latest_frame_id}; "
+            f"fps={self.diagnostics.fps:.1f}"
+        )
+
+
+async def run_vision_server(
+    frame_host: str = DEFAULT_FRAME_HOST,
+    frame_port: int = DEFAULT_FRAME_PORT,
+) -> None:
+    vision_server = VisionServer()
+    diagnostics_server = await asyncio.start_server(
+        vision_server.diagnostics_handler,
+        vision_server.config.vision_server_diagnostics_host,
+        vision_server.config.vision_server_diagnostics_port,
+    )
+    async with (
+        diagnostics_server,
+        serve(
+            vision_server.frame_handler,
+            frame_host,
+            frame_port,
+            max_size=VIDEO_MAX_PACKET_BYTES,
+        ),
+    ):
+        print(f"Drontect vision server receiving frames on ws://{frame_host}:{frame_port}{FRAMES_PATH}")
+        print(
+            "Drontect vision diagnostics on "
+            f"http://{vision_server.config.vision_server_diagnostics_host}:"
+            f"{vision_server.config.vision_server_diagnostics_port}/diagnostics"
+        )
+        await asyncio.Future()
+
+
+def main() -> None:
+    frame_host = os.getenv("DRONTECT_VISION_HOST", DEFAULT_FRAME_HOST)
+    frame_port = int(os.getenv("DRONTECT_VISION_PORT", str(DEFAULT_FRAME_PORT)))
+    asyncio.run(run_vision_server(frame_host, frame_port))
+
+
+if __name__ == "__main__":
+    main()

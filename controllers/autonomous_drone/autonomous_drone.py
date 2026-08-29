@@ -22,6 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from adapters.simulator.client import SimulatorRealtimeClient
+from adapters.simulator.video import SimulatorVideoClient
 from camera_control import CameraGimbal
 from flight_logic import (
     advance_kinematic_flight,
@@ -113,6 +114,8 @@ class AutonomousDrone(Supervisor):
         self._kinematic_yaw: float | None = None
         self.realtime_client = SimulatorRealtimeClient()
         self.realtime_client.start()
+        self.video_client = SimulatorVideoClient()
+        self.video_client.start()
 
     def run(self) -> None:
         print(
@@ -157,7 +160,11 @@ class AutonomousDrone(Supervisor):
                 speed_mps,
                 yaw,
             )
-            self._set_visual_motor_velocities()
+            self.video_client.publish_camera_frame(self.camera)
+            if self.logic.state in {FlightState.IDLE, FlightState.LANDED}:
+                self._stop_motors()
+            else:
+                self._set_visual_motor_velocities()
 
     def _handle_keyboard(self, position: Position) -> None:
         key = self.keyboard.getKey()

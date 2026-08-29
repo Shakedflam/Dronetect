@@ -46,6 +46,7 @@ class KinematicFlightConfig:
     max_ascent_speed_mps: float = 5.0
     max_descent_speed_mps: float = 3.0
     max_yaw_rate_rad_s: float = math.radians(150.0)
+    yaw_hold_horizontal_distance_m: float = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,16 +276,21 @@ def advance_kinematic_flight(
     dz = target[2] - position[2]
     horizontal_distance = math.hypot(dx, dy)
 
-    desired_yaw = math.atan2(dy, dx) if horizontal_distance > 1e-9 else yaw
+    should_hold_horizontal = horizontal_distance <= cfg.yaw_hold_horizontal_distance_m
+    desired_yaw = yaw if should_hold_horizontal else math.atan2(dy, dx)
     next_yaw = move_angle_toward(
         yaw,
         desired_yaw,
         cfg.max_yaw_rate_rad_s * dt,
     )
 
-    desired_horizontal_speed = min(
-        cfg.max_horizontal_speed_mps,
-        horizontal_distance / dt,
+    desired_horizontal_speed = (
+        0.0
+        if should_hold_horizontal
+        else min(
+            cfg.max_horizontal_speed_mps,
+            horizontal_distance / dt,
+        )
     )
     commanded_horizontal_speed = ramp_command(
         horizontal_speed_mps,
@@ -292,7 +298,7 @@ def advance_kinematic_flight(
         cfg.horizontal_acceleration_mps2 * dt,
     )
     horizontal_step = min(horizontal_distance, commanded_horizontal_speed * dt)
-    if horizontal_distance > 1e-9:
+    if horizontal_distance > 1e-9 and not should_hold_horizontal:
         next_x = position[0] + dx / horizontal_distance * horizontal_step
         next_y = position[1] + dy / horizontal_distance * horizontal_step
     else:

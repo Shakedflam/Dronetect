@@ -189,14 +189,29 @@ def test_kinematic_flight_uses_dji_like_ascent_speed():
     step = advance_kinematic_flight(
         position=(0.0, 0.0, 0.0),
         target=(0.0, 0.0, 15.0),
-        yaw=0.0,
+        yaw=1.25,
         horizontal_speed_mps=0.0,
         dt=1.0,
     )
 
     assert step.position == pytest.approx((0.0, 0.0, 5.0))
+    assert step.yaw == pytest.approx(1.25)
     assert step.speed_mps == pytest.approx(5.0)
     assert step.vertical_speed_mps == pytest.approx(5.0)
+
+
+def test_kinematic_flight_holds_yaw_for_tiny_horizontal_error():
+    step = advance_kinematic_flight(
+        position=(0.0, 0.0, 1.0),
+        target=(0.1, -0.1, 10.0),
+        yaw=1.25,
+        horizontal_speed_mps=0.0,
+        dt=1.0,
+    )
+
+    assert step.position == pytest.approx((0.0, 0.0, 6.0))
+    assert step.yaw == pytest.approx(1.25)
+    assert step.horizontal_speed_mps == pytest.approx(0.0)
 
 
 def test_kinematic_flight_turns_with_configured_yaw_rate():
