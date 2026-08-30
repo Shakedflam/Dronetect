@@ -1,6 +1,6 @@
 import type { TelemetryData } from '../types/drone';
 import { realtimeServerConnection } from './internal/realtimeServerConnection';
-import type { Unsubscribe } from './internal/pollingSource';
+import type { Unsubscribe } from './internal/unsubscribe';
 
 /**
  * Abstraction over the flight-instrument readout (speed, altitude, battery,

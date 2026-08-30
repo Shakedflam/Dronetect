@@ -1,0 +1,121 @@
+[
+  {
+    "file": "initial_00_one_drone_house_car.png",
+    "expected_drones_min": 1,
+    "expected_drones_max": 1,
+    "expected_birds": 0,
+    "note": "One simulator drone near the upper-left of the house/car scene."
+  },
+  {
+    "file": "initial_01_one_drone_far_ground.png",
+    "expected_drones_min": 1,
+    "expected_drones_max": 1,
+    "expected_birds": 0,
+    "note": "One small drone against sand."
+  },
+  {
+    "file": "initial_02_one_drone_forest.png",
+    "expected_drones_min": 1,
+    "expected_drones_max": 1,
+    "expected_birds": 0,
+    "note": "One harder drone near trees."
+  },
+  {
+    "file": "initial_03_one_drone_house.png",
+    "expected_drones_min": 1,
+    "expected_drones_max": 1,
+    "expected_birds": 0,
+    "note": "One hard drone near/behind the house and trees."
+  },
+  {
+    "file": "initial_04_zero_drone_two_birds.png",
+    "expected_drones_min": 0,
+    "expected_drones_max": 0,
+    "expected_birds": 2,
+    "note": "Bird-only simulator scene."
+  },
+  {
+    "file": "initial_05_two_drones_partial.png",
+    "expected_drones_min": 2,
+    "expected_drones_max": 3,
+    "expected_birds": 0,
+    "note": "Two clear drones plus one partial/edge target."
+  },
+  {
+    "file": "batch_01_three_drones_two_birds.png",
+    "expected_drones_min": 3,
+    "expected_drones_max": 3,
+    "expected_birds": 2,
+    "note": "Three drones and two generated bird shapes in the sky."
+  },
+  {
+    "file": "batch_02_one_drone_far.png",
+    "expected_drones_min": 1,
+    "expected_drones_max": 1,
+    "expected_birds": 0,
+    "note": "One far-away drone against sky."
+  },
+  {
+    "file": "batch_03_two_drones_house_windmill.png",
+    "expected_drones_min": 2,
+    "expected_drones_max": 2,
+    "expected_birds": 0,
+    "note": "Two drones near a house/windmill scene."
+  },
+  {
+    "file": "batch_04_zero_drone_two_birds_forest.png",
+    "expected_drones_min": 0,
+    "expected_drones_max": 0,
+    "expected_birds": 2,
+    "note": "Bird-only forest scene."
+  },
+  {
+    "file": "batch_05_two_drones_one_hard.png",
+    "expected_drones_min": 2,
+    "expected_drones_max": 2,
+    "expected_birds": 0,
+    "note": "Two drones, one harder in trees."
+  },
+  {
+    "file": "batch_06_zero_drone_ball.png",
+    "expected_drones_min": 0,
+    "expected_drones_max": 0,
+    "expected_birds": 0,
+    "note": "No drone and no bird, with red balloon marker."
+  },
+  {
+    "file": "batch_07_zero_drone_two_birds_ground.png",
+    "expected_drones_min": 0,
+    "expected_drones_max": 0,
+    "expected_birds": 2,
+    "note": "Two generated bird shapes over ground."
+  },
+  {
+    "file": "batch_08_two_drones_ground.png",
+    "expected_drones_min": 2,
+    "expected_drones_max": 2,
+    "expected_birds": 0,
+    "note": "Two drones against sand/tree background."
+  },
+  {
+    "file": "batch_09_one_drone_forest.png",
+    "expected_drones_min": 1,
+    "expected_drones_max": 1,
+    "expected_birds": 0,
+    "note": "One drone near forest."
+  },
+  {
+    "file": "batch_10_one_drone_three_birds_sky.png",
+    "expected_drones_min": 1,
+    "expected_drones_max": 1,
+    "expected_birds": 3,
+    "note": "One drone and three generated bird shapes in the sky."
+  },
+  {
+    "file": "batch_11_three_drones_three_birds_sky.png",
+    "expected_drones_min": 3,
+    "expected_drones_max": 3,
+    "expected_birds": 3,
+    "note": "Three drones and three generated bird shapes in the sky."
+  }
+]

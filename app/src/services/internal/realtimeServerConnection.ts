@@ -1,4 +1,4 @@
-import type { Unsubscribe } from './pollingSource';
+import type { Unsubscribe } from './unsubscribe';
 
 /**
  * Owns the single live WebSocket link to the edge realtime server

@@ -1,5 +1,5 @@
 import { webrtcConnection } from './internal/webrtcConnection';
-import type { Unsubscribe } from './internal/pollingSource';
+import type { Unsubscribe } from './internal/unsubscribe';
 
 /**
  * Abstraction over "what does the drone's camera currently see". This is

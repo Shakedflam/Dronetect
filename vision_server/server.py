@@ -9,7 +9,8 @@ import os
 from websockets.asyncio.server import ServerConnection, serve
 
 from config.video import VideoConfig, load_video_config
-from services.video import VIDEO_MAX_PACKET_BYTES, VideoPacketError, decode_video_frame
+from services.video import VIDEO_MAX_PACKET_BYTES, VideoFrame, VideoPacketError, decode_video_frame
+from vision_server.detector import Detection, DroneDetector, create_drone_detector
 from vision_server.diagnostics import VisionDiagnostics
 
 
@@ -19,8 +20,13 @@ FRAMES_PATH = "/frames"
 
 
 class VisionServer:
-    def __init__(self, config: VideoConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: VideoConfig | None = None,
+        detector: DroneDetector | None = None,
+    ) -> None:
         self.config = config or load_video_config()
+        self.detector = detector or create_drone_detector()
         self.diagnostics = VisionDiagnostics()
         self._last_log_count = 0
 
@@ -38,6 +44,8 @@ class VisionServer:
             except VideoPacketError:
                 continue
             self.diagnostics.record(frame)
+            detections = await self._detect(frame)
+            self._log_detections(frame.frame_id, detections)
             self._log_progress()
 
     async def diagnostics_handler(
@@ -81,6 +89,29 @@ class VisionServer:
             f"{self.diagnostics.received_count} frames; "
             f"latest frame_id={self.diagnostics.latest_frame_id}; "
             f"fps={self.diagnostics.fps:.1f}"
+        )
+
+    async def _detect(self, frame: VideoFrame) -> list[Detection]:
+        try:
+            return await asyncio.to_thread(self.detector.detect, frame)
+        except Exception as exc:
+            print(f"vision_server detection failed frame_id={frame.frame_id}: {exc}")
+            return []
+
+    def _log_detections(self, frame_id: int, detections: list[Detection]) -> None:
+        if not detections:
+            return
+
+        details = " ".join(
+            f"{detection.class_name} "
+            f"conf={detection.confidence:.2f} "
+            f"box=({detection.box[0]:.1f},{detection.box[1]:.1f},"
+            f"{detection.box[2]:.1f},{detection.box[3]:.1f})"
+            for detection in detections
+        )
+        print(
+            f"vision_server detections frame_id={frame_id} "
+            f"detections={len(detections)} {details}"
         )
 
 

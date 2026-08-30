@@ -6,7 +6,23 @@ from websockets.asyncio.server import serve
 
 from config.video import VideoConfig
 from services.video import JPEG_ENCODING, VideoFrame, encode_video_frame
+from vision_server.detector import Detection
 from vision_server.server import VisionServer
+
+
+class FakeDetector:
+    def __init__(self) -> None:
+        self.frames: list[VideoFrame] = []
+
+    def detect(self, frame: VideoFrame) -> list[Detection]:
+        self.frames.append(frame)
+        return [
+            Detection(
+                class_name="drone",
+                confidence=0.87,
+                box=(10.0, 20.0, 110.0, 120.0),
+            )
+        ]
 
 
 def test_vision_server_receives_frames_and_updates_diagnostics():
@@ -28,6 +44,29 @@ def test_vision_server_receives_frames_and_updates_diagnostics():
         assert diagnostics["fps"] >= 0.0
 
     asyncio.run(scenario())
+
+
+def test_vision_server_runs_detector_and_logs_detections(capsys):
+    async def scenario():
+        detector = FakeDetector()
+        vision_server = VisionServer(VideoConfig(), detector=detector)
+        async with serve(vision_server.frame_handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            async with connect(f"ws://127.0.0.1:{port}/frames") as websocket:
+                await websocket.send(encode_video_frame(_frame(42)))
+                await asyncio.wait_for(
+                    _wait_for(lambda: len(detector.frames) == 1),
+                    1.0,
+                )
+
+        return vision_server, detector
+
+    vision_server, detector = asyncio.run(scenario())
+    output = capsys.readouterr().out
+
+    assert vision_server.diagnostics.received_count == 1
+    assert detector.frames[0].frame_id == 42
+    assert "frame_id=42 detections=1 drone conf=0.87 box=(10.0,20.0,110.0,120.0)" in output
 
 
 def test_vision_server_exposes_http_diagnostics():

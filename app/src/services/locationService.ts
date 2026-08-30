@@ -1,6 +1,6 @@
 import type { DronePosition } from '../types/drone';
 import { realtimeServerConnection } from './internal/realtimeServerConnection';
-import type { Unsubscribe } from './internal/pollingSource';
+import type { Unsubscribe } from './internal/unsubscribe';
 
 /**
  * Abstraction over "where is the drone right now". This is the only piece of

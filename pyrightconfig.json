@@ -5,6 +5,9 @@
     "C:/Program Files/Webots/lib/controller/python"
   ],
   "include": [
-    "controllers"
+    "controllers",
+    "services",
+    "vision_server",
+    "tests"
   ]
 }
