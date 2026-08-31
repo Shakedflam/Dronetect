@@ -15,7 +15,7 @@ from realtime_server.protocol import (
 from services.gps import LocalPosition
 from services.telemetry import build_simulator_telemetry
 from services.video import JPEG_ENCODING, VideoFrame
-from vision_server.detector import Detection
+from vision_server.tracker import TrackedDetection
 
 
 def test_valid_telemetry_validates_and_serializes():
@@ -67,10 +67,14 @@ def test_valid_detection_message_validates_and_serializes():
             data=b"jpeg",
         ),
         [
-            Detection(
+            TrackedDetection(
                 class_name="drone",
                 confidence=0.87,
                 box=(420.0, 180.0, 580.0, 310.0),
+                track_id="drone-1",
+                track_state="confirmed",
+                last_seen_timestamp=1720000000.123,
+                velocity_px_per_sec=(12.0, -3.0),
             )
         ],
     )
@@ -80,11 +84,17 @@ def test_valid_detection_message_validates_and_serializes():
     assert message == {
         "type": "detections",
         "frameId": 150,
+        "frameWidth": 960,
+        "frameHeight": 540,
         "detections": [
             {
                 "className": "drone",
                 "confidence": 0.87,
                 "box": [420.0, 180.0, 580.0, 310.0],
+                "trackId": "drone-1",
+                "trackState": "confirmed",
+                "lastSeenTimestamp": 1720000000.123,
+                "velocityPxPerSec": {"x": 12.0, "y": -3.0},
             }
         ],
     }
@@ -95,6 +105,8 @@ def test_empty_detection_message_validates():
         {
             "type": "detections",
             "frameId": 150,
+            "frameWidth": 960,
+            "frameHeight": 540,
             "detections": [],
         }
     )
@@ -102,6 +114,8 @@ def test_empty_detection_message_validates():
     assert message == {
         "type": "detections",
         "frameId": 150,
+        "frameWidth": 960,
+        "frameHeight": 540,
         "detections": [],
     }
 
@@ -111,12 +125,35 @@ def test_empty_detection_message_validates():
     [
         ({"type": "telemetry", "frameId": 150, "detections": []}, "type"),
         ({"type": "detections", "detections": []}, "frameId"),
-        ({"type": "detections", "frameId": 150, "detections": {}}, "detections"),
+        ({"type": "detections", "frameId": 150, "frameHeight": 540, "detections": []}, "frameWidth"),
+        ({"type": "detections", "frameId": 150, "frameWidth": 960, "detections": []}, "frameHeight"),
         (
             {
                 "type": "detections",
                 "frameId": 150,
-                "detections": [{"className": "drone", "confidence": 1.5, "box": [1, 2, 3, 4]}],
+                "frameWidth": 960,
+                "frameHeight": 540,
+                "detections": {},
+            },
+            "detections",
+        ),
+        (
+            {
+                "type": "detections",
+                "frameId": 150,
+                "frameWidth": 960,
+                "frameHeight": 540,
+                "detections": [
+                    {
+                        "className": "drone",
+                        "confidence": 1.5,
+                        "box": [1, 2, 3, 4],
+                        "trackId": "drone-1",
+                        "trackState": "confirmed",
+                        "lastSeenTimestamp": 1.0,
+                        "velocityPxPerSec": {"x": 0.0, "y": 0.0},
+                    }
+                ],
             },
             "confidence",
         ),
@@ -124,9 +161,80 @@ def test_empty_detection_message_validates():
             {
                 "type": "detections",
                 "frameId": 150,
-                "detections": [{"className": "drone", "confidence": 0.8, "box": [1, 2, 3]}],
+                "frameWidth": 960,
+                "frameHeight": 540,
+                "detections": [
+                    {
+                        "className": "drone",
+                        "confidence": 0.8,
+                        "box": [1, 2, 3],
+                        "trackId": "drone-1",
+                        "trackState": "confirmed",
+                        "lastSeenTimestamp": 1.0,
+                        "velocityPxPerSec": {"x": 0.0, "y": 0.0},
+                    }
+                ],
             },
             "box",
+        ),
+        (
+            {
+                "type": "detections",
+                "frameId": 150,
+                "frameWidth": 960,
+                "frameHeight": 540,
+                "detections": [
+                    {
+                        "className": "drone",
+                        "confidence": 0.8,
+                        "box": [1, 2, 3, 4],
+                        "trackState": "confirmed",
+                        "lastSeenTimestamp": 1.0,
+                        "velocityPxPerSec": {"x": 0.0, "y": 0.0},
+                    }
+                ],
+            },
+            "trackId",
+        ),
+        (
+            {
+                "type": "detections",
+                "frameId": 150,
+                "frameWidth": 960,
+                "frameHeight": 540,
+                "detections": [
+                    {
+                        "className": "drone",
+                        "confidence": 0.8,
+                        "box": [1, 2, 3, 4],
+                        "trackId": "drone-1",
+                        "trackState": "bad",
+                        "lastSeenTimestamp": 1.0,
+                        "velocityPxPerSec": {"x": 0.0, "y": 0.0},
+                    }
+                ],
+            },
+            "trackState",
+        ),
+        (
+            {
+                "type": "detections",
+                "frameId": 150,
+                "frameWidth": 960,
+                "frameHeight": 540,
+                "detections": [
+                    {
+                        "className": "drone",
+                        "confidence": 0.8,
+                        "box": [1, 2, 3, 4],
+                        "trackId": "drone-1",
+                        "trackState": "confirmed",
+                        "lastSeenTimestamp": 1.0,
+                        "velocityPxPerSec": None,
+                    }
+                ],
+            },
+            "velocityPxPerSec",
         ),
     ],
 )

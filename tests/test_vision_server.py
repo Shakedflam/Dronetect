@@ -95,11 +95,17 @@ def test_vision_server_sends_detection_message_for_detected_frame():
     assert message == {
         "type": "detections",
         "frameId": 42,
+        "frameWidth": 640,
+        "frameHeight": 360,
         "detections": [
             {
                 "className": "drone",
                 "confidence": 0.87,
                 "box": [10.0, 20.0, 110.0, 120.0],
+                "trackId": "drone-1",
+                "trackState": "tentative",
+                "lastSeenTimestamp": 42.0,
+                "velocityPxPerSec": {"x": 0.0, "y": 0.0},
             }
         ],
     }
@@ -122,6 +128,8 @@ def test_vision_server_sends_empty_detection_message_for_clear_frame():
     assert message == {
         "type": "detections",
         "frameId": 44,
+        "frameWidth": 640,
+        "frameHeight": 360,
         "detections": [],
     }
 

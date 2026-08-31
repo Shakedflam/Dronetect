@@ -29,17 +29,22 @@ function createRealtimeServerDetectionService(): DetectionService {
         if (message.frameId < lastFrameId) return;
         lastFrameId = message.frameId;
 
+        const { frameWidth, frameHeight } = message;
+
         listener(
-          message.detections.map((detection, index) => ({
-            id: `${message.frameId}-${index}`,
+          message.detections.map((detection) => ({
+            id: detection.trackId,
             label: toLabel(detection.className),
             confidence: detection.confidence,
             boundingBox: {
-              x1: detection.box[0],
-              y1: detection.box[1],
-              x2: detection.box[2],
-              y2: detection.box[3],
+              x1: detection.box[0] / frameWidth,
+              y1: detection.box[1] / frameHeight,
+              x2: detection.box[2] / frameWidth,
+              y2: detection.box[3] / frameHeight,
             },
+            trackState: detection.trackState,
+            lastSeenTimestamp: detection.lastSeenTimestamp,
+            velocityPxPerSec: detection.velocityPxPerSec,
           }))
         );
       });

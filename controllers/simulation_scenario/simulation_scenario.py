@@ -17,7 +17,7 @@ from scenario_config import ScenarioConfig, load_scenario_config
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPO_ROOT / "config" / "simulation_scenario.json"
 MAX_CLEANUP_ACTORS = 200
-STATIC_TRAFFIC_DRONE_POOL = 12
+STATIC_TRAFFIC_DRONE_POOL = 5
 
 
 class SimulationScenario(Supervisor):

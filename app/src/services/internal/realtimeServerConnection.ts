@@ -26,10 +26,17 @@ export interface TelemetryMessage {
 export interface DetectionsMessage {
   type: 'detections';
   frameId: number;
+  /** Pixel dimensions of the frame the detector ran on — the coordinate space `box` is in. */
+  frameWidth: number;
+  frameHeight: number;
   detections: Array<{
     className: string;
     confidence: number;
     box: [number, number, number, number];
+    trackId: string;
+    trackState: string;
+    lastSeenTimestamp: number;
+    velocityPxPerSec: { x: number; y: number };
   }>;
 }
 
@@ -85,17 +92,26 @@ function isDetectionsMessage(value: unknown): value is DetectionsMessage {
   const message = value as Record<string, unknown>;
   if (message.type !== 'detections') return false;
   if (typeof message.frameId !== 'number') return false;
+  if (typeof message.frameWidth !== 'number' || typeof message.frameHeight !== 'number') return false;
   if (!Array.isArray(message.detections)) return false;
 
   return message.detections.every((detection) => {
     if (typeof detection !== 'object' || detection === null) return false;
     const d = detection as Record<string, unknown>;
+    const velocity = d.velocityPxPerSec as Record<string, unknown> | undefined;
     return (
       typeof d.className === 'string' &&
       typeof d.confidence === 'number' &&
       Array.isArray(d.box) &&
       d.box.length === 4 &&
-      d.box.every((coordinate) => typeof coordinate === 'number')
+      d.box.every((coordinate) => typeof coordinate === 'number') &&
+      typeof d.trackId === 'string' &&
+      typeof d.trackState === 'string' &&
+      typeof d.lastSeenTimestamp === 'number' &&
+      typeof velocity === 'object' &&
+      velocity !== null &&
+      typeof velocity.x === 'number' &&
+      typeof velocity.y === 'number'
     );
   });
 }

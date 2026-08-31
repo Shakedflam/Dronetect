@@ -26,8 +26,12 @@ export interface TelemetryData {
   etaSeconds?: number;
 }
 
-/** Bounding box in the pixel coordinate space of the video's intrinsic frame (videoWidth/videoHeight). */
-export interface PixelBox {
+/**
+ * Bounding box normalized to [0, 1] against the YOLO detection frame's own
+ * dimensions (frameWidth/frameHeight from the wire message) — independent of
+ * the WebRTC video element's intrinsic resolution, which can differ.
+ */
+export interface NormalizedBox {
   x1: number;
   y1: number;
   x2: number;
@@ -36,11 +40,15 @@ export interface PixelBox {
 
 /** A single detected object/target in the drone's camera frame. */
 export interface DetectedTarget {
+  /** The detector's trackId — stable across frames for the same tracked object. */
   id: string;
   label: string;
   /** Detection confidence in [0, 1]. */
   confidence: number;
-  boundingBox: PixelBox;
+  boundingBox: NormalizedBox;
+  trackState: string;
+  lastSeenTimestamp: number;
+  velocityPxPerSec: { x: number; y: number };
 }
 
 /** Commands the operator can issue for a specific detected target. */

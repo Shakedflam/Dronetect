@@ -1,4 +1,4 @@
-import type { DetectedTarget, PixelBox } from '../../types/drone';
+import type { DetectedTarget, NormalizedBox } from '../../types/drone';
 import type { CoverTransform } from './useVideoCoverTransform';
 import styles from './DetectionOverlay.module.css';
 
@@ -9,11 +9,13 @@ interface DetectionOverlayProps {
   transform: CoverTransform | null;
 }
 
-function toDisplayRect(box: PixelBox, transform: CoverTransform) {
-  const left = box.x1 * transform.scale - transform.offsetX;
-  const top = box.y1 * transform.scale - transform.offsetY;
-  const right = box.x2 * transform.scale - transform.offsetX;
-  const bottom = box.y2 * transform.scale - transform.offsetY;
+function toDisplayRect(box: NormalizedBox, transform: CoverTransform) {
+  // Re-project the box (normalized against the detector's own frame size)
+  // into the video's intrinsic pixel space before applying the cover crop.
+  const left = box.x1 * transform.videoWidth * transform.scale - transform.offsetX;
+  const top = box.y1 * transform.videoHeight * transform.scale - transform.offsetY;
+  const right = box.x2 * transform.videoWidth * transform.scale - transform.offsetX;
+  const bottom = box.y2 * transform.videoHeight * transform.scale - transform.offsetY;
 
   return {
     left: `${(left / transform.containerWidth) * 100}%`,
@@ -25,11 +27,12 @@ function toDisplayRect(box: PixelBox, transform: CoverTransform) {
 
 /**
  * Draws one bounding box per detected target on top of the video feed.
- * Boxes arrive in the video's intrinsic pixel space; `transform` (derived
- * from the video's object-fit: cover mapping) converts them to on-screen
- * percentages so they stay aligned as the element is resized. Tapping a
- * box selects it — with multiple targets in frame, the operator has to pick
- * one before Follow/Ignore/Engage become available.
+ * Boxes are normalized against the detector's own frame size (which can
+ * differ from the video's intrinsic resolution); `transform` re-projects
+ * them into the video's displayed area, accounting for object-fit: cover,
+ * so they stay aligned as the element is resized. Tapping a box selects it
+ * — with multiple targets in frame, the operator has to pick one before
+ * Follow/Ignore/Engage become available.
  */
 export function DetectionOverlay({ targets, selectedTargetId, onSelectTarget, transform }: DetectionOverlayProps) {
   if (!transform) return <div className={styles.overlay} />;

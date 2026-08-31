@@ -53,8 +53,15 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
 class AutonomousDrone(Supervisor):
     K_VISUAL_PROPELLER_SPEED = 68.5
     KINEMATIC_FLIGHT_CONFIG = KinematicFlightConfig(
-        max_horizontal_speed_mps=14.0,
-        horizontal_acceleration_mps2=6.0,
+        max_horizontal_speed_mps=7.0,
+        horizontal_acceleration_mps2=3.0,
+        max_ascent_speed_mps=5.0,
+        max_descent_speed_mps=3.0,
+        max_yaw_rate_rad_s=math.radians(150.0),
+    )
+    SEARCH_KINEMATIC_FLIGHT_CONFIG = KinematicFlightConfig(
+        max_horizontal_speed_mps=3.5,
+        horizontal_acceleration_mps2=1.5,
         max_ascent_speed_mps=5.0,
         max_descent_speed_mps=3.0,
         max_yaw_rate_rad_s=math.radians(150.0),
@@ -255,7 +262,7 @@ class AutonomousDrone(Supervisor):
             yaw=self._kinematic_yaw,
             horizontal_speed_mps=self._horizontal_speed_mps,
             dt=dt,
-            config=self.KINEMATIC_FLIGHT_CONFIG,
+            config=self._kinematic_config_for_state(),
         )
         self.translation.setSFVec3f(list(step.position))
         self.rotation.setSFRotation([0.0, 0.0, 1.0, step.yaw])
@@ -267,6 +274,11 @@ class AutonomousDrone(Supervisor):
             step.speed_mps,
             step.vertical_speed_mps,
         )
+
+    def _kinematic_config_for_state(self) -> KinematicFlightConfig:
+        if self.logic.state is FlightState.FLYING_RANDOMLY:
+            return self.SEARCH_KINEMATIC_FLIGHT_CONFIG
+        return self.KINEMATIC_FLIGHT_CONFIG
 
     def _update_hud(
         self,

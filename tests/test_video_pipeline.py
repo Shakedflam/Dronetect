@@ -127,11 +127,17 @@ def test_realtime_video_ingest_forwards_vision_detections_to_tablets():
                         {
                             "type": "detections",
                             "frameId": frame.frame_id,
+                            "frameWidth": frame.width,
+                            "frameHeight": frame.height,
                             "detections": [
                                 {
                                     "className": "drone",
                                     "confidence": 0.87,
                                     "box": [10.0, 20.0, 110.0, 120.0],
+                                    "trackId": "drone-1",
+                                    "trackState": "confirmed",
+                                    "lastSeenTimestamp": frame.timestamp,
+                                    "velocityPxPerSec": {"x": 12.0, "y": -4.0},
                                 }
                             ],
                         }
@@ -168,11 +174,17 @@ def test_realtime_video_ingest_forwards_vision_detections_to_tablets():
     assert received == {
         "type": "detections",
         "frameId": 2,
+        "frameWidth": 1280,
+        "frameHeight": 720,
         "detections": [
             {
                 "className": "drone",
                 "confidence": 0.87,
                 "box": [10.0, 20.0, 110.0, 120.0],
+                "trackId": "drone-1",
+                "trackState": "confirmed",
+                "lastSeenTimestamp": 2.0,
+                "velocityPxPerSec": {"x": 12.0, "y": -4.0},
             }
         ],
     }

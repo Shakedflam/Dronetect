@@ -2,11 +2,14 @@ import { useEffect, useState } from 'react';
 
 /**
  * Maps the video's intrinsic pixel space onto its displayed box, matching
- * `object-fit: cover` (center-cropped, uniform scale-to-fill). Used to
- * convert YOLO pixel boxes — which are in the video's intrinsic frame — into
- * on-screen percentages that stay aligned as the element is resized.
+ * `object-fit: cover` (center-cropped, uniform scale-to-fill). Exposes the
+ * video's own intrinsic size too, since detection boxes are normalized
+ * against a possibly-different detector frame size and must be re-projected
+ * into the video's intrinsic space before the cover scale/offset apply.
  */
 export interface CoverTransform {
+  videoWidth: number;
+  videoHeight: number;
   scale: number;
   offsetX: number;
   offsetY: number;
@@ -30,6 +33,8 @@ export function useVideoCoverTransform(video: HTMLVideoElement | null): CoverTra
 
       const scale = Math.max(clientWidth / videoWidth, clientHeight / videoHeight);
       setTransform({
+        videoWidth,
+        videoHeight,
         scale,
         offsetX: (videoWidth * scale - clientWidth) / 2,
         offsetY: (videoHeight * scale - clientHeight) / 2,

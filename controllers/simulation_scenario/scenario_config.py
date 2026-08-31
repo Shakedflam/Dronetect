@@ -10,7 +10,9 @@ from typing import Any
 
 
 DEFAULT_TRAFFIC_DRONES = 3
-DEFAULT_BIRDS = 6
+DEFAULT_BIRDS = 3
+MAX_TRAFFIC_DRONES = 5
+MAX_BIRDS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,12 +33,17 @@ def load_scenario_config(path: Path) -> ScenarioConfig:
         return ScenarioConfig()
 
     return ScenarioConfig(
-        traffic_drone_count=_read_count(raw, "traffic_drones", DEFAULT_TRAFFIC_DRONES),
-        bird_count=_read_count(raw, "birds", DEFAULT_BIRDS),
+        traffic_drone_count=_read_count(
+            raw,
+            "traffic_drones",
+            DEFAULT_TRAFFIC_DRONES,
+            MAX_TRAFFIC_DRONES,
+        ),
+        bird_count=_read_count(raw, "birds", DEFAULT_BIRDS, MAX_BIRDS),
     )
 
 
-def _read_count(raw: dict[str, Any], section: str, default: int) -> int:
+def _read_count(raw: dict[str, Any], section: str, default: int, maximum: int) -> int:
     section_value = raw.get(section)
     if not isinstance(section_value, dict):
         return default
@@ -45,6 +52,6 @@ def _read_count(raw: dict[str, Any], section: str, default: int) -> int:
     if isinstance(count, bool):
         return default
     try:
-        return max(0, int(count))
+        return min(max(0, int(count)), maximum)
     except (TypeError, ValueError):
         return default

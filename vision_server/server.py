@@ -13,6 +13,7 @@ from realtime_server.protocol import build_detection_message, encode_message
 from services.video import VIDEO_MAX_PACKET_BYTES, VideoFrame, VideoPacketError, decode_video_frame
 from vision_server.detector import Detection, DroneDetector, create_drone_detector
 from vision_server.diagnostics import VisionDiagnostics
+from vision_server.tracker import DroneTracker
 
 
 DEFAULT_FRAME_HOST = "127.0.0.1"
@@ -28,6 +29,7 @@ class VisionServer:
     ) -> None:
         self.config = config or load_video_config()
         self.detector = detector or create_drone_detector()
+        self.tracker = DroneTracker()
         self.diagnostics = VisionDiagnostics()
         self._last_log_count = 0
 
@@ -46,7 +48,13 @@ class VisionServer:
                 continue
             self.diagnostics.record(frame)
             detections = await self._detect(frame)
-            await websocket.send(encode_message(build_detection_message(frame, detections)))
+            tracked_detections = self.tracker.update(
+                detections,
+                timestamp=frame.timestamp,
+                frame_width=frame.width,
+                frame_height=frame.height,
+            )
+            await websocket.send(encode_message(build_detection_message(frame, tracked_detections)))
             self._log_detections(frame.frame_id, detections)
             self._log_progress()
 

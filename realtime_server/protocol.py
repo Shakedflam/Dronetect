@@ -142,11 +142,20 @@ def build_detection_message(frame: Any, detections: list[Any]) -> dict[str, Any]
     return {
         "type": MESSAGE_TYPE_DETECTIONS,
         "frameId": frame.frame_id,
+        "frameWidth": frame.width,
+        "frameHeight": frame.height,
         "detections": [
             {
                 "className": detection.class_name,
                 "confidence": detection.confidence,
                 "box": list(detection.box),
+                "trackId": detection.track_id,
+                "trackState": detection.track_state,
+                "lastSeenTimestamp": detection.last_seen_timestamp,
+                "velocityPxPerSec": {
+                    "x": detection.velocity_px_per_sec[0],
+                    "y": detection.velocity_px_per_sec[1],
+                },
             }
             for detection in detections
         ],
@@ -173,6 +182,8 @@ def validate_detection_message(message: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": MESSAGE_TYPE_DETECTIONS,
         "frameId": _required_int(message, "frameId"),
+        "frameWidth": _required_int(message, "frameWidth"),
+        "frameHeight": _required_int(message, "frameHeight"),
         "detections": [_validate_detection(detection) for detection in detections],
     }
 
@@ -213,6 +224,35 @@ def _validate_detection(value: Any) -> dict[str, Any]:
         "className": _required_string(value, "className"),
         "confidence": confidence,
         "box": [_required_number({"value": coordinate}, "value") for coordinate in box],
+        "trackId": _required_string(value, "trackId"),
+        "trackState": _required_track_state(value),
+        "lastSeenTimestamp": _required_number(value, "lastSeenTimestamp"),
+        "velocityPxPerSec": _required_velocity(value),
+    }
+
+
+def _required_track_state(message: dict[str, Any]) -> str:
+    value = _required_string(message, "trackState")
+    if value not in {"tentative", "confirmed", "lost"}:
+        raise ProtocolError(
+            "validation_error",
+            "Detection trackState must be 'tentative', 'confirmed', or 'lost'.",
+            details={"field": "trackState"},
+        )
+    return value
+
+
+def _required_velocity(message: dict[str, Any]) -> dict[str, float]:
+    velocity = message.get("velocityPxPerSec")
+    if not isinstance(velocity, dict):
+        raise ProtocolError(
+            "validation_error",
+            "Detection velocityPxPerSec must be an object.",
+            details={"field": "velocityPxPerSec"},
+        )
+    return {
+        "x": _required_number(velocity, "x"),
+        "y": _required_number(velocity, "y"),
     }
 
 

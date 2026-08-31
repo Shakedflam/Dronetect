@@ -181,6 +181,13 @@ class RealtimeServer:
         await self._broadcast_to_tablets(encode_message(telemetry))
 
     async def _route_vision_detections(self, detections: dict) -> None:
+        if detections.get("detections"):
+            print(
+                "realtime_server forwarding detections "
+                f"frame_id={detections.get('frameId')} "
+                f"count={len(detections['detections'])} "
+                f"tablets={len(self.tablets)}"
+            )
         await self._broadcast_to_tablets(encode_message(detections))
 
     async def _route_tablet_message(

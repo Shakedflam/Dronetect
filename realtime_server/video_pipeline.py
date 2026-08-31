@@ -161,7 +161,11 @@ class VisionFrameForwarder:
                 continue
             try:
                 message = validate_detection_message(parse_json_message(raw))
-            except ProtocolError:
+            except ProtocolError as exc:
+                print(
+                    "realtime_server dropped invalid vision detection message "
+                    f"field={exc.details.get('field')} code={exc.code}"
+                )
                 continue
             if self._detection_handler is not None:
                 await self._detection_handler(message)
