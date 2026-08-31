@@ -43,7 +43,10 @@ class RealtimeServer:
     def __init__(self, video_config: VideoConfig | None = None) -> None:
         self.drone: DroneSdkConnection | None = None
         self.video_source: VideoSourceConnection | None = None
-        self.video_pipeline = VideoPipeline(video_config or load_video_config())
+        self.video_pipeline = VideoPipeline(
+            video_config or load_video_config(),
+            detection_handler=self._route_vision_detections,
+        )
         self._video_pipeline_started = False
         self.tablets: set[ServerConnection] = set()
 
@@ -176,6 +179,9 @@ class RealtimeServer:
 
     async def _route_drone_telemetry(self, telemetry: dict) -> None:
         await self._broadcast_to_tablets(encode_message(telemetry))
+
+    async def _route_vision_detections(self, detections: dict) -> None:
+        await self._broadcast_to_tablets(encode_message(detections))
 
     async def _route_tablet_message(
         self,

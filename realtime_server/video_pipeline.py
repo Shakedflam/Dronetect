@@ -14,7 +14,13 @@ from PIL import Image
 from websockets.exceptions import ConnectionClosed
 
 from config.video import VideoConfig
-from realtime_server.protocol import ProtocolError, encode_message, parse_json_message, validate_role
+from realtime_server.protocol import (
+    ProtocolError,
+    encode_message,
+    parse_json_message,
+    validate_detection_message,
+    validate_role,
+)
 from services.video import (
     JPEG_ENCODING,
     LatestFrameBuffer,
@@ -74,9 +80,11 @@ class VisionFrameForwarder:
         self,
         frames_url: str,
         connect_factory: Callable[[str], Awaitable] | None = None,
+        detection_handler: Callable[[dict], Awaitable[None]] | None = None,
     ) -> None:
         self.frames_url = frames_url
         self._connect_factory = connect_factory
+        self._detection_handler = detection_handler
         self._queue: Queue[VideoFrame] = Queue(maxsize=1)
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
@@ -114,12 +122,26 @@ class VisionFrameForwarder:
                     await asyncio.sleep(RECONNECT_DELAY_S)
                     continue
                 async with connector(self.frames_url) as websocket:
-                    await self._send_frames(websocket)
+                    await self._exchange_frames_and_detections(websocket)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 if not self._stop.is_set():
                     await asyncio.sleep(RECONNECT_DELAY_S)
+
+    async def _exchange_frames_and_detections(self, websocket) -> None:
+        sender = asyncio.create_task(self._send_frames(websocket))
+        receiver = asyncio.create_task(self._receive_detections(websocket))
+        done, pending = await asyncio.wait(
+            {sender, receiver},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            task.result()
 
     async def _send_frames(self, websocket) -> None:
         while not self._stop.is_set():
@@ -133,6 +155,17 @@ class VisionFrameForwarder:
                 continue
             await websocket.send(encode_video_frame(frame))
 
+    async def _receive_detections(self, websocket) -> None:
+        async for raw in websocket:
+            if not isinstance(raw, str):
+                continue
+            try:
+                message = validate_detection_message(parse_json_message(raw))
+            except ProtocolError:
+                continue
+            if self._detection_handler is not None:
+                await self._detection_handler(message)
+
     def _drain_stale(self) -> None:
         while True:
             try:
@@ -144,10 +177,17 @@ class VisionFrameForwarder:
 class VideoPipeline:
     """Coordinates video ingest, WebRTC viewers, and vision forwarding."""
 
-    def __init__(self, config: VideoConfig) -> None:
+    def __init__(
+        self,
+        config: VideoConfig,
+        detection_handler: Callable[[dict], Awaitable[None]] | None = None,
+    ) -> None:
         self.config = config
         self.hub = VideoHub()
-        self.vision = VisionFrameForwarder(config.vision_server_frames_url)
+        self.vision = VisionFrameForwarder(
+            config.vision_server_frames_url,
+            detection_handler=detection_handler,
+        )
 
     def start(self) -> None:
         self.vision.start()

@@ -1,9 +1,10 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useState } from 'react';
 import type { DetectedTarget } from '../../types/drone';
 import { useLocation } from '../../hooks/useLocation';
 import { useVideoStream } from '../../hooks/useVideoStream';
 import { DetectionOverlay } from './DetectionOverlay';
 import { CompassStrip } from './CompassStrip';
+import { useVideoCoverTransform } from './useVideoCoverTransform';
 import styles from './DroneVideo.module.css';
 
 interface DroneVideoProps {
@@ -20,21 +21,21 @@ interface DroneVideoProps {
 export function DroneVideo({ targets, selectedTargetId, onSelectTarget }: DroneVideoProps) {
   const position = useLocation();
   const stream = useVideoStream();
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const [videoElement, setVideoElement] = useState<HTMLVideoElement | null>(null);
+  const transform = useVideoCoverTransform(videoElement);
 
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.srcObject = stream;
+    if (!videoElement) return;
+    videoElement.srcObject = stream;
     return () => {
-      video.srcObject = null;
+      videoElement.srcObject = null;
     };
-  }, [stream]);
+  }, [stream, videoElement]);
 
   return (
     <div className={styles.wrapper}>
       {stream ? (
-        <video ref={videoRef} className={styles.videoFeed} autoPlay playsInline muted />
+        <video ref={setVideoElement} className={styles.videoFeed} autoPlay playsInline muted />
       ) : (
         <div className={styles.feedPlaceholder}>
           <div className={styles.scanlines} />
@@ -45,6 +46,7 @@ export function DroneVideo({ targets, selectedTargetId, onSelectTarget }: DroneV
         targets={targets}
         selectedTargetId={selectedTargetId}
         onSelectTarget={onSelectTarget}
+        transform={transform}
       />
       {position && <CompassStrip headingDeg={position.headingDeg} />}
     </div>

@@ -26,12 +26,12 @@ export interface TelemetryData {
   etaSeconds?: number;
 }
 
-/** Normalized bounding box, values in [0, 1] relative to the video frame. */
-export interface NormalizedBoundingBox {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
+/** Bounding box in the pixel coordinate space of the video's intrinsic frame (videoWidth/videoHeight). */
+export interface PixelBox {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
 }
 
 /** A single detected object/target in the drone's camera frame. */
@@ -40,7 +40,7 @@ export interface DetectedTarget {
   label: string;
   /** Detection confidence in [0, 1]. */
   confidence: number;
-  boundingBox: NormalizedBoundingBox;
+  boundingBox: PixelBox;
 }
 
 /** Commands the operator can issue for a specific detected target. */

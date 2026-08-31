@@ -25,9 +25,18 @@ class FakeDetector:
         ]
 
 
+class FakeEmptyDetector:
+    def __init__(self) -> None:
+        self.frames: list[VideoFrame] = []
+
+    def detect(self, frame: VideoFrame) -> list[Detection]:
+        self.frames.append(frame)
+        return []
+
+
 def test_vision_server_receives_frames_and_updates_diagnostics():
     async def scenario():
-        vision_server = VisionServer(VideoConfig())
+        vision_server = VisionServer(VideoConfig(), detector=FakeEmptyDetector())
         async with serve(vision_server.frame_handler, "127.0.0.1", 0) as server:
             port = server.sockets[0].getsockname()[1]
             async with connect(f"ws://127.0.0.1:{port}/frames") as websocket:
@@ -67,6 +76,54 @@ def test_vision_server_runs_detector_and_logs_detections(capsys):
     assert vision_server.diagnostics.received_count == 1
     assert detector.frames[0].frame_id == 42
     assert "frame_id=42 detections=1 drone conf=0.87 box=(10.0,20.0,110.0,120.0)" in output
+
+
+def test_vision_server_sends_detection_message_for_detected_frame():
+    async def scenario():
+        detector = FakeDetector()
+        vision_server = VisionServer(VideoConfig(), detector=detector)
+        async with serve(vision_server.frame_handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            async with connect(f"ws://127.0.0.1:{port}/frames") as websocket:
+                await websocket.send(encode_video_frame(_frame(42)))
+                raw = await asyncio.wait_for(websocket.recv(), 1.0)
+
+        return json.loads(raw)
+
+    message = asyncio.run(scenario())
+
+    assert message == {
+        "type": "detections",
+        "frameId": 42,
+        "detections": [
+            {
+                "className": "drone",
+                "confidence": 0.87,
+                "box": [10.0, 20.0, 110.0, 120.0],
+            }
+        ],
+    }
+
+
+def test_vision_server_sends_empty_detection_message_for_clear_frame():
+    async def scenario():
+        detector = FakeEmptyDetector()
+        vision_server = VisionServer(VideoConfig(), detector=detector)
+        async with serve(vision_server.frame_handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            async with connect(f"ws://127.0.0.1:{port}/frames") as websocket:
+                await websocket.send(encode_video_frame(_frame(44)))
+                raw = await asyncio.wait_for(websocket.recv(), 1.0)
+
+        return json.loads(raw)
+
+    message = asyncio.run(scenario())
+
+    assert message == {
+        "type": "detections",
+        "frameId": 44,
+        "detections": [],
+    }
 
 
 def test_vision_server_exposes_http_diagnostics():

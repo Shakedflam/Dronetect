@@ -1,10 +1,11 @@
 import asyncio
+import json
 
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
 from config.video import VideoConfig
-from realtime_server.protocol import ROLE_DRONE
+from realtime_server.protocol import ROLE_DRONE, encode_message
 from realtime_server.server import RealtimeServer
 from realtime_server.video_pipeline import ROLE_VIEWER, VideoPipeline, validate_video_role
 from services.video import (
@@ -114,6 +115,67 @@ def test_realtime_video_ingest_forwards_even_frames_to_vision_server():
         assert received_frame_ids == [2, 4]
 
     asyncio.run(scenario())
+
+
+def test_realtime_video_ingest_forwards_vision_detections_to_tablets():
+    async def scenario():
+        async def vision_handler(websocket):
+            async for packet in websocket:
+                frame = decode_video_frame(bytes(packet))
+                await websocket.send(
+                    encode_message(
+                        {
+                            "type": "detections",
+                            "frameId": frame.frame_id,
+                            "detections": [
+                                {
+                                    "className": "drone",
+                                    "confidence": 0.87,
+                                    "box": [10.0, 20.0, 110.0, 120.0],
+                                }
+                            ],
+                        }
+                    )
+                )
+
+        async with serve(vision_handler, "127.0.0.1", 0) as vision:
+            vision_port = vision.sockets[0].getsockname()[1]
+            realtime_server = RealtimeServer(
+                VideoConfig(
+                    vision_frame_interval=2,
+                    vision_server_frames_url=f"ws://127.0.0.1:{vision_port}/frames",
+                )
+            )
+            realtime_server.start_background_tasks()
+            try:
+                async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+                    port = server.sockets[0].getsockname()[1]
+                    await asyncio.sleep(0.2)
+                    async with (
+                        connect(f"ws://127.0.0.1:{port}/ws?role=tablet") as tablet,
+                        connect(f"ws://127.0.0.1:{port}/video/ingest?role=drone") as source,
+                    ):
+                        await source.send(encode_video_frame_bundle(_bundle(1)))
+                        await source.send(encode_video_frame_bundle(_bundle(2)))
+                        raw = await asyncio.wait_for(tablet.recv(), 2.0)
+            finally:
+                await realtime_server.video_pipeline.vision.stop()
+
+        return json.loads(raw)
+
+    received = asyncio.run(scenario())
+
+    assert received == {
+        "type": "detections",
+        "frameId": 2,
+        "detections": [
+            {
+                "className": "drone",
+                "confidence": 0.87,
+                "box": [10.0, 20.0, 110.0, 120.0],
+            }
+        ],
+    }
 
 
 def test_video_ingest_continues_when_vision_server_is_offline():

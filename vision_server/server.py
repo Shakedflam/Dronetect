@@ -9,6 +9,7 @@ import os
 from websockets.asyncio.server import ServerConnection, serve
 
 from config.video import VideoConfig, load_video_config
+from realtime_server.protocol import build_detection_message, encode_message
 from services.video import VIDEO_MAX_PACKET_BYTES, VideoFrame, VideoPacketError, decode_video_frame
 from vision_server.detector import Detection, DroneDetector, create_drone_detector
 from vision_server.diagnostics import VisionDiagnostics
@@ -45,6 +46,7 @@ class VisionServer:
                 continue
             self.diagnostics.record(frame)
             detections = await self._detect(frame)
+            await websocket.send(encode_message(build_detection_message(frame, detections)))
             self._log_detections(frame.frame_id, detections)
             self._log_progress()
 

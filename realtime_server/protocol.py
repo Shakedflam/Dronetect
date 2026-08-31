@@ -12,6 +12,7 @@ from services.commands import SUPPORTED_COMMANDS
 MESSAGE_TYPE_TELEMETRY = "telemetry"
 MESSAGE_TYPE_COMMAND = "command"
 MESSAGE_TYPE_COMMAND_ACK = "command_ack"
+MESSAGE_TYPE_DETECTIONS = "detections"
 MESSAGE_TYPE_ERROR = "error"
 
 ROLE_DRONE = "drone"
@@ -137,12 +138,93 @@ def validate_telemetry_message(message: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_detection_message(frame: Any, detections: list[Any]) -> dict[str, Any]:
+    return {
+        "type": MESSAGE_TYPE_DETECTIONS,
+        "frameId": frame.frame_id,
+        "detections": [
+            {
+                "className": detection.class_name,
+                "confidence": detection.confidence,
+                "box": list(detection.box),
+            }
+            for detection in detections
+        ],
+    }
+
+
+def validate_detection_message(message: dict[str, Any]) -> dict[str, Any]:
+    message_type = _required_string(message, "type")
+    if message_type != MESSAGE_TYPE_DETECTIONS:
+        raise ProtocolError(
+            "invalid_type",
+            "Vision messages sent as detections must use type 'detections'.",
+            details={"type": message_type},
+        )
+
+    detections = message.get("detections")
+    if not isinstance(detections, list):
+        raise ProtocolError(
+            "validation_error",
+            "Required list field 'detections' is missing or invalid.",
+            details={"field": "detections"},
+        )
+
+    return {
+        "type": MESSAGE_TYPE_DETECTIONS,
+        "frameId": _required_int(message, "frameId"),
+        "detections": [_validate_detection(detection) for detection in detections],
+    }
+
+
 def command_ack(command_id: str, status: str = "accepted") -> dict[str, str]:
     return {
         "type": MESSAGE_TYPE_COMMAND_ACK,
         "commandId": command_id,
         "status": status,
     }
+
+
+def _validate_detection(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ProtocolError(
+            "validation_error",
+            "Detection entries must be JSON objects.",
+            details={"field": "detections"},
+        )
+
+    confidence = _required_number(value, "confidence")
+    if confidence < 0.0 or confidence > 1.0:
+        raise ProtocolError(
+            "validation_error",
+            "Detection confidence must be between 0 and 1.",
+            details={"field": "confidence"},
+        )
+
+    box = value.get("box")
+    if not isinstance(box, list) or len(box) != 4:
+        raise ProtocolError(
+            "validation_error",
+            "Detection box must be a four-number list.",
+            details={"field": "box"},
+        )
+
+    return {
+        "className": _required_string(value, "className"),
+        "confidence": confidence,
+        "box": [_required_number({"value": coordinate}, "value") for coordinate in box],
+    }
+
+
+def _required_int(message: dict[str, Any], key: str) -> int:
+    value = message.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProtocolError(
+            "validation_error",
+            f"Required integer field '{key}' is missing or invalid.",
+            details={"field": key},
+        )
+    return value
 
 
 def _required_string(message: dict[str, Any], key: str) -> str:

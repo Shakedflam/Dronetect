@@ -3,15 +3,19 @@ import pytest
 from realtime_server.protocol import (
     ROLE_DRONE,
     ProtocolError,
+    build_detection_message,
     command_ack,
     encode_message,
     parse_json_message,
+    validate_detection_message,
     validate_command_message,
     validate_role,
     validate_telemetry_message,
 )
 from services.gps import LocalPosition
 from services.telemetry import build_simulator_telemetry
+from services.video import JPEG_ENCODING, VideoFrame
+from vision_server.detector import Detection
 
 
 def test_valid_telemetry_validates_and_serializes():
@@ -50,6 +54,88 @@ def test_valid_command_validates_and_serializes():
         "command": "return_home",
         "params": {},
     }
+
+
+def test_valid_detection_message_validates_and_serializes():
+    raw = build_detection_message(
+        VideoFrame(
+            frame_id=150,
+            timestamp=1720000000.123,
+            width=960,
+            height=540,
+            encoding=JPEG_ENCODING,
+            data=b"jpeg",
+        ),
+        [
+            Detection(
+                class_name="drone",
+                confidence=0.87,
+                box=(420.0, 180.0, 580.0, 310.0),
+            )
+        ],
+    )
+
+    message = validate_detection_message(parse_json_message(encode_message(raw)))
+
+    assert message == {
+        "type": "detections",
+        "frameId": 150,
+        "detections": [
+            {
+                "className": "drone",
+                "confidence": 0.87,
+                "box": [420.0, 180.0, 580.0, 310.0],
+            }
+        ],
+    }
+
+
+def test_empty_detection_message_validates():
+    message = validate_detection_message(
+        {
+            "type": "detections",
+            "frameId": 150,
+            "detections": [],
+        }
+    )
+
+    assert message == {
+        "type": "detections",
+        "frameId": 150,
+        "detections": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "message,field",
+    [
+        ({"type": "telemetry", "frameId": 150, "detections": []}, "type"),
+        ({"type": "detections", "detections": []}, "frameId"),
+        ({"type": "detections", "frameId": 150, "detections": {}}, "detections"),
+        (
+            {
+                "type": "detections",
+                "frameId": 150,
+                "detections": [{"className": "drone", "confidence": 1.5, "box": [1, 2, 3, 4]}],
+            },
+            "confidence",
+        ),
+        (
+            {
+                "type": "detections",
+                "frameId": 150,
+                "detections": [{"className": "drone", "confidence": 0.8, "box": [1, 2, 3]}],
+            },
+            "box",
+        ),
+    ],
+)
+def test_invalid_detection_messages_are_rejected(message, field):
+    with pytest.raises(ProtocolError) as exc_info:
+        validate_detection_message(message)
+
+    if field != "type":
+        assert exc_info.value.details["field"] == field
 
 
 def test_unknown_command_is_rejected():

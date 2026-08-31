@@ -23,11 +23,22 @@ export interface TelemetryMessage {
   };
 }
 
+export interface DetectionsMessage {
+  type: 'detections';
+  frameId: number;
+  detections: Array<{
+    className: string;
+    confidence: number;
+    box: [number, number, number, number];
+  }>;
+}
+
 /** Exactly the command names the realtime server/simulator currently support. */
 export type RealtimeServerCommandName = 'return_home' | 'new_mission' | 'camera_tilt_up' | 'camera_tilt_down';
 
 export interface RealtimeServerConnection {
   subscribeTelemetry(listener: (message: TelemetryMessage) => void): Unsubscribe;
+  subscribeDetections(listener: (message: DetectionsMessage) => void): Unsubscribe;
   subscribeStatus(listener: (status: ConnectionStatus) => void): Unsubscribe;
   sendCommand(command: RealtimeServerCommandName, params?: Record<string, unknown>): Promise<void>;
 }
@@ -69,8 +80,29 @@ function isTelemetryMessage(value: unknown): value is TelemetryMessage {
   );
 }
 
+function isDetectionsMessage(value: unknown): value is DetectionsMessage {
+  if (typeof value !== 'object' || value === null) return false;
+  const message = value as Record<string, unknown>;
+  if (message.type !== 'detections') return false;
+  if (typeof message.frameId !== 'number') return false;
+  if (!Array.isArray(message.detections)) return false;
+
+  return message.detections.every((detection) => {
+    if (typeof detection !== 'object' || detection === null) return false;
+    const d = detection as Record<string, unknown>;
+    return (
+      typeof d.className === 'string' &&
+      typeof d.confidence === 'number' &&
+      Array.isArray(d.box) &&
+      d.box.length === 4 &&
+      d.box.every((coordinate) => typeof coordinate === 'number')
+    );
+  });
+}
+
 function createRealtimeServerConnection(): RealtimeServerConnection {
   const telemetryListeners = new Set<(message: TelemetryMessage) => void>();
+  const detectionListeners = new Set<(message: DetectionsMessage) => void>();
   const statusListeners = new Set<(status: ConnectionStatus) => void>();
   const pendingCommands = new Map<string, PendingCommand>();
 
@@ -114,6 +146,14 @@ function createRealtimeServerConnection(): RealtimeServerConnection {
           return;
         }
         telemetryListeners.forEach((listener) => listener(message));
+        return;
+      }
+      case 'detections': {
+        if (!isDetectionsMessage(message)) {
+          console.warn('[realtimeServerConnection] detections message failed shape check, ignoring', message);
+          return;
+        }
+        detectionListeners.forEach((listener) => listener(message));
         return;
       }
       case 'command_ack': {
@@ -187,6 +227,10 @@ function createRealtimeServerConnection(): RealtimeServerConnection {
     subscribeTelemetry(listener) {
       telemetryListeners.add(listener);
       return () => telemetryListeners.delete(listener);
+    },
+    subscribeDetections(listener) {
+      detectionListeners.add(listener);
+      return () => detectionListeners.delete(listener);
     },
     subscribeStatus(listener) {
       statusListeners.add(listener);
