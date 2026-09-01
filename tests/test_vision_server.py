@@ -95,6 +95,7 @@ def test_vision_server_sends_detection_message_for_detected_frame():
     assert message == {
         "type": "detections",
         "frameId": 42,
+        "timestampMs": 42000,
         "frameWidth": 640,
         "frameHeight": 360,
         "detections": [
@@ -128,6 +129,7 @@ def test_vision_server_sends_empty_detection_message_for_clear_frame():
     assert message == {
         "type": "detections",
         "frameId": 44,
+        "timestampMs": 44000,
         "frameWidth": 640,
         "frameHeight": 360,
         "detections": [],

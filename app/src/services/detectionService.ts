@@ -8,9 +8,10 @@ import type { Unsubscribe } from './internal/unsubscribe';
  * multiple other drones in frame) — choosing which one to act on is a UI
  * concern handled above this layer, not something the detector decides.
  *
- * Detections update at ~6 FPS while video runs at ~30 FPS; there is no
- * interpolation or tracking here — listeners simply keep the last-received
- * boxes until the next message replaces them.
+ * Detections update at ~10 FPS while video runs at ~30 FPS; there is no
+ * interpolation here. The backend may keep lost tracks alive briefly for
+ * re-identification, but the operator overlay should only render boxes that
+ * came from the latest successful detector match.
  */
 export interface DetectionService {
   subscribe(listener: (targets: DetectedTarget[]) => void): Unsubscribe;
@@ -20,19 +21,34 @@ function toLabel(className: string): string {
   return className.charAt(0).toUpperCase() + className.slice(1);
 }
 
+/** Dev-only: how often to log detection age, so ~10fps updates don't flood the console. */
+const DEV_LATENCY_LOG_INTERVAL_MS = 1000;
+
 function createRealtimeServerDetectionService(): DetectionService {
-  let lastFrameId = -1;
+  let lastLatencyLogAt = 0;
 
   return {
     subscribe(listener) {
       return realtimeServerConnection.subscribeDetections((message) => {
-        if (message.frameId < lastFrameId) return;
-        lastFrameId = message.frameId;
-
+        const frameTimestampMs = message.timestampMs ?? Date.now();
         const { frameWidth, frameHeight } = message;
+        const activeDetections = message.detections.filter(
+          (detection) => detection.trackState !== 'lost'
+        );
+
+        if (import.meta.env.DEV) {
+          const now = Date.now();
+          if (now - lastLatencyLogAt >= DEV_LATENCY_LOG_INTERVAL_MS) {
+            lastLatencyLogAt = now;
+            // Camera -> YOLO -> tracker -> WebSocket -> tablet delay for this frame.
+            console.debug(
+              `[detectionService] frame ${message.frameId} age=${now - frameTimestampMs}ms raw=${message.detections.length} active=${activeDetections.length}`
+            );
+          }
+        }
 
         listener(
-          message.detections.map((detection) => ({
+          activeDetections.map((detection) => ({
             id: detection.trackId,
             label: toLabel(detection.className),
             confidence: detection.confidence,
@@ -45,6 +61,11 @@ function createRealtimeServerDetectionService(): DetectionService {
             trackState: detection.trackState,
             lastSeenTimestamp: detection.lastSeenTimestamp,
             velocityPxPerSec: detection.velocityPxPerSec,
+            frameTimestampMs,
+            velocityNormalizedPerSec: {
+              x: detection.velocityPxPerSec.x / frameWidth,
+              y: detection.velocityPxPerSec.y / frameHeight,
+            },
           }))
         );
       });

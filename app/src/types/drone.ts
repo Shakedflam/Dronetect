@@ -49,6 +49,15 @@ export interface DetectedTarget {
   trackState: string;
   lastSeenTimestamp: number;
   velocityPxPerSec: { x: number; y: number };
+  /**
+   * The backend's own capture timestamp for this detection (Unix epoch ms,
+   * from the wire message's `timestampMs`), preserved as received — never
+   * replaced with the frontend's receive time. Used to age/clamp frontend
+   * visual extrapolation between backend updates.
+   */
+  frameTimestampMs: number;
+  /** `velocityPxPerSec` converted to the same normalized [0, 1] units as `boundingBox`, for extrapolating box position between updates. */
+  velocityNormalizedPerSec: { x: number; y: number };
 }
 
 /** Commands the operator can issue for a specific detected target. */

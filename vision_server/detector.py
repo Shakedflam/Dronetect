@@ -15,7 +15,7 @@ from services.video import JPEG_ENCODING, VideoFrame
 
 DEFAULT_YOLO_MODEL_PATH = "models/drone.pt"
 DEFAULT_YOLO_CONFIDENCE = 0.35
-DEFAULT_YOLO_IMAGE_SIZE: int | None = None
+DEFAULT_YOLO_IMAGE_SIZE: int | None = 960
 DRONE_CLASS_NAMES = {"drone", "uav", "quadcopter"}
 
 

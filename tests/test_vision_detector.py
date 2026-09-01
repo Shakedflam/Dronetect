@@ -109,6 +109,22 @@ def test_create_drone_detector_reads_image_size_env(monkeypatch, tmp_path):
     assert detector.image_size == 960
 
 
+def test_create_drone_detector_uses_default_image_size(monkeypatch, tmp_path):
+    import sys
+    import types
+
+    yolo_module = types.ModuleType("ultralytics")
+    setattr(yolo_module, "YOLO", FakeYoloModel)
+    monkeypatch.setitem(sys.modules, "ultralytics", yolo_module)
+
+    model_path = tmp_path / "drone.pt"
+    model_path.write_bytes(b"weights")
+    detector = create_drone_detector(model_path=model_path, logger=lambda _: None)
+
+    assert isinstance(detector, YoloDroneDetector)
+    assert detector.image_size == 960
+
+
 class FakeYoloModel:
     names = {0: "drone"}
 

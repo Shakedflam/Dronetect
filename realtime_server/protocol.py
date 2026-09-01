@@ -142,6 +142,7 @@ def build_detection_message(frame: Any, detections: list[Any]) -> dict[str, Any]
     return {
         "type": MESSAGE_TYPE_DETECTIONS,
         "frameId": frame.frame_id,
+        "timestampMs": _timestamp_ms(frame.timestamp),
         "frameWidth": frame.width,
         "frameHeight": frame.height,
         "detections": [
@@ -182,6 +183,7 @@ def validate_detection_message(message: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": MESSAGE_TYPE_DETECTIONS,
         "frameId": _required_int(message, "frameId"),
+        "timestampMs": _required_number(message, "timestampMs"),
         "frameWidth": _required_int(message, "frameWidth"),
         "frameHeight": _required_int(message, "frameHeight"),
         "detections": [_validate_detection(detection) for detection in detections],
@@ -298,3 +300,7 @@ def _required_object(message: dict[str, Any], key: str) -> dict[str, Any]:
         f"Required object field '{key}' is missing or invalid.",
         details={"field": key},
     )
+
+
+def _timestamp_ms(timestamp_seconds: float) -> int:
+    return int(round(timestamp_seconds * 1000.0))

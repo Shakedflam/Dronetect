@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Literal
 
 from vision_server.detector import Box, Detection
@@ -13,8 +14,12 @@ Velocity = tuple[float, float]
 
 MIN_IOU_MATCH = 0.2
 MAX_CENTER_DISTANCE_DIAGONALS = 1.0
+MIN_CENTER_DISTANCE_FRAME_DIAGONALS = 0.20
 CONFIRMATION_HITS = 2
 MAX_CONSECUTIVE_MISSES = 5
+LOST_AFTER_SECONDS = 0.25
+REMOVE_AFTER_SECONDS = 0.80
+MAX_VELOCITY_PX_PER_SEC = 5000.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,11 +45,24 @@ class _Track:
     hits: int
     consecutive_misses: int
 
-    def to_detection(self) -> TrackedDetection:
+    def to_detection(
+        self,
+        *,
+        timestamp: float,
+        frame_width: int,
+        frame_height: int,
+        prediction_horizon_seconds: float,
+    ) -> TrackedDetection:
         return TrackedDetection(
             class_name=self.class_name,
             confidence=self.confidence,
-            box=self.box,
+            box=_predict_box(
+                self,
+                timestamp=timestamp,
+                frame_width=frame_width,
+                frame_height=frame_height,
+                prediction_horizon_seconds=prediction_horizon_seconds,
+            ),
             track_id=self.track_id,
             track_state=self.track_state,
             last_seen_timestamp=self.last_seen_timestamp,
@@ -60,13 +78,21 @@ class DroneTracker:
         *,
         min_iou_match: float = MIN_IOU_MATCH,
         max_center_distance_diagonals: float = MAX_CENTER_DISTANCE_DIAGONALS,
+        min_center_distance_frame_diagonals: float = MIN_CENTER_DISTANCE_FRAME_DIAGONALS,
         confirmation_hits: int = CONFIRMATION_HITS,
         max_consecutive_misses: int = MAX_CONSECUTIVE_MISSES,
+        lost_after_seconds: float = LOST_AFTER_SECONDS,
+        remove_after_seconds: float = REMOVE_AFTER_SECONDS,
+        max_velocity_px_per_sec: float = MAX_VELOCITY_PX_PER_SEC,
     ) -> None:
         self.min_iou_match = min_iou_match
         self.max_center_distance_diagonals = max_center_distance_diagonals
+        self.min_center_distance_frame_diagonals = min_center_distance_frame_diagonals
         self.confirmation_hits = confirmation_hits
         self.max_consecutive_misses = max_consecutive_misses
+        self.lost_after_seconds = max(0.0, lost_after_seconds)
+        self.remove_after_seconds = max(remove_after_seconds, self.lost_after_seconds)
+        self.max_velocity_px_per_sec = max_velocity_px_per_sec
         self._next_track_number = 1
         self._tracks: list[_Track] = []
 
@@ -78,12 +104,18 @@ class DroneTracker:
         frame_width: int,
         frame_height: int,
     ) -> list[TrackedDetection]:
-        del frame_width, frame_height
+        timestamp = _valid_timestamp(timestamp)
         unmatched_track_indexes = set(range(len(self._tracks)))
         next_tracks: list[_Track] = []
 
         for detection in detections:
-            track_index = self._best_track_index(detection, unmatched_track_indexes)
+            track_index = self._best_track_index(
+                detection,
+                unmatched_track_indexes,
+                timestamp=timestamp,
+                frame_width=frame_width,
+                frame_height=frame_height,
+            )
             if track_index is None:
                 next_tracks.append(self._new_track(detection, timestamp))
                 continue
@@ -96,28 +128,53 @@ class DroneTracker:
         for track_index in unmatched_track_indexes:
             track = self._tracks[track_index]
             track.consecutive_misses += 1
-            if track.consecutive_misses < self.max_consecutive_misses:
+            elapsed = _elapsed_seconds(timestamp, track.last_seen_timestamp)
+            if elapsed >= self.remove_after_seconds:
+                continue
+            if elapsed >= self.lost_after_seconds:
                 track.track_state = "lost"
-                next_tracks.append(track)
+            next_tracks.append(track)
 
         self._tracks = next_tracks
-        return [track.to_detection() for track in self._tracks]
+        return [
+            track.to_detection(
+                timestamp=timestamp,
+                frame_width=frame_width,
+                frame_height=frame_height,
+                prediction_horizon_seconds=self.remove_after_seconds,
+            )
+            for track in self._tracks
+        ]
 
     def _best_track_index(
         self,
         detection: Detection,
         candidates: set[int],
+        *,
+        timestamp: float,
+        frame_width: int,
+        frame_height: int,
     ) -> int | None:
         best_index: int | None = None
         best_score = float("-inf")
 
         for track_index in candidates:
             track = self._tracks[track_index]
+            predicted_box = _predict_box(
+                track,
+                timestamp=timestamp,
+                frame_width=frame_width,
+                frame_height=frame_height,
+                prediction_horizon_seconds=self.remove_after_seconds,
+            )
             score = _match_score(
-                track.box,
+                predicted_box,
                 detection.box,
                 min_iou_match=self.min_iou_match,
                 max_center_distance_diagonals=self.max_center_distance_diagonals,
+                min_center_distance_frame_diagonals=self.min_center_distance_frame_diagonals,
+                frame_width=frame_width,
+                frame_height=frame_height,
             )
             if score is not None and score > best_score:
                 best_score = score
@@ -148,20 +205,21 @@ class DroneTracker:
     ) -> None:
         previous_center = _center(track.box)
         next_center = _center(detection.box)
-        dt = timestamp - track.last_seen_timestamp
-        velocity = (
+        dt = _elapsed_seconds(timestamp, track.last_seen_timestamp)
+        velocity = _bounded_velocity(
             (
                 (next_center[0] - previous_center[0]) / dt,
                 (next_center[1] - previous_center[1]) / dt,
             )
             if dt > 0.0
-            else (0.0, 0.0)
+            else (0.0, 0.0),
+            max_velocity_px_per_sec=self.max_velocity_px_per_sec,
         )
 
         track.class_name = detection.class_name
         track.confidence = detection.confidence
         track.box = detection.box
-        track.last_seen_timestamp = timestamp
+        track.last_seen_timestamp = max(timestamp, track.last_seen_timestamp)
         track.velocity_px_per_sec = velocity
         track.hits += 1
         track.consecutive_misses = 0
@@ -174,6 +232,9 @@ def _match_score(
     *,
     min_iou_match: float,
     max_center_distance_diagonals: float,
+    min_center_distance_frame_diagonals: float,
+    frame_width: int,
+    frame_height: int,
 ) -> float | None:
     overlap = _iou(track_box, detection_box)
     if overlap >= min_iou_match:
@@ -184,6 +245,11 @@ def _match_score(
         max(_diagonal(track_box), _diagonal(detection_box))
         * max_center_distance_diagonals
     )
+    min_distance = (
+        _frame_diagonal(frame_width, frame_height)
+        * min_center_distance_frame_diagonals
+    )
+    max_distance = max(max_distance, min_distance)
     if max_distance > 0.0 and distance <= max_distance:
         return 1.0 - distance / max_distance
 
@@ -219,3 +285,72 @@ def _center_distance(a: Box, b: Box) -> float:
 
 def _diagonal(box: Box) -> float:
     return ((box[2] - box[0]) ** 2 + (box[3] - box[1]) ** 2) ** 0.5
+
+
+def _frame_diagonal(frame_width: int, frame_height: int) -> float:
+    if frame_width <= 0 or frame_height <= 0:
+        return 0.0
+    return (frame_width**2 + frame_height**2) ** 0.5
+
+
+def _predict_box(
+    track: _Track,
+    *,
+    timestamp: float,
+    frame_width: int,
+    frame_height: int,
+    prediction_horizon_seconds: float,
+) -> Box:
+    elapsed = min(
+        _elapsed_seconds(timestamp, track.last_seen_timestamp),
+        max(0.0, prediction_horizon_seconds),
+    )
+    dx = track.velocity_px_per_sec[0] * elapsed
+    dy = track.velocity_px_per_sec[1] * elapsed
+    predicted = (
+        track.box[0] + dx,
+        track.box[1] + dy,
+        track.box[2] + dx,
+        track.box[3] + dy,
+    )
+    return _clamp_box(predicted, frame_width=frame_width, frame_height=frame_height)
+
+
+def _clamp_box(box: Box, *, frame_width: int, frame_height: int) -> Box:
+    width = box[2] - box[0]
+    height = box[3] - box[1]
+    if width <= 0.0 or height <= 0.0 or frame_width <= 0 or frame_height <= 0:
+        return box
+
+    max_x1 = max(0.0, frame_width - width)
+    max_y1 = max(0.0, frame_height - height)
+    x1 = min(max(0.0, box[0]), max_x1)
+    y1 = min(max(0.0, box[1]), max_y1)
+    return (x1, y1, x1 + width, y1 + height)
+
+
+def _elapsed_seconds(timestamp: float, previous_timestamp: float) -> float:
+    if not math.isfinite(timestamp) or not math.isfinite(previous_timestamp):
+        return 0.0
+    return max(0.0, timestamp - previous_timestamp)
+
+
+def _bounded_velocity(
+    velocity: Velocity,
+    *,
+    max_velocity_px_per_sec: float,
+) -> Velocity:
+    vx, vy = velocity
+    if not math.isfinite(vx) or not math.isfinite(vy):
+        return (0.0, 0.0)
+
+    speed = (vx**2 + vy**2) ** 0.5
+    if speed <= max_velocity_px_per_sec or speed == 0.0:
+        return velocity
+
+    scale = max_velocity_px_per_sec / speed
+    return (vx * scale, vy * scale)
+
+
+def _valid_timestamp(timestamp: float) -> float:
+    return timestamp if math.isfinite(timestamp) else 0.0

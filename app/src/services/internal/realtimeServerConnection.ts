@@ -26,6 +26,8 @@ export interface TelemetryMessage {
 export interface DetectionsMessage {
   type: 'detections';
   frameId: number;
+  /** Source video frame timestamp, carried through detection unchanged, in Unix epoch milliseconds. */
+  timestampMs?: number;
   /** Pixel dimensions of the frame the detector ran on — the coordinate space `box` is in. */
   frameWidth: number;
   frameHeight: number;
@@ -92,6 +94,12 @@ function isDetectionsMessage(value: unknown): value is DetectionsMessage {
   const message = value as Record<string, unknown>;
   if (message.type !== 'detections') return false;
   if (typeof message.frameId !== 'number') return false;
+  if (
+    message.timestampMs !== undefined &&
+    (typeof message.timestampMs !== 'number' || !Number.isFinite(message.timestampMs))
+  ) {
+    return false;
+  }
   if (typeof message.frameWidth !== 'number' || typeof message.frameHeight !== 'number') return false;
   if (!Array.isArray(message.detections)) return false;
 

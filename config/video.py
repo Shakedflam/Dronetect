@@ -21,6 +21,10 @@ class VideoConfig:
     vision_max_width: int = 960
     vision_max_height: int = 540
     vision_jpeg_quality: int = 92
+    vision_tracker_lost_after_seconds: float = 0.25
+    vision_tracker_remove_after_seconds: float = 0.80
+    vision_tracker_max_velocity_px_per_sec: float = 5000.0
+    vision_tracker_min_center_distance_frame_diagonals: float = 0.20
     vision_server_frames_url: str = "ws://127.0.0.1:8870/frames"
     vision_server_diagnostics_host: str = "127.0.0.1"
     vision_server_diagnostics_port: int = 8871
@@ -73,6 +77,22 @@ def load_video_config(path: str | Path | None = None) -> VideoConfig:
             raw.get("vision_jpeg_quality"),
             defaults.vision_jpeg_quality,
         ),
+        vision_tracker_lost_after_seconds=_positive_float(
+            raw.get("vision_tracker_lost_after_seconds"),
+            defaults.vision_tracker_lost_after_seconds,
+        ),
+        vision_tracker_remove_after_seconds=_positive_float(
+            raw.get("vision_tracker_remove_after_seconds"),
+            defaults.vision_tracker_remove_after_seconds,
+        ),
+        vision_tracker_max_velocity_px_per_sec=_positive_float(
+            raw.get("vision_tracker_max_velocity_px_per_sec"),
+            defaults.vision_tracker_max_velocity_px_per_sec,
+        ),
+        vision_tracker_min_center_distance_frame_diagonals=_positive_float(
+            raw.get("vision_tracker_min_center_distance_frame_diagonals"),
+            defaults.vision_tracker_min_center_distance_frame_diagonals,
+        ),
         vision_server_frames_url=_non_empty_string(
             raw.get("vision_server_frames_url"),
             defaults.vision_server_frames_url,
@@ -101,6 +121,14 @@ def _jpeg_quality(value: Any, fallback: int) -> int:
         return fallback
     if isinstance(value, int) and 1 <= value <= 95:
         return value
+    return fallback
+
+
+def _positive_float(value: Any, fallback: float) -> float:
+    if isinstance(value, bool):
+        return fallback
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
     return fallback
 
 

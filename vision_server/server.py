@@ -29,7 +29,14 @@ class VisionServer:
     ) -> None:
         self.config = config or load_video_config()
         self.detector = detector or create_drone_detector()
-        self.tracker = DroneTracker()
+        self.tracker = DroneTracker(
+            lost_after_seconds=self.config.vision_tracker_lost_after_seconds,
+            remove_after_seconds=self.config.vision_tracker_remove_after_seconds,
+            max_velocity_px_per_sec=self.config.vision_tracker_max_velocity_px_per_sec,
+            min_center_distance_frame_diagonals=(
+                self.config.vision_tracker_min_center_distance_frame_diagonals
+            ),
+        )
         self.diagnostics = VisionDiagnostics()
         self._last_log_count = 0
 

@@ -22,6 +22,10 @@ def test_video_config_reads_frame_rates_and_vision_urls(tmp_path):
                 "vision_max_width": 1280,
                 "vision_max_height": 720,
                 "vision_jpeg_quality": 91,
+                "vision_tracker_lost_after_seconds": 0.4,
+                "vision_tracker_remove_after_seconds": 1.2,
+                "vision_tracker_max_velocity_px_per_sec": 3200.0,
+                "vision_tracker_min_center_distance_frame_diagonals": 0.18,
                 "vision_server_frames_url": "ws://127.0.0.1:9999/frames",
                 "vision_server_diagnostics_host": "0.0.0.0",
                 "vision_server_diagnostics_port": 9998,
@@ -40,6 +44,10 @@ def test_video_config_reads_frame_rates_and_vision_urls(tmp_path):
     assert config.vision_max_width == 1280
     assert config.vision_max_height == 720
     assert config.vision_jpeg_quality == 91
+    assert config.vision_tracker_lost_after_seconds == 0.4
+    assert config.vision_tracker_remove_after_seconds == 1.2
+    assert config.vision_tracker_max_velocity_px_per_sec == 3200.0
+    assert config.vision_tracker_min_center_distance_frame_diagonals == 0.18
     assert config.vision_server_frames_url == "ws://127.0.0.1:9999/frames"
     assert config.vision_server_diagnostics_host == "0.0.0.0"
     assert config.vision_server_diagnostics_port == 9998
@@ -58,6 +66,10 @@ def test_video_config_rejects_invalid_frame_counts(tmp_path):
                 "vision_max_width": 0,
                 "vision_max_height": "720",
                 "vision_jpeg_quality": 0,
+                "vision_tracker_lost_after_seconds": 0,
+                "vision_tracker_remove_after_seconds": "1.2",
+                "vision_tracker_max_velocity_px_per_sec": False,
+                "vision_tracker_min_center_distance_frame_diagonals": -0.1,
                 "vision_server_diagnostics_port": True,
             }
         ),
@@ -75,4 +87,11 @@ def test_video_config_rejects_invalid_frame_counts(tmp_path):
     assert config.vision_max_width == defaults.vision_max_width
     assert config.vision_max_height == defaults.vision_max_height
     assert config.vision_jpeg_quality == defaults.vision_jpeg_quality
+    assert config.vision_tracker_lost_after_seconds == defaults.vision_tracker_lost_after_seconds
+    assert config.vision_tracker_remove_after_seconds == defaults.vision_tracker_remove_after_seconds
+    assert config.vision_tracker_max_velocity_px_per_sec == defaults.vision_tracker_max_velocity_px_per_sec
+    assert (
+        config.vision_tracker_min_center_distance_frame_diagonals
+        == defaults.vision_tracker_min_center_distance_frame_diagonals
+    )
     assert config.vision_server_diagnostics_port == defaults.vision_server_diagnostics_port

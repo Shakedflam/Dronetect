@@ -130,45 +130,37 @@ class VisionFrameForwarder:
                     await asyncio.sleep(RECONNECT_DELAY_S)
 
     async def _exchange_frames_and_detections(self, websocket) -> None:
-        sender = asyncio.create_task(self._send_frames(websocket))
-        receiver = asyncio.create_task(self._receive_detections(websocket))
-        done, pending = await asyncio.wait(
-            {sender, receiver},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            task.result()
-
-    async def _send_frames(self, websocket) -> None:
         while not self._stop.is_set():
-            try:
-                frame = await asyncio.to_thread(
-                    self._queue.get,
-                    True,
-                    QUEUE_TIMEOUT_S,
-                )
-            except Empty:
+            frame = await self._next_frame()
+            if frame is None:
                 continue
             await websocket.send(encode_video_frame(frame))
+            await self._receive_detection(websocket)
 
-    async def _receive_detections(self, websocket) -> None:
-        async for raw in websocket:
-            if not isinstance(raw, str):
-                continue
-            try:
-                message = validate_detection_message(parse_json_message(raw))
-            except ProtocolError as exc:
-                print(
-                    "realtime_server dropped invalid vision detection message "
-                    f"field={exc.details.get('field')} code={exc.code}"
-                )
-                continue
-            if self._detection_handler is not None:
-                await self._detection_handler(message)
+    async def _next_frame(self) -> VideoFrame | None:
+        try:
+            return await asyncio.to_thread(
+                self._queue.get,
+                True,
+                QUEUE_TIMEOUT_S,
+            )
+        except Empty:
+            return None
+
+    async def _receive_detection(self, websocket) -> None:
+        raw = await websocket.recv()
+        if not isinstance(raw, str):
+            return
+        try:
+            message = validate_detection_message(parse_json_message(raw))
+        except ProtocolError as exc:
+            print(
+                "realtime_server dropped invalid vision detection message "
+                f"field={exc.details.get('field')} code={exc.code}"
+            )
+            return
+        if self._detection_handler is not None:
+            await self._detection_handler(message)
 
     def _drain_stale(self) -> None:
         while True:

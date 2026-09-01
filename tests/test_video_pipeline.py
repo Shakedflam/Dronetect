@@ -54,14 +54,32 @@ def test_vision_forwarder_keeps_only_latest_frame():
         sent_packets = []
 
         class FakeWebSocket:
+            def __init__(self) -> None:
+                self._received = asyncio.Event()
+
             async def send(self, packet):
                 sent_packets.append(packet)
+                self._received.set()
+
+            async def recv(self):
+                await self._received.wait()
+                frame = decode_video_frame(sent_packets[-1])
+                return encode_message(
+                    {
+                        "type": "detections",
+                        "frameId": frame.frame_id,
+                        "timestampMs": int(frame.timestamp * 1000),
+                        "frameWidth": frame.width,
+                        "frameHeight": frame.height,
+                        "detections": [],
+                    }
+                )
 
         pipeline.vision.publish(_vision_frame(1))
         pipeline.vision.publish(_vision_frame(2))
         pipeline.vision.publish(_vision_frame(3))
 
-        sender = asyncio.create_task(pipeline.vision._send_frames(FakeWebSocket()))
+        sender = asyncio.create_task(pipeline.vision._exchange_frames_and_detections(FakeWebSocket()))
         await asyncio.sleep(0.05)
         sender.cancel()
         try:
@@ -75,13 +93,60 @@ def test_vision_forwarder_keeps_only_latest_frame():
     asyncio.run(scenario())
 
 
+def test_vision_forwarder_waits_for_detection_before_sending_next_frame():
+    async def scenario():
+        pipeline = VideoPipeline(VideoConfig())
+        sent_packets = []
+
+        class SlowVisionWebSocket:
+            async def send(self, packet):
+                sent_packets.append(packet)
+
+            async def recv(self):
+                await asyncio.Future()
+
+        pipeline.vision.publish(_vision_frame(1))
+        exchange = asyncio.create_task(
+            pipeline.vision._exchange_frames_and_detections(SlowVisionWebSocket())
+        )
+        await asyncio.sleep(0.05)
+
+        pipeline.vision.publish(_vision_frame(2))
+        pipeline.vision.publish(_vision_frame(3))
+        await asyncio.sleep(0.05)
+
+        exchange.cancel()
+        try:
+            await exchange
+        except asyncio.CancelledError:
+            pass
+
+        assert len(sent_packets) == 1
+        assert decode_video_frame(sent_packets[0]).frame_id == 1
+
+    asyncio.run(scenario())
+
+
 def test_realtime_video_ingest_forwards_even_frames_to_vision_server():
     async def scenario():
         received_frame_ids = []
 
         async def vision_handler(websocket):
             async for packet in websocket:
-                received_frame_ids.append(decode_video_frame(bytes(packet)).frame_id)
+                frame = decode_video_frame(bytes(packet))
+                received_frame_ids.append(frame.frame_id)
+                await websocket.send(
+                    encode_message(
+                        {
+                            "type": "detections",
+                            "frameId": frame.frame_id,
+                            "timestampMs": int(frame.timestamp * 1000),
+                            "frameWidth": frame.width,
+                            "frameHeight": frame.height,
+                            "detections": [],
+                        }
+                    )
+                )
                 if len(received_frame_ids) >= 2:
                     await websocket.close()
                     return
@@ -127,6 +192,7 @@ def test_realtime_video_ingest_forwards_vision_detections_to_tablets():
                         {
                             "type": "detections",
                             "frameId": frame.frame_id,
+                            "timestampMs": int(frame.timestamp * 1000),
                             "frameWidth": frame.width,
                             "frameHeight": frame.height,
                             "detections": [
@@ -174,6 +240,7 @@ def test_realtime_video_ingest_forwards_vision_detections_to_tablets():
     assert received == {
         "type": "detections",
         "frameId": 2,
+        "timestampMs": 2000,
         "frameWidth": 1280,
         "frameHeight": 720,
         "detections": [

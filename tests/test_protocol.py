@@ -84,6 +84,7 @@ def test_valid_detection_message_validates_and_serializes():
     assert message == {
         "type": "detections",
         "frameId": 150,
+        "timestampMs": 1720000000123,
         "frameWidth": 960,
         "frameHeight": 540,
         "detections": [
@@ -105,6 +106,7 @@ def test_empty_detection_message_validates():
         {
             "type": "detections",
             "frameId": 150,
+            "timestampMs": 150000,
             "frameWidth": 960,
             "frameHeight": 540,
             "detections": [],
@@ -114,6 +116,7 @@ def test_empty_detection_message_validates():
     assert message == {
         "type": "detections",
         "frameId": 150,
+        "timestampMs": 150000,
         "frameWidth": 960,
         "frameHeight": 540,
         "detections": [],
@@ -125,12 +128,14 @@ def test_empty_detection_message_validates():
     [
         ({"type": "telemetry", "frameId": 150, "detections": []}, "type"),
         ({"type": "detections", "detections": []}, "frameId"),
-        ({"type": "detections", "frameId": 150, "frameHeight": 540, "detections": []}, "frameWidth"),
-        ({"type": "detections", "frameId": 150, "frameWidth": 960, "detections": []}, "frameHeight"),
+        ({"type": "detections", "frameId": 150, "frameWidth": 960, "frameHeight": 540, "detections": []}, "timestampMs"),
+        ({"type": "detections", "frameId": 150, "timestampMs": 150000, "frameHeight": 540, "detections": []}, "frameWidth"),
+        ({"type": "detections", "frameId": 150, "timestampMs": 150000, "frameWidth": 960, "detections": []}, "frameHeight"),
         (
             {
                 "type": "detections",
                 "frameId": 150,
+                "timestampMs": 150000,
                 "frameWidth": 960,
                 "frameHeight": 540,
                 "detections": {},
@@ -141,6 +146,7 @@ def test_empty_detection_message_validates():
             {
                 "type": "detections",
                 "frameId": 150,
+                "timestampMs": 150000,
                 "frameWidth": 960,
                 "frameHeight": 540,
                 "detections": [
@@ -161,6 +167,7 @@ def test_empty_detection_message_validates():
             {
                 "type": "detections",
                 "frameId": 150,
+                "timestampMs": 150000,
                 "frameWidth": 960,
                 "frameHeight": 540,
                 "detections": [
@@ -181,6 +188,7 @@ def test_empty_detection_message_validates():
             {
                 "type": "detections",
                 "frameId": 150,
+                "timestampMs": 150000,
                 "frameWidth": 960,
                 "frameHeight": 540,
                 "detections": [
@@ -200,6 +208,7 @@ def test_empty_detection_message_validates():
             {
                 "type": "detections",
                 "frameId": 150,
+                "timestampMs": 150000,
                 "frameWidth": 960,
                 "frameHeight": 540,
                 "detections": [
@@ -220,6 +229,7 @@ def test_empty_detection_message_validates():
             {
                 "type": "detections",
                 "frameId": 150,
+                "timestampMs": 150000,
                 "frameWidth": 960,
                 "frameHeight": 540,
                 "detections": [

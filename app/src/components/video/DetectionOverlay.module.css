@@ -6,23 +6,82 @@
 
 .box {
   position: absolute;
-  border: 2px solid var(--color-accent-amber);
+  border: 2px solid var(--color-accent-green);
   border-radius: var(--radius-sm);
-  background: rgba(255, 176, 32, 0.08);
+  background: rgba(52, 208, 88, 0.08);
+  box-shadow:
+    0 0 0 1px rgba(5, 7, 10, 0.9),
+    0 0 12px rgba(52, 208, 88, 0.55),
+    inset 0 0 12px rgba(52, 208, 88, 0.18);
   padding: 0;
   cursor: pointer;
   pointer-events: auto;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.box::before,
+.box::after {
+  position: absolute;
+  inset: -7px;
+  content: '';
+  pointer-events: none;
+}
+
+.box::before {
+  border-top: 3px solid var(--color-accent-green);
+  border-bottom: 3px solid var(--color-accent-green);
+}
+
+.box::after {
+  border-left: 3px solid var(--color-accent-green);
+  border-right: 3px solid var(--color-accent-green);
 }
 
 .box:hover {
-  border-color: #ffc750;
+  border-color: #76f28f;
+  background: rgba(52, 208, 88, 0.14);
+}
+
+.box.boxTentative {
+  border-style: dashed;
+  border-color: var(--color-accent-amber);
+  background: rgba(255, 176, 32, 0.06);
+  box-shadow:
+    0 0 0 1px rgba(5, 7, 10, 0.9),
+    0 0 6px rgba(255, 176, 32, 0.35);
+}
+
+.box.boxTentative::before {
+  border-top-color: var(--color-accent-amber);
+  border-bottom-color: var(--color-accent-amber);
+}
+
+.box.boxTentative::after {
+  border-left-color: var(--color-accent-amber);
+  border-right-color: var(--color-accent-amber);
+}
+
+.box.boxTentative .tag {
+  box-shadow: 0 0 0 1px rgba(255, 176, 32, 0.5);
 }
 
 .box.boxSelected {
   border-color: var(--color-accent-blue);
   background: rgba(74, 163, 255, 0.14);
-  box-shadow: 0 0 0 2px rgba(74, 163, 255, 0.35);
+  box-shadow:
+    0 0 0 1px rgba(5, 7, 10, 0.9),
+    0 0 0 2px rgba(74, 163, 255, 0.35),
+    0 0 14px rgba(74, 163, 255, 0.6);
+}
+
+.box.boxSelected::before {
+  border-top-color: var(--color-accent-blue);
+  border-bottom-color: var(--color-accent-blue);
+}
+
+.box.boxSelected::after {
+  border-left-color: var(--color-accent-blue);
+  border-right-color: var(--color-accent-blue);
 }
 
 .tag {
@@ -32,9 +91,13 @@
   margin-bottom: 2px;
   padding: 2px 6px;
   border-radius: var(--radius-sm);
-  background: var(--color-panel);
-  color: var(--color-text);
+  background: rgba(5, 7, 10, 0.94);
+  color: #d8ffe0;
   font-family: var(--font-mono);
   font-size: 11px;
+  font-weight: 700;
+  line-height: 1.35;
   white-space: nowrap;
+  text-shadow: 0 1px 2px #000;
+  box-shadow: 0 0 0 1px rgba(52, 208, 88, 0.55);
 }
