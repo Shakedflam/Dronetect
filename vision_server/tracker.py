@@ -16,7 +16,6 @@ MIN_IOU_MATCH = 0.2
 MAX_CENTER_DISTANCE_DIAGONALS = 1.0
 MIN_CENTER_DISTANCE_FRAME_DIAGONALS = 0.20
 CONFIRMATION_HITS = 2
-MAX_CONSECUTIVE_MISSES = 5
 LOST_AFTER_SECONDS = 0.25
 REMOVE_AFTER_SECONDS = 0.80
 MAX_VELOCITY_PX_PER_SEC = 5000.0
@@ -80,7 +79,6 @@ class DroneTracker:
         max_center_distance_diagonals: float = MAX_CENTER_DISTANCE_DIAGONALS,
         min_center_distance_frame_diagonals: float = MIN_CENTER_DISTANCE_FRAME_DIAGONALS,
         confirmation_hits: int = CONFIRMATION_HITS,
-        max_consecutive_misses: int = MAX_CONSECUTIVE_MISSES,
         lost_after_seconds: float = LOST_AFTER_SECONDS,
         remove_after_seconds: float = REMOVE_AFTER_SECONDS,
         max_velocity_px_per_sec: float = MAX_VELOCITY_PX_PER_SEC,
@@ -89,7 +87,6 @@ class DroneTracker:
         self.max_center_distance_diagonals = max_center_distance_diagonals
         self.min_center_distance_frame_diagonals = min_center_distance_frame_diagonals
         self.confirmation_hits = confirmation_hits
-        self.max_consecutive_misses = max_consecutive_misses
         self.lost_after_seconds = max(0.0, lost_after_seconds)
         self.remove_after_seconds = max(remove_after_seconds, self.lost_after_seconds)
         self.max_velocity_px_per_sec = max_velocity_px_per_sec

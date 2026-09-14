@@ -40,6 +40,7 @@ VIDEO_WEBRTC_PATH = "/video/webrtc"
 ROLE_VIEWER = "viewer"
 RECONNECT_DELAY_S = 1.0
 QUEUE_TIMEOUT_S = 0.1
+VISION_RESPONSE_TIMEOUT_S = 5.0
 
 
 class VideoHub:
@@ -81,10 +82,12 @@ class VisionFrameForwarder:
         frames_url: str,
         connect_factory: Callable[[str], Awaitable] | None = None,
         detection_handler: Callable[[dict], Awaitable[None]] | None = None,
+        response_timeout_s: float = VISION_RESPONSE_TIMEOUT_S,
     ) -> None:
         self.frames_url = frames_url
         self._connect_factory = connect_factory
         self._detection_handler = detection_handler
+        self._response_timeout_s = response_timeout_s
         self._queue: Queue[VideoFrame] = Queue(maxsize=1)
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
@@ -148,7 +151,7 @@ class VisionFrameForwarder:
             return None
 
     async def _receive_detection(self, websocket) -> None:
-        raw = await websocket.recv()
+        raw = await asyncio.wait_for(websocket.recv(), self._response_timeout_s)
         if not isinstance(raw, str):
             return
         try:

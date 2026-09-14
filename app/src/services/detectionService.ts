@@ -30,19 +30,19 @@ function createRealtimeServerDetectionService(): DetectionService {
   return {
     subscribe(listener) {
       return realtimeServerConnection.subscribeDetections((message) => {
-        const frameTimestampMs = message.timestampMs ?? Date.now();
+        const receivedAtPerformanceMs = performance.now();
         const { frameWidth, frameHeight } = message;
         const activeDetections = message.detections.filter(
           (detection) => detection.trackState !== 'lost'
         );
 
         if (import.meta.env.DEV) {
-          const now = Date.now();
+          const now = performance.now();
           if (now - lastLatencyLogAt >= DEV_LATENCY_LOG_INTERVAL_MS) {
             lastLatencyLogAt = now;
             // Camera -> YOLO -> tracker -> WebSocket -> tablet delay for this frame.
             console.debug(
-              `[detectionService] frame ${message.frameId} age=${now - frameTimestampMs}ms raw=${message.detections.length} active=${activeDetections.length}`
+              `[detectionService] frame ${message.frameId} age=${message.detectionAgeMs}ms raw=${message.detections.length} active=${activeDetections.length}`
             );
           }
         }
@@ -61,7 +61,8 @@ function createRealtimeServerDetectionService(): DetectionService {
             trackState: detection.trackState,
             lastSeenTimestamp: detection.lastSeenTimestamp,
             velocityPxPerSec: detection.velocityPxPerSec,
-            frameTimestampMs,
+            detectionAgeMs: message.detectionAgeMs,
+            receivedAtPerformanceMs,
             velocityNormalizedPerSec: {
               x: detection.velocityPxPerSec.x / frameWidth,
               y: detection.velocityPxPerSec.y / frameHeight,

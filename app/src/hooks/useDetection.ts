@@ -9,7 +9,7 @@ import { detectionService } from '../services/detectionService';
  * makes boxes blink in and out; a short hold smooths over that gap without
  * hiding a genuine "target lost".
  */
-const DETECTION_HOLD_MS = 750;
+const DETECTION_HOLD_MS = 500;
 
 /** Every target currently detected in the drone's camera frame. */
 export function useDetection(): DetectedTarget[] {

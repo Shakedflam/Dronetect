@@ -28,6 +28,8 @@ export interface DetectionsMessage {
   frameId: number;
   /** Source video frame timestamp, carried through detection unchanged, in Unix epoch milliseconds. */
   timestampMs?: number;
+  /** Capture-to-realtime-server delay, measured on the backend clock. */
+  detectionAgeMs: number;
   /** Pixel dimensions of the frame the detector ran on — the coordinate space `box` is in. */
   frameWidth: number;
   frameHeight: number;
@@ -59,6 +61,21 @@ const DEFAULT_REALTIME_SERVER_ORIGIN = 'ws://127.0.0.1:8765';
 function resolveRealtimeServerUrl(): string {
   const origin = import.meta.env.VITE_REALTIME_SERVER_WS_URL || DEFAULT_REALTIME_SERVER_ORIGIN;
   return `${origin}/ws?role=tablet`;
+}
+
+/**
+ * `crypto.randomUUID` only exists in secure contexts (https, or literal
+ * `localhost`) — this tablet UI is typically served plain-http to a device
+ * on the same local network as the drone, which is not a secure context.
+ * Command IDs are just a local correlation key for matching `command_ack`
+ * responses, not a security boundary, so a non-cryptographic fallback is
+ * fine when the real API is unavailable.
+ */
+function generateCommandId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `cmd-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 interface PendingCommand {
@@ -97,6 +114,13 @@ function isDetectionsMessage(value: unknown): value is DetectionsMessage {
   if (
     message.timestampMs !== undefined &&
     (typeof message.timestampMs !== 'number' || !Number.isFinite(message.timestampMs))
+  ) {
+    return false;
+  }
+  if (
+    typeof message.detectionAgeMs !== 'number' ||
+    !Number.isFinite(message.detectionAgeMs) ||
+    message.detectionAgeMs < 0
   ) {
     return false;
   }
@@ -268,7 +292,7 @@ function createRealtimeServerConnection(): RealtimeServerConnection {
           return;
         }
 
-        const commandId = crypto.randomUUID();
+        const commandId = generateCommandId();
         const timeoutHandle = setTimeout(() => {
           pendingCommands.delete(commandId);
           reject(new Error(`Command "${command}" timed out waiting for realtime server response`));

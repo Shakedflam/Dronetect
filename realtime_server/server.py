@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from urllib.parse import parse_qs, urlsplit
 
 from websockets.asyncio.server import ServerConnection, serve
@@ -38,7 +39,7 @@ WS_PATH = "/ws"
 
 
 class RealtimeServer:
-    """Routes telemetry from one drone source to any connected tablet clients."""
+    """Routes telemetry from one drone source to one connected tablet client."""
 
     def __init__(self, video_config: VideoConfig | None = None) -> None:
         self.drone: DroneSdkConnection | None = None
@@ -48,7 +49,7 @@ class RealtimeServer:
             detection_handler=self._route_vision_detections,
         )
         self._video_pipeline_started = False
-        self.tablets: set[ServerConnection] = set()
+        self.tablet: ServerConnection | None = None
 
     async def handler(self, websocket: ServerConnection) -> None:
         try:
@@ -170,25 +171,45 @@ class RealtimeServer:
                 self.video_source = None
 
     async def _handle_tablet(self, websocket: ServerConnection) -> None:
-        self.tablets.add(websocket)
+        if self.tablet is not None and self.tablet is not websocket:
+            await websocket.send(
+                encode_message(
+                    ProtocolError(
+                        "tablet_already_connected",
+                        "Only one tablet connection is supported.",
+                    ).to_message()
+                )
+            )
+            await websocket.close(code=1008, reason="tablet_already_connected")
+            return
+
+        self.tablet = websocket
         try:
             async for raw in websocket:
                 await self._route_tablet_message(websocket, str(raw))
         finally:
-            self.tablets.discard(websocket)
+            if self.tablet is websocket:
+                self.tablet = None
 
     async def _route_drone_telemetry(self, telemetry: dict) -> None:
-        await self._broadcast_to_tablets(encode_message(telemetry))
+        await self._send_to_tablet(encode_message(telemetry))
 
     async def _route_vision_detections(self, detections: dict) -> None:
+        timestamp_ms = detections.get("timestampMs")
+        detection_age_ms = (
+            max(0, round(time.time() * 1000.0 - timestamp_ms))
+            if isinstance(timestamp_ms, (int, float))
+            else 0
+        )
+        routed_detections = {**detections, "detectionAgeMs": detection_age_ms}
         if detections.get("detections"):
             print(
                 "realtime_server forwarding detections "
                 f"frame_id={detections.get('frameId')} "
                 f"count={len(detections['detections'])} "
-                f"tablets={len(self.tablets)}"
+                f"tablet_connected={self.tablet is not None}"
             )
-        await self._broadcast_to_tablets(encode_message(detections))
+        await self._send_to_tablet(encode_message(routed_detections))
 
     async def _route_tablet_message(
         self,
@@ -230,14 +251,15 @@ class RealtimeServer:
 
         await tablet.send(encode_message(command_ack(command["commandId"])))
 
-    async def _broadcast_to_tablets(self, message: str) -> None:
-        disconnected: set[ServerConnection] = set()
-        for tablet in self.tablets:
-            try:
-                await tablet.send(message)
-            except ConnectionClosed:
-                disconnected.add(tablet)
-        self.tablets.difference_update(disconnected)
+    async def _send_to_tablet(self, message: str) -> None:
+        tablet = self.tablet
+        if tablet is None:
+            return
+        try:
+            await tablet.send(message)
+        except ConnectionClosed:
+            if self.tablet is tablet:
+                self.tablet = None
 
 
 async def run_realtime_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:

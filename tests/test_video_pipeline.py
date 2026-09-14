@@ -1,13 +1,19 @@
 import asyncio
 import json
 
+import pytest
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
 from config.video import VideoConfig
 from realtime_server.protocol import ROLE_DRONE, encode_message
 from realtime_server.server import RealtimeServer
-from realtime_server.video_pipeline import ROLE_VIEWER, VideoPipeline, validate_video_role
+from realtime_server.video_pipeline import (
+    ROLE_VIEWER,
+    VideoPipeline,
+    VisionFrameForwarder,
+    validate_video_role,
+)
 from services.video import (
     JPEG_ENCODING,
     VideoFrame,
@@ -93,9 +99,12 @@ def test_vision_forwarder_keeps_only_latest_frame():
     asyncio.run(scenario())
 
 
-def test_vision_forwarder_waits_for_detection_before_sending_next_frame():
+def test_vision_forwarder_times_out_while_waiting_for_detection():
     async def scenario():
-        pipeline = VideoPipeline(VideoConfig())
+        forwarder = VisionFrameForwarder(
+            "ws://127.0.0.1:9/frames",
+            response_timeout_s=0.05,
+        )
         sent_packets = []
 
         class SlowVisionWebSocket:
@@ -105,21 +114,9 @@ def test_vision_forwarder_waits_for_detection_before_sending_next_frame():
             async def recv(self):
                 await asyncio.Future()
 
-        pipeline.vision.publish(_vision_frame(1))
-        exchange = asyncio.create_task(
-            pipeline.vision._exchange_frames_and_detections(SlowVisionWebSocket())
-        )
-        await asyncio.sleep(0.05)
-
-        pipeline.vision.publish(_vision_frame(2))
-        pipeline.vision.publish(_vision_frame(3))
-        await asyncio.sleep(0.05)
-
-        exchange.cancel()
-        try:
-            await exchange
-        except asyncio.CancelledError:
-            pass
+        forwarder.publish(_vision_frame(1))
+        with pytest.raises(TimeoutError):
+            await forwarder._exchange_frames_and_detections(SlowVisionWebSocket())
 
         assert len(sent_packets) == 1
         assert decode_video_frame(sent_packets[0]).frame_id == 1
@@ -182,7 +179,9 @@ def test_realtime_video_ingest_forwards_even_frames_to_vision_server():
     asyncio.run(scenario())
 
 
-def test_realtime_video_ingest_forwards_vision_detections_to_tablets():
+def test_realtime_video_ingest_forwards_vision_detections_to_tablets(monkeypatch):
+    monkeypatch.setattr("realtime_server.server.time.time", lambda: 2.125)
+
     async def scenario():
         async def vision_handler(websocket):
             async for packet in websocket:
@@ -241,6 +240,7 @@ def test_realtime_video_ingest_forwards_vision_detections_to_tablets():
         "type": "detections",
         "frameId": 2,
         "timestampMs": 2000,
+        "detectionAgeMs": 125,
         "frameWidth": 1280,
         "frameHeight": 720,
         "detections": [

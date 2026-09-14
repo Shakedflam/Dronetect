@@ -96,6 +96,42 @@ def test_tablet_command_errors_when_no_drone_is_connected():
     asyncio.run(scenario())
 
 
+def test_second_tablet_is_rejected_and_reconnect_succeeds_after_first_closes():
+    async def scenario():
+        realtime_server = RealtimeServer()
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/ws?role=tablet"
+
+            first = await connect(url)
+            try:
+                async with connect(url) as second:
+                    error = json.loads(await asyncio.wait_for(second.recv(), 1.0))
+                    assert error["code"] == "tablet_already_connected"
+            finally:
+                await first.close()
+
+            await asyncio.wait_for(_wait_for(lambda: realtime_server.tablet is None), 1.0)
+            async with connect(url) as replacement:
+                await asyncio.wait_for(
+                    _wait_for(lambda: realtime_server.tablet is not None),
+                    1.0,
+                )
+                await realtime_server._route_drone_telemetry(
+                    build_simulator_telemetry(
+                        position_local=LocalPosition(1.0, 2.0, 3.0),
+                        heading_deg=45.0,
+                        speed_mps=6.0,
+                        state="TAKING_OFF",
+                        timestamp=1.5,
+                    )
+                )
+                received = json.loads(await asyncio.wait_for(replacement.recv(), 1.0))
+                assert received["type"] == "telemetry"
+
+    asyncio.run(scenario())
+
+
 def test_legacy_simulator_role_is_accepted_as_drone_source():
     async def scenario():
         realtime_server = RealtimeServer()
@@ -121,3 +157,8 @@ def test_legacy_simulator_role_is_accepted_as_drone_source():
                 assert received["source"] == "simulator"
 
     asyncio.run(scenario())
+
+
+async def _wait_for(predicate):
+    while not predicate():
+        await asyncio.sleep(0.01)

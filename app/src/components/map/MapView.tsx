@@ -50,6 +50,17 @@ const FOLLOW_PADDING: L.PointTuple = [64, 64];
  * crowds them together.
  */
 const MAX_FOLLOW_ZOOM = 18;
+/** Duration of each auto-follow flight, in seconds. */
+const FOLLOW_FLY_DURATION_S = 0.8;
+/**
+ * Minimum time between flyToBounds calls, in ms. Telemetry (and therefore
+ * `position`) can update far faster than the flight animation takes to
+ * play out — without this, every update would restart the in-flight
+ * animation, so the map would visibly judder instead of smoothly tracking.
+ * Kept just under the flight duration so a flight mostly finishes before
+ * the next one starts.
+ */
+const FOLLOW_REFLY_MIN_INTERVAL_MS = FOLLOW_FLY_DURATION_S * 1000 - 100;
 
 /**
  * Keeps both the drone and home in view as the drone moves, zooming out as
@@ -62,6 +73,7 @@ function LiveTrackingControl({ position, home }: { position: DronePosition; home
   const map = useMap();
   const [autoFollow, setAutoFollow] = useState(true);
   const hasCenteredOnce = useRef(false);
+  const lastFlyAt = useRef(0);
 
   useEffect(() => {
     const stopFollowing = () => setAutoFollow(false);
@@ -76,11 +88,14 @@ function LiveTrackingControl({ position, home }: { position: DronePosition; home
     if (!hasCenteredOnce.current) {
       map.fitBounds(bounds, { padding: FOLLOW_PADDING, maxZoom: MAX_FOLLOW_ZOOM, animate: false });
       hasCenteredOnce.current = true;
+      lastFlyAt.current = performance.now();
       return;
     }
-    if (autoFollow) {
-      map.flyToBounds(bounds, { padding: FOLLOW_PADDING, maxZoom: MAX_FOLLOW_ZOOM, duration: 0.8 });
-    }
+    if (!autoFollow) return;
+    const now = performance.now();
+    if (now - lastFlyAt.current < FOLLOW_REFLY_MIN_INTERVAL_MS) return;
+    lastFlyAt.current = now;
+    map.flyToBounds(bounds, { padding: FOLLOW_PADDING, maxZoom: MAX_FOLLOW_ZOOM, duration: FOLLOW_FLY_DURATION_S });
   }, [position, home, autoFollow, map]);
 
   if (autoFollow) return null;
@@ -89,7 +104,11 @@ function LiveTrackingControl({ position, home }: { position: DronePosition; home
     <button
       type="button"
       className={styles.recenterButton}
-      onClick={() => setAutoFollow(true)}
+      onClick={() => {
+        // Bypass the throttle so Recenter reacts immediately.
+        lastFlyAt.current = 0;
+        setAutoFollow(true);
+      }}
     >
       Recenter
     </button>
