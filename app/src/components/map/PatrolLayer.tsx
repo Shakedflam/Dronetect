@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Circle, Marker, Polygon, Polyline, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import type { Coordinates } from '../../types/drone';
+import type { PatrolAreaType } from '../../types/patrol';
 import { useMissionState } from '../../hooks/useMissionState';
 import { usePatrolConfig } from '../../hooks/usePatrolConfig';
 import { patrolService } from '../../services/patrolService';
@@ -21,6 +22,13 @@ const BAND_CIRCLE_PATH_OPTIONS = { color: BAND_CIRCLE_COLOR, weight: 1.5, opacit
 const HIT_FILL_OPACITY = 0.001;
 /** Fill used for a region's tap target once it has a priority rank — a subtle highlight, still no stroke. */
 const RANKED_FILL_OPACITY = 0.12;
+const AREA_TYPE_STYLE: Record<PatrolAreaType, { color: string; opacity: number }> = {
+  PATROL: { color: GRID_COLOR, opacity: HIT_FILL_OPACITY },
+  IGNORE: { color: '#f5a623', opacity: 0.2 },
+  NO_FLY: { color: '#ff4d5e', opacity: 0.28 },
+};
+
+type EditMode = 'PRIORITY' | Exclude<PatrolAreaType, 'PATROL'> | null;
 
 function toLatLngTuples(points: Coordinates[]): [number, number][] {
   return points.map((point): [number, number] => [point.lat, point.lng]);
@@ -36,18 +44,16 @@ function rankBadgeIcon(rank: number): L.DivIcon {
 }
 
 /**
- * Frontend-only "Persistent Coverage with Dynamic Priorities" patrol grid:
+ * "Persistent Coverage with Dynamic Priorities" patrol grid:
  * divides the Home operational circle into 8 directions x 4 equal-area
- * distance bands, and lets the operator rank regions by revisit priority.
- * Purely visual/data-structure — no flight-planning logic reads it. State
- * lives in patrolService, not here, mirroring RoiLayer/roiService in
- * MapView.tsx, which this component otherwise never touches.
+ * distance bands, and lets the operator rank and classify regions. State
+ * lives in patrolService and is synchronized with the backend planner.
  */
 export function PatrolLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: number }) {
   const map = useMap();
   const missionState = useMissionState();
   const config = usePatrolConfig();
-  const [settingPriority, setSettingPriority] = useState(false);
+  const [editMode, setEditMode] = useState<EditMode>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -80,7 +86,9 @@ export function PatrolLayer({ home, homeRadiusM }: { home: Coordinates; homeRadi
     [home, homeRadiusM]
   );
 
-  const rankedRegions = config.regions.filter((region) => region.priorityRank !== null);
+  const rankedRegions = config.regions.filter(
+    (region) => region.areaType === 'PATROL' && region.priorityRank !== null
+  );
 
   const focusPatrolArea = useCallback(() => {
     // Stop live tracking before changing the viewport; otherwise the next
@@ -89,6 +97,15 @@ export function PatrolLayer({ home, homeRadiusM }: { home: Coordinates; homeRadi
     const patrolBounds = L.latLng(home.lat, home.lng).toBounds(homeRadiusM);
     map.fitBounds(patrolBounds, { padding: [48, 48], animate: false });
   }, [home.lat, home.lng, homeRadiusM, map]);
+
+  const toggleEditMode = useCallback(
+    (mode: Exclude<EditMode, null>) => {
+      const nextMode = editMode === mode ? null : mode;
+      setEditMode(nextMode);
+      if (nextMode !== null) focusPatrolArea();
+    },
+    [editMode, focusPatrolArea]
+  );
 
   useEffect(() => {
     if (missionState === 'PATROL') focusPatrolArea();
@@ -114,7 +131,7 @@ export function PatrolLayer({ home, homeRadiusM }: { home: Coordinates; homeRadi
         // react-leaflet only applies `interactive` once, at layer creation
         // (@react-leaflet/core's usePathOptions syncs pathOptions via
         // setStyle() but never touches the interactive flag), so toggling
-        // interactive={settingPriority} here would silently stop working
+        // interactive={editMode !== null} here would silently stop working
         // after the first render. Instead these stay interactive={true} for
         // their whole lifetime, and the click handler itself — a fresh
         // closure every render, which react-leaflet's useEventHandlers does
@@ -126,15 +143,26 @@ export function PatrolLayer({ home, homeRadiusM }: { home: Coordinates; homeRadi
           interactive
           eventHandlers={{
             click: () => {
-              if (!settingPriority) return;
-              patrolService.setPriority(region.id);
+              if (editMode === 'PRIORITY') {
+                if (region.areaType === 'PATROL') patrolService.setPriority(region.id);
+              } else if (editMode !== null) {
+                patrolService.setAreaType(
+                  region.id,
+                  region.areaType === editMode ? 'PATROL' : editMode
+                );
+              }
             },
           }}
           pathOptions={{
-            stroke: false,
+            stroke: region.areaType !== 'PATROL',
+            color: AREA_TYPE_STYLE[region.areaType].color,
+            weight: 2,
             fill: true,
-            fillColor: GRID_COLOR,
-            fillOpacity: region.priorityRank !== null ? RANKED_FILL_OPACITY : HIT_FILL_OPACITY,
+            fillColor: AREA_TYPE_STYLE[region.areaType].color,
+            fillOpacity:
+              region.areaType === 'PATROL' && region.priorityRank !== null
+                ? RANKED_FILL_OPACITY
+                : AREA_TYPE_STYLE[region.areaType].opacity,
           }}
         />
       ))}
@@ -152,16 +180,23 @@ export function PatrolLayer({ home, homeRadiusM }: { home: Coordinates; homeRadi
         <div className={styles.patrolButtons}>
           <button
             type="button"
-            className={`${styles.patrolButton} ${settingPriority ? styles.patrolButtonActive : ''}`}
-            onClick={() => {
-              const nextSettingPriority = !settingPriority;
-              setSettingPriority(nextSettingPriority);
-              if (nextSettingPriority) focusPatrolArea();
-            }}
-            aria-pressed={settingPriority}
+            className={`${styles.patrolButton} ${editMode === 'PRIORITY' ? styles.patrolButtonActive : ''}`}
+            onClick={() => toggleEditMode('PRIORITY')}
+            aria-pressed={editMode === 'PRIORITY'}
           >
-            {settingPriority ? 'Tap Regions to Rank…' : 'Set Priority'}
+            {editMode === 'PRIORITY' ? 'Tap Regions to Rank…' : 'Set Priority'}
           </button>
+          {(['IGNORE', 'NO_FLY'] as const).map((areaType) => (
+            <button
+              key={areaType}
+              type="button"
+              className={`${styles.patrolButton} ${editMode === areaType ? styles.patrolButtonActive : ''}`}
+              onClick={() => toggleEditMode(areaType)}
+              aria-pressed={editMode === areaType}
+            >
+              {areaType === 'NO_FLY' ? 'No-Fly' : areaType[0] + areaType.slice(1).toLowerCase()}
+            </button>
+          ))}
           {rankedRegions.length > 0 && (
             <button type="button" className={styles.patrolButton} onClick={() => patrolService.clearPriorities()}>
               Clear Priorities

@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from enum import Enum
 import math
 import random
-from typing import Protocol
+from typing import Callable, Protocol
+
+try:
+    from .roi_patrol import LawnMowerRoiPatrolPlanner, RoiPatrolPlan
+except ImportError:  # Webots loads this directory as top-level modules.
+    from roi_patrol import LawnMowerRoiPatrolPlanner, RoiPatrolPlan
 
 
 Position = tuple[float, float, float]
@@ -19,6 +24,10 @@ class RandomSource(Protocol):
 class FlightState(Enum):
     IDLE = "IDLE"
     TAKING_OFF = "TAKING_OFF"
+    HOLDING = "HOLDING"
+    TRANSITING_TO_ROI = "TRANSITING_TO_ROI"
+    ROI_PATROL = "ROI_PATROL"
+    PATROLLING = "PATROLLING"
     FLYING_RANDOMLY = "FLYING_RANDOMLY"
     RETURNING_HOME = "RETURNING_HOME"
     LANDING = "LANDING"
@@ -37,6 +46,7 @@ class FlightConfig:
     vertical_tolerance: float = 0.25
     landing_rate: float = 0.35
     landed_height: float = 0.12
+    roi_arrival_tolerance: float = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,9 +75,13 @@ class FlightLogic:
         self,
         config: FlightConfig | None = None,
         rng: RandomSource | None = None,
+        roi_patrol_planner: RoiPatrolPlan | None = None,
+        patrol_waypoint_provider: Callable[[Position, bool], Position] | None = None,
     ) -> None:
         self.config = config or FlightConfig()
         self.rng = rng or random.Random()
+        self.roi_patrol_planner = roi_patrol_planner or LawnMowerRoiPatrolPlanner()
+        self.patrol_waypoint_provider = patrol_waypoint_provider
         self.state = FlightState.IDLE
         self.home: Position | None = None
         self.target: Position | None = None
@@ -75,6 +89,9 @@ class FlightLogic:
         self._landing_target_altitude = self.config.takeoff_altitude
         self._takeoff_anchor: Position | None = None
         self._queued_waypoint: Position | None = None
+        self._queued_state: FlightState | None = None
+        self._roi_center: tuple[float, float] | None = None
+        self._roi_radius = 0.0
 
     def initialize_home(self, position: Position) -> None:
         """Capture home once from the first valid simulated GPS reading."""
@@ -97,9 +114,36 @@ class FlightLogic:
         elif self.state is FlightState.TAKING_OFF:
             self.target = self._takeoff_target()
             if self._has_reached(position, self.target):
-                self.state = FlightState.FLYING_RANDOMLY
-                self.target = self._queued_waypoint or self.choose_random_waypoint()
+                self.state = self._queued_state or FlightState.HOLDING
+                self.target = self._queued_waypoint or self.target
                 self._queued_waypoint = None
+                self._queued_state = None
+                if (
+                    self.state is FlightState.TRANSITING_TO_ROI
+                    and self._is_inside_roi(position)
+                ):
+                    self._start_roi_patrol(position)
+
+        elif self.state is FlightState.HOLDING:
+            # Mission navigation is not implemented yet. Hold the position
+            # reached by the commanded takeoff instead of choosing a waypoint.
+            if self.target is None:
+                self.target = position
+
+        elif self.state is FlightState.TRANSITING_TO_ROI:
+            if self._is_inside_roi(position):
+                self._start_roi_patrol(position)
+
+        elif self.state is FlightState.ROI_PATROL:
+            if not self._is_inside_roi(position):
+                # Recover toward the center after an external disturbance.
+                self.target = self._roi_center_target()
+            elif self.target is None or self._has_reached(position, self.target):
+                self.target = self.roi_patrol_planner.next_waypoint()
+
+        elif self.state is FlightState.PATROLLING:
+            if self.target is None or self._has_reached(position, self.target):
+                self.target = self._next_patrol_waypoint(position, completed=True)
 
         elif self.state is FlightState.FLYING_RANDOMLY:
             if self.target is None:
@@ -134,29 +178,118 @@ class FlightLogic:
         """Replace an active flight target with home at a safe altitude."""
         if self.home is None or self.state not in {
             FlightState.TAKING_OFF,
+            FlightState.HOLDING,
+            FlightState.TRANSITING_TO_ROI,
+            FlightState.ROI_PATROL,
+            FlightState.PATROLLING,
             FlightState.FLYING_RANDOMLY,
         }:
             return False
 
         self.state = FlightState.RETURNING_HOME
         self._queued_waypoint = None
+        self._queued_state = None
+        self._roi_center = None
+        self._roi_radius = 0.0
+        self.roi_patrol_planner.clear()
         self.target = self._home_at_cruise_altitude()
         return True
+
+    def request_mission_takeoff(self, position: Position) -> None:
+        """Take off for a mission, or hold immediately when already airborne."""
+        if self.home is None:
+            raise RuntimeError("Home position must be initialized before commands.")
+
+        self._queued_waypoint = None
+        self._queued_state = None
+        self._roi_center = None
+        self._roi_radius = 0.0
+        self.roi_patrol_planner.clear()
+        safe_altitude = self.config.takeoff_altitude - self.config.vertical_tolerance
+        if position[2] < safe_altitude:
+            self._start_takeoff(position)
+        else:
+            self.state = FlightState.HOLDING
+            self.target = position
+
+    def request_patrol(self, position: Position) -> Position:
+        """Start continuous normal patrol, taking off first when necessary."""
+        if self.home is None:
+            raise RuntimeError("Home position must be initialized before commands.")
+
+        self._roi_center = None
+        self._roi_radius = 0.0
+        self.roi_patrol_planner.clear()
+        waypoint = self._next_patrol_waypoint(position, completed=False)
+        safe_altitude = self.config.takeoff_altitude - self.config.vertical_tolerance
+        if position[2] < safe_altitude:
+            self._queued_waypoint = waypoint
+            self._queued_state = FlightState.PATROLLING
+            self._start_takeoff(position)
+        else:
+            self._queued_waypoint = None
+            self._queued_state = None
+            self.state = FlightState.PATROLLING
+            self.target = waypoint
+        return waypoint
+
+    def request_roi(
+        self,
+        position: Position,
+        center: tuple[float, float],
+        radius_m: float,
+    ) -> None:
+        """Take off if needed, transit into the ROI, then patrol continuously."""
+        if self.home is None:
+            raise RuntimeError("Home position must be initialized before commands.")
+
+        self._roi_center = center
+        self._roi_radius = radius_m
+        self.roi_patrol_planner.clear()
+        roi_target = (center[0], center[1], self.config.takeoff_altitude)
+        safe_altitude = self.config.takeoff_altitude - self.config.vertical_tolerance
+        if position[2] < safe_altitude:
+            self._queued_waypoint = roi_target
+            self._queued_state = FlightState.TRANSITING_TO_ROI
+            self._start_takeoff(position)
+        else:
+            self._queued_waypoint = None
+            self._queued_state = None
+            self.state = FlightState.TRANSITING_TO_ROI
+            self.target = roi_target
+
+    def clear_roi(self, position: Position) -> None:
+        """Cancel ROI guidance without initiating any new movement."""
+        was_queued_for_roi = self._queued_state is FlightState.TRANSITING_TO_ROI
+        self._roi_center = None
+        self._roi_radius = 0.0
+        self.roi_patrol_planner.clear()
+        if was_queued_for_roi:
+            self._queued_waypoint = None
+            self._queued_state = None
+        if self.state in {FlightState.TRANSITING_TO_ROI, FlightState.ROI_PATROL}:
+            self.state = FlightState.HOLDING
+            self.target = position
 
     def request_new_target(self, position: Position) -> Position:
         """Start a new random mission safely from any flight state."""
         if self.home is None:
             raise RuntimeError("Home position must be initialized before commands.")
 
+        self._roi_center = None
+        self._roi_radius = 0.0
+        self.roi_patrol_planner.clear()
         waypoint = self.choose_random_waypoint()
         safe_altitude = (
             self.config.takeoff_altitude - self.config.vertical_tolerance
         )
         if position[2] < safe_altitude:
             self._queued_waypoint = waypoint
+            self._queued_state = FlightState.FLYING_RANDOMLY
             self._start_takeoff(position)
         else:
             self._queued_waypoint = None
+            self._queued_state = None
             self.state = FlightState.FLYING_RANDOMLY
             self.target = waypoint
         return waypoint
@@ -192,6 +325,48 @@ class FlightLogic:
     def _landing_target(self) -> Position:
         assert self.home is not None
         return (self.home[0], self.home[1], self._landing_target_altitude)
+
+    def _start_roi_patrol(self, position: Position) -> None:
+        if self._roi_center is None:
+            raise RuntimeError("Cannot start ROI patrol without an ROI")
+        self.state = FlightState.ROI_PATROL
+        self.target = self.roi_patrol_planner.reset(
+            self._roi_center,
+            self._roi_radius,
+            self.config.takeoff_altitude,
+            position,
+        )
+
+    def _roi_center_target(self) -> Position:
+        if self._roi_center is None:
+            raise RuntimeError("Cannot recover into a missing ROI")
+        return (
+            self._roi_center[0],
+            self._roi_center[1],
+            self.config.takeoff_altitude,
+        )
+
+    def _next_patrol_waypoint(
+        self,
+        position: Position,
+        *,
+        completed: bool,
+    ) -> Position:
+        if self.patrol_waypoint_provider is None:
+            return self.choose_random_waypoint()
+        return self.patrol_waypoint_provider(position, completed)
+
+    def _is_inside_roi(self, position: Position) -> bool:
+        if self._roi_center is None:
+            return False
+        distance_m = math.hypot(
+            position[0] - self._roi_center[0],
+            position[1] - self._roi_center[1],
+        )
+        # Patrol must not begin in the arrival-tolerance halo outside the ROI.
+        # The configured tolerance remains useful to mission/UI observers, but
+        # flight guidance uses the physical boundary as its safety invariant.
+        return distance_m <= self._roi_radius
 
     def _has_reached(self, position: Position, target: Position) -> bool:
         """Check if drone reached it's target"""

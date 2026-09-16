@@ -15,9 +15,8 @@ import 'leaflet/dist/leaflet.css';
 import type { Coordinates, DronePosition } from '../../types/drone';
 import type { RoiCenter } from '../../types/roi';
 import { useLocation } from '../../hooks/useLocation';
-import { useMissionState } from '../../hooks/useMissionState';
 import { useRoi } from '../../hooks/useRoi';
-import { missionStateService } from '../../services/missionStateService';
+import { droneCommandService } from '../../services/droneCommandService';
 import { roiService } from '../../services/roiService';
 import {
   DEFAULT_ROI_RADIUS_METERS,
@@ -192,7 +191,6 @@ function toCoordinates(center: RoiCenter): Coordinates {
  */
 function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: number }) {
   const roi = useRoi();
-  const missionState = useMissionState();
   const [defining, setDefining] = useState(false);
   const panelRef = useRef<HTMLDivElement>(null);
   // Shared by both the boundary (resize) and interior (move) drag gestures
@@ -312,9 +310,9 @@ function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: numbe
 
   function handleClear(): void {
     roiService.clearRoi();
-    if (missionState === 'TRANSIT_TO_ROI' || missionState === 'ROI_PATROL') {
-      missionStateService.setMissionState('ON_GROUND');
-    }
+    droneCommandService.clearRoi().catch((error: unknown) => {
+      console.error('[MapView] clearRoi failed', error);
+    });
     setDefining(false);
   }
 

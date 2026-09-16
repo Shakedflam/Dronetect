@@ -18,7 +18,7 @@ class TelemetryPayload:
     altitude_m: float
     heading_deg: float
     speed_mps: float
-    battery_percent: int
+    battery_percent: float
     state: str
 
 
@@ -28,6 +28,8 @@ def build_simulator_telemetry(
     heading_deg: float,
     speed_mps: float,
     state: str,
+    battery_percent: float = SIMULATOR_BATTERY_PERCENT,
+    target_patrol_region_id: str | None = None,
     timestamp: float | None = None,
 ) -> dict:
     """Build the JSON-compatible simulator telemetry message."""
@@ -45,7 +47,8 @@ def build_simulator_telemetry(
             "altitudeM": position_local.z,
             "headingDeg": heading_deg,
             "speedMps": speed_mps,
-            "batteryPercent": SIMULATOR_BATTERY_PERCENT,
+            "batteryPercent": battery_percent,
             "state": state,
+            "targetPatrolRegionId": target_patrol_region_id,
         },
     }

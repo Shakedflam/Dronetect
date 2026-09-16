@@ -23,7 +23,7 @@ function formatState(state: string): string {
   return state.replace(/_/g, ' ');
 }
 
-/** Same underscore-to-space formatting as formatState, applied to the frontend-only mission state. */
+/** Same underscore-to-space formatting as formatState, applied to mission state. */
 function formatMissionState(state: string): string {
   return state.replace(/_/g, ' ');
 }

@@ -2,7 +2,7 @@
   "source_target_fps": 30,
   "ui_max_width": 960,
   "ui_max_height": 540,
-  "ui_jpeg_quality": 72,
+  "ui_jpeg_quality": 85,
   "vision_frame_interval": 3,
   "vision_max_width": 960,
   "vision_max_height": 540,

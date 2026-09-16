@@ -1,3 +1,4 @@
+import type { MissionState } from '../../types/missionState';
 import type { Unsubscribe } from './unsubscribe';
 
 /**
@@ -20,6 +21,7 @@ export interface TelemetryMessage {
     speedMps: number;
     batteryPercent: number;
     state: string;
+    targetPatrolRegionId: string | null;
   };
 }
 
@@ -44,12 +46,44 @@ export interface DetectionsMessage {
   }>;
 }
 
+/** Complete backend-owned mission snapshot. Frontend code must not derive transitions. */
+export interface MissionStatusMessage {
+  type: 'mission_status';
+  state: MissionState;
+  droneConnected: boolean;
+  activeRoi: { center: { lat: number; lon: number }; radiusM: number } | null;
+  patrol: {
+    priorities: Array<{ regionId: string; rank: number }>;
+    areaTypes?: Array<{ regionId: string; areaType: 'PATROL' | 'IGNORE' | 'NO_FLY' }>;
+    currentRegionId: string | null;
+    targetRegionId: string | null;
+  };
+  batteryRth: {
+    batteryPercent: number | null;
+    lowBattery: boolean;
+    rthActive: boolean;
+    safetyRthActive: boolean;
+    rthReason: string | null;
+  };
+}
+
 /** Exactly the command names the realtime server/simulator currently support. */
-export type RealtimeServerCommandName = 'return_home' | 'new_mission' | 'camera_tilt_up' | 'camera_tilt_down';
+export type RealtimeServerCommandName =
+  | 'start_patrol'
+  | 'set_patrol_priorities'
+  | 'set_patrol_area_types'
+  | 'set_roi'
+  | 'clear_roi'
+  | 'return_home'
+  | 'new_mission'
+  | 'camera_tilt_up'
+  | 'camera_tilt_down';
 
 export interface RealtimeServerConnection {
   subscribeTelemetry(listener: (message: TelemetryMessage) => void): Unsubscribe;
   subscribeDetections(listener: (message: DetectionsMessage) => void): Unsubscribe;
+  subscribeMissionState(listener: (state: MissionState) => void): Unsubscribe;
+  subscribeMissionStatus(listener: (status: MissionStatusMessage) => void): Unsubscribe;
   subscribeStatus(listener: (status: ConnectionStatus) => void): Unsubscribe;
   sendCommand(command: RealtimeServerCommandName, params?: Record<string, unknown>): Promise<void>;
 }
@@ -102,7 +136,8 @@ function isTelemetryMessage(value: unknown): value is TelemetryMessage {
     typeof data.headingDeg === 'number' &&
     typeof data.speedMps === 'number' &&
     typeof data.batteryPercent === 'number' &&
-    typeof data.state === 'string'
+    typeof data.state === 'string' &&
+    (data.targetPatrolRegionId === null || typeof data.targetPatrolRegionId === 'string')
   );
 }
 
@@ -148,9 +183,68 @@ function isDetectionsMessage(value: unknown): value is DetectionsMessage {
   });
 }
 
+const MISSION_STATES = new Set<MissionState>([
+  'ON_GROUND',
+  'TAKING_OFF',
+  'PATROL',
+  'TRANSIT_TO_ROI',
+  'ROI_PATROL',
+  'RTH',
+  'LANDING',
+]);
+
+function isMissionState(value: unknown): value is MissionState {
+  return typeof value === 'string' && MISSION_STATES.has(value as MissionState);
+}
+
+function isMissionStatusMessage(value: unknown): value is MissionStatusMessage {
+  if (typeof value !== 'object' || value === null) return false;
+  const message = value as Record<string, unknown>;
+  if (
+    message.type !== 'mission_status' ||
+    !isMissionState(message.state) ||
+    typeof message.droneConnected !== 'boolean'
+  ) return false;
+  if (message.activeRoi !== null) {
+    if (typeof message.activeRoi !== 'object') return false;
+    const roi = message.activeRoi as Record<string, unknown>;
+    const center = roi.center as Record<string, unknown> | undefined;
+    if (
+      typeof center !== 'object' || center === null ||
+      typeof center.lat !== 'number' || typeof center.lon !== 'number' ||
+      typeof roi.radiusM !== 'number'
+    ) return false;
+  }
+  const patrol = message.patrol as Record<string, unknown> | undefined;
+  const batteryRth = message.batteryRth as Record<string, unknown> | undefined;
+  const areaTypes = patrol?.areaTypes;
+  const hasValidAreaTypes =
+    areaTypes === undefined ||
+    (Array.isArray(areaTypes) && areaTypes.every((entry) => {
+      if (typeof entry !== 'object' || entry === null) return false;
+      const typed = entry as Record<string, unknown>;
+      return (
+        typeof typed.regionId === 'string' &&
+        (typed.areaType === 'PATROL' || typed.areaType === 'IGNORE' || typed.areaType === 'NO_FLY')
+      );
+    }));
+  return (
+    typeof patrol === 'object' && patrol !== null && Array.isArray(patrol.priorities) &&
+    hasValidAreaTypes &&
+    typeof batteryRth === 'object' && batteryRth !== null &&
+    (batteryRth.batteryPercent === null || typeof batteryRth.batteryPercent === 'number') &&
+    typeof batteryRth.lowBattery === 'boolean' &&
+    typeof batteryRth.rthActive === 'boolean' &&
+    typeof batteryRth.safetyRthActive === 'boolean' &&
+    (batteryRth.rthReason === null || typeof batteryRth.rthReason === 'string')
+  );
+}
+
 function createRealtimeServerConnection(): RealtimeServerConnection {
   const telemetryListeners = new Set<(message: TelemetryMessage) => void>();
   const detectionListeners = new Set<(message: DetectionsMessage) => void>();
+  const missionStateListeners = new Set<(state: MissionState) => void>();
+  const missionStatusListeners = new Set<(status: MissionStatusMessage) => void>();
   const statusListeners = new Set<(status: ConnectionStatus) => void>();
   const pendingCommands = new Map<string, PendingCommand>();
 
@@ -202,6 +296,24 @@ function createRealtimeServerConnection(): RealtimeServerConnection {
           return;
         }
         detectionListeners.forEach((listener) => listener(message));
+        return;
+      }
+      case 'mission_state': {
+        const state = message.state;
+        if (!isMissionState(state)) {
+          console.warn('[realtimeServerConnection] mission state failed shape check, ignoring', message);
+          return;
+        }
+        missionStateListeners.forEach((listener) => listener(state));
+        return;
+      }
+      case 'mission_status': {
+        if (!isMissionStatusMessage(message)) {
+          console.warn('[realtimeServerConnection] mission status failed shape check, ignoring', message);
+          return;
+        }
+        missionStatusListeners.forEach((listener) => listener(message));
+        missionStateListeners.forEach((listener) => listener(message.state));
         return;
       }
       case 'command_ack': {
@@ -279,6 +391,14 @@ function createRealtimeServerConnection(): RealtimeServerConnection {
     subscribeDetections(listener) {
       detectionListeners.add(listener);
       return () => detectionListeners.delete(listener);
+    },
+    subscribeMissionState(listener) {
+      missionStateListeners.add(listener);
+      return () => missionStateListeners.delete(listener);
+    },
+    subscribeMissionStatus(listener) {
+      missionStatusListeners.add(listener);
+      return () => missionStatusListeners.delete(listener);
     },
     subscribeStatus(listener) {
       statusListeners.add(listener);

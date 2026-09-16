@@ -1,3 +1,4 @@
+import math
 import random
 
 import pytest
@@ -45,6 +46,16 @@ def test_stays_idle_until_a_mission_is_requested():
     assert logic.target == HOME
 
 
+def test_startup_updates_never_cause_takeoff_or_horizontal_movement():
+    logic = make_logic(takeoff_altitude=12.0)
+
+    for _ in range(100):
+        logic.update(HOME, 1.0)
+
+    assert logic.state is FlightState.IDLE
+    assert logic.target == HOME
+
+
 def test_new_mission_instruction_starts_takeoff_from_idle():
     logic = make_logic()
 
@@ -61,6 +72,212 @@ def test_reaching_takeoff_altitude_starts_random_flight():
 
     assert logic.state is FlightState.FLYING_RANDOMLY
     assert logic.target is not None
+
+
+def test_patrol_command_takes_off_to_configured_altitude_then_holds():
+    logic = make_logic(takeoff_altitude=12.0)
+
+    logic.request_mission_takeoff(HOME)
+    assert logic.state is FlightState.TAKING_OFF
+    assert logic.target == (HOME[0], HOME[1], 12.0)
+
+    logic.update((HOME[0], HOME[1], 12.0), 0.1)
+    assert logic.state is FlightState.HOLDING
+    assert logic.target == (HOME[0], HOME[1], 12.0)
+
+    logic.update((HOME[0], HOME[1], 12.0), 10.0)
+    assert logic.state is FlightState.HOLDING
+    assert logic.target == (HOME[0], HOME[1], 12.0)
+
+
+def test_normal_patrol_takes_off_and_continuously_requests_waypoints():
+    waypoints = iter(((20.0, 0.0, 12.0), (0.0, 20.0, 12.0)))
+    calls = []
+
+    def next_waypoint(position, completed):
+        calls.append((position, completed))
+        return next(waypoints)
+
+    logic = FlightLogic(
+        config=FlightConfig(takeoff_altitude=12.0),
+        patrol_waypoint_provider=next_waypoint,
+    )
+    logic.initialize_home(HOME)
+
+    first = logic.request_patrol(HOME)
+    logic.update((HOME[0], HOME[1], 12.0), 0.1)
+    assert logic.state is FlightState.PATROLLING
+    assert logic.target == first
+
+    logic.update(first, 0.1)
+
+    assert logic.state is FlightState.PATROLLING
+    assert logic.target == (0.0, 20.0, 12.0)
+    assert calls == [(HOME, False), (first, True)]
+
+def test_mission_command_while_airborne_skips_takeoff_and_holds_position():
+    logic = make_logic(takeoff_altitude=12.0)
+    airborne = (3.0, -2.0, 12.0)
+
+    logic.request_mission_takeoff(airborne)
+
+    assert logic.state is FlightState.HOLDING
+    assert logic.target == airborne
+
+
+def test_roi_from_ground_takes_off_then_transits_toward_center():
+    logic = make_logic(takeoff_altitude=12.0, roi_arrival_tolerance=5.0)
+
+    logic.request_roi(HOME, center=(100.0, 0.0), radius_m=20.0)
+    assert logic.state is FlightState.TAKING_OFF
+
+    airborne = (HOME[0], HOME[1], 12.0)
+    logic.update(airborne, 0.1)
+
+    assert logic.state is FlightState.TRANSITING_TO_ROI
+    assert logic.target == (100.0, 0.0, 12.0)
+
+
+def test_airborne_roi_command_skips_takeoff_and_starts_patrol_inside_boundary():
+    logic = make_logic(takeoff_altitude=12.0, roi_arrival_tolerance=5.0)
+    airborne = (0.0, 0.0, 12.0)
+
+    logic.request_roi(airborne, center=(100.0, 0.0), radius_m=20.0)
+    assert logic.state is FlightState.TRANSITING_TO_ROI
+
+    outside = (74.9, 0.0, 12.0)
+    logic.update(outside, 0.1)
+    assert logic.state is FlightState.TRANSITING_TO_ROI
+
+    tolerance_halo = (75.0, 0.0, 12.0)
+    logic.update(tolerance_halo, 0.1)
+    assert logic.state is FlightState.TRANSITING_TO_ROI
+
+    boundary = (80.0, 0.0, 12.0)
+    logic.update(boundary, 0.1)
+    assert logic.state is FlightState.ROI_PATROL
+    assert logic.target is not None
+    assert math.hypot(logic.target[0] - 100.0, logic.target[1]) <= 20.0
+
+
+def test_airborne_roi_command_already_inside_transitions_through_transit():
+    logic = make_logic(takeoff_altitude=12.0, roi_arrival_tolerance=5.0)
+    airborne = (90.0, 0.0, 12.0)
+
+    logic.request_roi(airborne, center=(100.0, 0.0), radius_m=20.0)
+
+    assert logic.state is FlightState.TRANSITING_TO_ROI
+    assert logic.target == (100.0, 0.0, 12.0)
+
+    logic.update(airborne, 0.1)
+
+    assert logic.state is FlightState.ROI_PATROL
+
+
+def test_roi_patrol_continuously_selects_another_in_bounds_waypoint():
+    logic = make_logic(takeoff_altitude=12.0)
+    airborne = (100.0, 0.0, 12.0)
+    logic.request_roi(airborne, center=(100.0, 0.0), radius_m=20.0)
+    logic.update(airborne, 0.1)
+    first_target = logic.target
+
+    logic.update(first_target, 0.1)
+
+    assert logic.state is FlightState.ROI_PATROL
+    assert logic.target != first_target
+    assert math.hypot(logic.target[0] - 100.0, logic.target[1]) <= 20.0
+
+
+def test_new_roi_during_roi_patrol_returns_through_transit():
+    logic = make_logic(takeoff_altitude=12.0)
+    airborne = (10.0, 0.0, 12.0)
+    logic.request_roi(airborne, center=(10.0, 0.0), radius_m=20.0)
+    logic.update(airborne, 0.1)
+    assert logic.state is FlightState.ROI_PATROL
+
+    logic.request_roi(airborne, center=(200.0, 0.0), radius_m=30.0)
+
+    assert logic.state is FlightState.TRANSITING_TO_ROI
+    assert logic.target == (200.0, 0.0, 12.0)
+
+
+def test_start_patrol_interrupts_roi_patrol_and_holds():
+    logic = make_logic(takeoff_altitude=12.0)
+    airborne = (10.0, 0.0, 12.0)
+    logic.request_roi(airborne, center=(10.0, 0.0), radius_m=20.0)
+    logic.update(airborne, 0.1)
+
+    logic.request_mission_takeoff(airborne)
+
+    assert logic.state is FlightState.HOLDING
+    assert logic.target == airborne
+
+
+def test_roi_patrol_recovers_toward_center_after_boundary_excursion():
+    logic = make_logic(takeoff_altitude=12.0)
+    center = (100.0, 0.0)
+    logic.request_roi((100.0, 0.0, 12.0), center=center, radius_m=20.0)
+    logic.update((100.0, 0.0, 12.0), 0.1)
+
+    logic.update((121.0, 0.0, 12.0), 0.1)
+
+    assert logic.state is FlightState.ROI_PATROL
+    assert logic.target == (100.0, 0.0, 12.0)
+
+
+def test_return_home_interrupts_roi_patrol_for_rth_condition():
+    logic = make_logic(takeoff_altitude=12.0)
+    airborne = (10.0, 0.0, 12.0)
+    logic.request_roi(airborne, center=(10.0, 0.0), radius_m=20.0)
+    logic.update(airborne, 0.1)
+
+    assert logic.request_return_home() is True
+    assert logic.state is FlightState.RETURNING_HOME
+    assert logic.target == (HOME[0], HOME[1], 12.0)
+
+
+def test_clear_roi_on_ground_does_not_start_takeoff():
+    logic = make_logic(takeoff_altitude=12.0)
+
+    logic.clear_roi(HOME)
+
+    assert logic.state is FlightState.IDLE
+    assert logic.target == HOME
+
+
+def test_clear_roi_during_transit_holds_current_position():
+    logic = make_logic(takeoff_altitude=12.0)
+    airborne = (0.0, 0.0, 12.0)
+    logic.request_roi(airborne, center=(100.0, 0.0), radius_m=20.0)
+    current = (25.0, 0.0, 12.0)
+
+    logic.clear_roi(current)
+
+    assert logic.state is FlightState.HOLDING
+    assert logic.target == current
+
+
+def test_clear_roi_during_roi_patrol_holds_current_position():
+    logic = make_logic(takeoff_altitude=12.0)
+    current = (10.0, 0.0, 12.0)
+    logic.request_roi(current, center=(10.0, 0.0), radius_m=20.0)
+    logic.update(current, 0.1)
+
+    logic.clear_roi(current)
+
+    assert logic.state is FlightState.HOLDING
+    assert logic.target == current
+
+
+def test_clear_roi_during_takeoff_keeps_climb_but_cancels_transit():
+    logic = make_logic(takeoff_altitude=12.0)
+    logic.request_roi(HOME, center=(100.0, 0.0), radius_m=20.0)
+
+    logic.clear_roi(HOME)
+    logic.update((HOME[0], HOME[1], 12.0), 0.1)
+
+    assert logic.state is FlightState.HOLDING
+    assert logic.target == (HOME[0], HOME[1], 12.0)
 
 
 def test_random_waypoints_stay_inside_all_configured_bounds():
@@ -87,7 +304,11 @@ def test_reaching_mission_waypoint_returns_to_home_automatically():
 
 @pytest.mark.parametrize(
     "starting_state",
-    [FlightState.TAKING_OFF, FlightState.FLYING_RANDOMLY],
+    [
+        FlightState.TAKING_OFF,
+        FlightState.PATROLLING,
+        FlightState.FLYING_RANDOMLY,
+    ],
 )
 def test_return_home_replaces_active_target(starting_state):
     logic = make_logic()

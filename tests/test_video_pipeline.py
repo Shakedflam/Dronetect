@@ -226,6 +226,9 @@ def test_realtime_video_ingest_forwards_vision_detections_to_tablets(monkeypatch
                         connect(f"ws://127.0.0.1:{port}/ws?role=tablet") as tablet,
                         connect(f"ws://127.0.0.1:{port}/video/ingest?role=drone") as source,
                     ):
+                        initial = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                        assert initial["type"] == "mission_status"
+                        assert initial["state"] == "ON_GROUND"
                         await source.send(encode_video_frame_bundle(_bundle(1)))
                         await source.send(encode_video_frame_bundle(_bundle(2)))
                         raw = await asyncio.wait_for(tablet.recv(), 2.0)

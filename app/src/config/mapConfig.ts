@@ -16,7 +16,7 @@ export const HOME_REFERENCE: Coordinates = { lat: 32.0853, lng: 34.7818 };
  * Radius, in meters, of the purely-visual reference ring drawn around Home
  * on the map. Display-only for now — no mission logic reads or enforces it.
  */
-export const HOME_RADIUS_METERS = 2500;
+export const HOME_RADIUS_METERS = 300;
 
 /** Initial map zoom level on first render, before any auto-follow occurs. */
 export const DEFAULT_ZOOM = 15;

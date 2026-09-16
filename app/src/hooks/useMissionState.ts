@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import type { MissionState } from '../types/missionState';
 import { missionStateService } from '../services/missionStateService';
 
-/** The current frontend-only mission state (ON_GROUND/PATROL/TRANSIT_TO_ROI/ROI_PATROL/RTH). */
+/** The current backend-owned mission state. */
 export function useMissionState(): MissionState {
   const [state, setState] = useState<MissionState>(() => missionStateService.getMissionState());
 

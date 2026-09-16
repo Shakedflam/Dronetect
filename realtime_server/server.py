@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import uuid
 from urllib.parse import parse_qs, urlsplit
 
 from websockets.asyncio.server import ServerConnection, serve
@@ -18,6 +19,7 @@ from realtime_server.protocol import (
     ProtocolError,
     command_ack,
     encode_message,
+    mission_status_message,
     parse_json_message,
     validate_command_message,
     validate_role,
@@ -31,6 +33,21 @@ from realtime_server.video_pipeline import (
 )
 from realtime_server.video_source import VideoSourceConnection, WebSocketVideoSourceAdapter
 from services.video import VIDEO_MAX_PACKET_BYTES, VideoPacketError
+from services.commands import CommandName, MISSION_COMMANDS
+from services.mission_commands import (
+    InvalidMissionCommand,
+    MissionCommandConfig,
+    MissionCommandService,
+)
+from services.mission_state import MissionState
+from services.gps import Wgs84Point
+from services.flight_safety import (
+    DefaultSafetyRthPolicy,
+    FlightSafetySnapshot,
+    SafetyRthPolicy,
+)
+from services.patrol_planner import PatrolPlanner
+from services.patrol_regions import PatrolAreaType, PatrolRegionStore
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -41,7 +58,12 @@ WS_PATH = "/ws"
 class RealtimeServer:
     """Routes telemetry from one drone source to one connected tablet client."""
 
-    def __init__(self, video_config: VideoConfig | None = None) -> None:
+    def __init__(
+        self,
+        video_config: VideoConfig | None = None,
+        mission_config: MissionCommandConfig | None = None,
+        safety_rth_policy: SafetyRthPolicy | None = None,
+    ) -> None:
         self.drone: DroneSdkConnection | None = None
         self.video_source: VideoSourceConnection | None = None
         self.video_pipeline = VideoPipeline(
@@ -50,6 +72,27 @@ class RealtimeServer:
         )
         self._video_pipeline_started = False
         self.tablet: ServerConnection | None = None
+        self.mission = MissionCommandService(
+            config=mission_config
+            or MissionCommandConfig(
+                takeoff_altitude_m=float(
+                    os.getenv("DRONTECT_TAKEOFF_ALTITUDE_M", "15.0")
+                ),
+                roi_arrival_tolerance_m=float(
+                    os.getenv("DRONTECT_ROI_ARRIVAL_TOLERANCE_M", "10.0")
+                ),
+            )
+        )
+        self.patrol_regions = PatrolRegionStore()
+        self.patrol_planner = PatrolPlanner(store=self.patrol_regions)
+        self.safety_rth_policy = safety_rth_policy or DefaultSafetyRthPolicy(
+            low_battery_threshold_percent=float(
+                os.getenv("DRONTECT_LOW_BATTERY_RTH_PERCENT", "20.0")
+            )
+        )
+        self._battery_percent: float | None = None
+        self._low_battery = False
+        self._target_patrol_region_id: str | None = None
 
     async def handler(self, websocket: ServerConnection) -> None:
         try:
@@ -119,12 +162,16 @@ class RealtimeServer:
             return
 
         self.drone = drone
+        await self._send_patrol_priorities_to_drone(drone)
+        await self._send_patrol_area_types_to_drone(drone)
+        await self._send_to_tablet(encode_message(self._mission_status()))
         try:
             async for telemetry in drone.iter_telemetry():
                 await self._route_drone_telemetry(telemetry)
         finally:
             if self.drone is drone:
                 self.drone = None
+                await self._send_to_tablet(encode_message(self._mission_status()))
 
     async def _handle_video_ingest(self, websocket: ServerConnection, query: str) -> None:
         try:
@@ -185,6 +232,7 @@ class RealtimeServer:
 
         self.tablet = websocket
         try:
+            await websocket.send(encode_message(self._mission_status()))
             async for raw in websocket:
                 await self._route_tablet_message(websocket, str(raw))
         finally:
@@ -192,7 +240,94 @@ class RealtimeServer:
                 self.tablet = None
 
     async def _route_drone_telemetry(self, telemetry: dict) -> None:
+        previous_state = self.mission.state
+        data = telemetry["data"]
+        safety_signal = self.safety_rth_policy.evaluate(
+            FlightSafetySnapshot(battery_percent=data["batteryPercent"])
+        )
+        self._battery_percent = float(data["batteryPercent"])
+        self._target_patrol_region_id = data["targetPatrolRegionId"]
+        self._low_battery = safety_signal.reason == "low_battery"
+        self.mission.observe_safety(safety_signal)
+        safety_rth_started = (
+            previous_state is not MissionState.RTH
+            and self.mission.state is MissionState.RTH
+            and self.mission.safety_rth_active
+        )
+        if safety_rth_started:
+            await self._send_safety_rth_to_drone()
+
+        self.mission.observe_altitude(data["altitudeM"])
+        gps = data["gps"]
+        self.mission.observe_position(Wgs84Point(lat=gps["lat"], lng=gps["lng"]))
+        self.mission.observe_flight_state(data["state"])
+        await self._send_to_tablet(encode_message(self._mission_status()))
         await self._send_to_tablet(encode_message(telemetry))
+
+    async def _send_safety_rth_to_drone(self) -> None:
+        drone = self.drone
+        if drone is None:
+            return
+        command = {
+            "type": "command",
+            "commandId": f"safety-rth-{uuid.uuid4()}",
+            "command": CommandName.RETURN_HOME.value,
+            "params": {},
+        }
+        try:
+            await drone.send_command(command)
+        except ConnectionClosed:
+            if self.drone is drone:
+                self.drone = None
+
+    async def _send_patrol_priorities_to_drone(
+        self,
+        drone: DroneSdkConnection,
+    ) -> None:
+        priorities = sorted(
+            (
+                {"regionId": region.id, "rank": region.priority}
+                for region in self.patrol_regions.regions
+                if region.priority is not None
+            ),
+            key=lambda entry: entry["rank"],
+        )
+        if not priorities:
+            return
+        command = {
+            "type": "command",
+            "commandId": f"patrol-priorities-{uuid.uuid4()}",
+            "command": CommandName.SET_PATROL_PRIORITIES.value,
+            "params": {"priorities": priorities},
+        }
+        try:
+            await drone.send_command(command)
+        except ConnectionClosed:
+            if self.drone is drone:
+                self.drone = None
+
+    async def _send_patrol_area_types_to_drone(
+        self,
+        drone: DroneSdkConnection,
+    ) -> None:
+        area_types = [
+            {"regionId": region.id, "areaType": region.area_type.value}
+            for region in self.patrol_regions.regions
+            if region.area_type is not PatrolAreaType.PATROL
+        ]
+        if not area_types:
+            return
+        command = {
+            "type": "command",
+            "commandId": f"patrol-area-types-{uuid.uuid4()}",
+            "command": CommandName.SET_PATROL_AREA_TYPES.value,
+            "params": {"areaTypes": area_types},
+        }
+        try:
+            await drone.send_command(command)
+        except ConnectionClosed:
+            if self.drone is drone:
+                self.drone = None
 
     async def _route_vision_detections(self, detections: dict) -> None:
         timestamp_ms = detections.get("timestampMs")
@@ -220,6 +355,61 @@ class RealtimeServer:
             command = validate_command_message(parse_json_message(raw))
         except ProtocolError as exc:
             await tablet.send(encode_message(exc.to_message()))
+            return
+
+        command_name = CommandName(command["command"])
+        if (
+            self.mission.safety_rth_active
+            and command_name is CommandName.NEW_MISSION
+        ):
+            await tablet.send(
+                encode_message(
+                    ProtocolError(
+                        "invalid_mission_transition",
+                        f"Command {command_name.value} is invalid while in "
+                        f"{self.mission.state.value}",
+                        command_id=command["commandId"],
+                        details={"state": self.mission.state.value},
+                    ).to_message()
+                )
+            )
+            return
+        if command_name is CommandName.SET_PATROL_PRIORITIES:
+            self.patrol_regions.replace_priorities(
+                [
+                    (entry["regionId"], entry["rank"])
+                    for entry in command["params"]["priorities"]
+                ]
+            )
+            drone = self.drone
+            if drone is not None:
+                try:
+                    await drone.send_command(command)
+                except ConnectionClosed:
+                    if self.drone is drone:
+                        self.drone = None
+            await tablet.send(encode_message(command_ack(command["commandId"])))
+            await tablet.send(encode_message(self._mission_status()))
+            return
+        if command_name is CommandName.SET_PATROL_AREA_TYPES:
+            self.patrol_regions.replace_area_types(
+                [
+                    (entry["regionId"], entry["areaType"])
+                    for entry in command["params"]["areaTypes"]
+                ]
+            )
+            drone = self.drone
+            if drone is not None:
+                try:
+                    await drone.send_command(command)
+                except ConnectionClosed:
+                    if self.drone is drone:
+                        self.drone = None
+            await tablet.send(encode_message(command_ack(command["commandId"])))
+            await tablet.send(encode_message(self._mission_status()))
+            return
+        if command_name in MISSION_COMMANDS:
+            await self._route_mission_command(tablet, command, command_name)
             return
 
         if self.drone is None:
@@ -250,6 +440,98 @@ class RealtimeServer:
             return
 
         await tablet.send(encode_message(command_ack(command["commandId"])))
+
+    async def _route_mission_command(
+        self,
+        tablet: ServerConnection,
+        command: dict,
+        command_name: CommandName,
+    ) -> None:
+        try:
+            self.mission.validate(command_name)
+        except InvalidMissionCommand as exc:
+            await tablet.send(
+                encode_message(
+                    ProtocolError(
+                        "invalid_mission_transition",
+                        str(exc),
+                        command_id=command["commandId"],
+                        details={"state": exc.state.value},
+                    ).to_message()
+                )
+            )
+            return
+
+        drone = self.drone
+        if drone is None:
+            await tablet.send(
+                encode_message(
+                    ProtocolError(
+                        "drone_unavailable",
+                        "No drone is connected to receive mission commands.",
+                        command_id=command["commandId"],
+                    ).to_message()
+                )
+            )
+            return
+
+        try:
+            await drone.send_command(command)
+        except ConnectionClosed:
+            if self.drone is drone:
+                self.drone = None
+            await tablet.send(
+                encode_message(
+                    ProtocolError(
+                        "drone_unavailable",
+                        "Drone disconnected before receiving the mission command.",
+                        command_id=command["commandId"],
+                    ).to_message()
+                )
+            )
+            return
+
+        self.mission.apply(command_name, command["params"])
+
+        await tablet.send(encode_message(command_ack(command["commandId"])))
+        await tablet.send(encode_message(self._mission_status()))
+
+    def _mission_status(self) -> dict:
+        roi = self.mission.roi
+        active_roi = (
+            None
+            if roi is None
+            else {
+                "center": {"lat": roi.lat, "lon": roi.lon},
+                "radiusM": roi.radius_m,
+            }
+        )
+        priorities = sorted(
+            (
+                {"regionId": region.id, "rank": region.priority}
+                for region in self.patrol_regions.regions
+                if region.priority is not None
+            ),
+            key=lambda entry: entry["rank"],
+        )
+        area_types = [
+            {"regionId": region.id, "areaType": region.area_type.value}
+            for region in self.patrol_regions.regions
+            if region.area_type is not PatrolAreaType.PATROL
+        ]
+        return mission_status_message(
+            state=self.mission.state,
+            active_roi=active_roi,
+            patrol_priorities=priorities,
+            current_patrol_region_id=None,
+            target_patrol_region_id=self._target_patrol_region_id,
+            battery_percent=self._battery_percent,
+            low_battery=self._low_battery,
+            safety_rth_active=self.mission.safety_rth_active,
+            rth_reason=self.mission.safety_rth_reason,
+            drone_connected=self.drone is not None,
+            patrol_area_types=area_types,
+        )
 
     async def _send_to_tablet(self, message: str) -> None:
         tablet = self.tablet

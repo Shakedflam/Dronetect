@@ -6,6 +6,11 @@ from enum import StrEnum
 
 
 class CommandName(StrEnum):
+    START_PATROL = "start_patrol"
+    SET_PATROL_PRIORITIES = "set_patrol_priorities"
+    SET_PATROL_AREA_TYPES = "set_patrol_area_types"
+    SET_ROI = "set_roi"
+    CLEAR_ROI = "clear_roi"
     RETURN_HOME = "return_home"
     NEW_MISSION = "new_mission"
     CAMERA_TILT_UP = "camera_tilt_up"
@@ -13,3 +18,11 @@ class CommandName(StrEnum):
 
 
 SUPPORTED_COMMANDS = frozenset(command.value for command in CommandName)
+MISSION_COMMANDS = frozenset(
+    {
+        CommandName.START_PATROL,
+        CommandName.SET_ROI,
+        CommandName.CLEAR_ROI,
+        CommandName.RETURN_HOME,
+    }
+)

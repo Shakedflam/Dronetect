@@ -61,6 +61,7 @@ export function generatePatrolRegions(home: Coordinates, homeRadiusM: number): P
         startBearingDeg: (deg - SECTOR_HALF_WIDTH_DEG + 360) % 360,
         endBearingDeg: (deg + SECTOR_HALF_WIDTH_DEG) % 360,
         center: { lat: centerCoords.lat, lon: centerCoords.lng },
+        areaType: 'PATROL',
         priorityRank: null,
       });
     }

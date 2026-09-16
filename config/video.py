@@ -16,7 +16,7 @@ class VideoConfig:
     source_target_fps: int = 30
     ui_max_width: int = 960
     ui_max_height: int = 540
-    ui_jpeg_quality: int = 72
+    ui_jpeg_quality: int = 85
     vision_frame_interval: int = 2
     vision_max_width: int = 960
     vision_max_height: int = 540

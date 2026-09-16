@@ -75,6 +75,7 @@ class SimulatorRealtimeClient:
             try:
                 assert connect is not None
                 async with connect(self.url) as websocket:
+                    print(f"Realtime command link connected: {self.url}")
                     receiver = asyncio.create_task(self._receive_commands(websocket))
                     sender = asyncio.create_task(self._send_telemetry(websocket))
                     done, pending = await asyncio.wait(
@@ -85,8 +86,9 @@ class SimulatorRealtimeClient:
                         task.cancel()
                     for task in done:
                         task.result()
-            except Exception:
+            except Exception as exc:
                 if not self._stop.is_set():
+                    print(f"Realtime command link unavailable: {exc}")
                     await asyncio.sleep(RECONNECT_DELAY_S)
 
     async def _receive_commands(self, websocket) -> None:

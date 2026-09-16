@@ -11,7 +11,9 @@
 
 """Webots adapter for the autonomous generic-quadcopter proof of concept."""
 
+from collections import deque
 import math
+import os
 from pathlib import Path
 import sys
 from typing import cast
@@ -40,7 +42,16 @@ from hud import (
     signed_angle_to_target_degrees,
 )
 from services.commands import CommandName
-from services.gps import LocalPosition
+from services.gps import (
+    DEFAULT_HOME,
+    LocalPosition,
+    Wgs84Point,
+    local_meters_to_wgs84,
+    wgs84_to_local_meters,
+)
+from services.no_fly_router import NoFlyRouteUnavailable, NoFlyRouter
+from services.patrol_planner import PatrolPlanner
+from services.patrol_regions import PatrolRegionStore
 from services.telemetry import build_simulator_telemetry
 from world_markers import WorldMarkers
 
@@ -72,16 +83,27 @@ class AutonomousDrone(Supervisor):
     def __init__(self) -> None:
         super().__init__()
         self.time_step = int(self.getBasicTimeStep())
+        self.patrol_regions = PatrolRegionStore()
+        self.patrol_planner = PatrolPlanner(store=self.patrol_regions)
+        self.no_fly_router = NoFlyRouter()
+        self._patrol_route_waypoints: deque[Position] = deque()
+        self._target_patrol_region_id: str | None = None
         self.logic = FlightLogic(
             FlightConfig(
-                takeoff_altitude=15.0,
+                takeoff_altitude=float(
+                    os.getenv("DRONTECT_TAKEOFF_ALTITUDE_M", "15.0")
+                ),
                 x_bounds=(-60.0, -30.0),
                 y_bounds=(5.0, 20.0),
                 z_bounds=(13.0, 18.0),
                 horizontal_tolerance=1.2,
                 vertical_tolerance=0.5,
                 landing_rate=1.0,
-            )
+                roi_arrival_tolerance=float(
+                    os.getenv("DRONTECT_ROI_ARRIVAL_TOLERANCE_M", "10.0")
+                ),
+            ),
+            patrol_waypoint_provider=self._next_patrol_waypoint,
         )
 
         self.markers = WorldMarkers(self)
@@ -122,6 +144,9 @@ class AutonomousDrone(Supervisor):
         self._last_hud_update_time = -1.0
         self._horizontal_speed_mps = 0.0
         self._kinematic_yaw: float | None = None
+        self._simulated_battery_percent = float(
+            os.getenv("DRONTECT_SIMULATED_BATTERY_PERCENT", "100.0")
+        )
         self.realtime_client = SimulatorRealtimeClient()
         self.realtime_client.start()
         self.video_client = SimulatorVideoClient()
@@ -183,10 +208,14 @@ class AutonomousDrone(Supervisor):
             normalized_key = key & 0xFFFF
             if normalized_key in (ord("H"), ord("h")):
                 if self.logic.request_return_home():
+                    self._patrol_route_waypoints.clear()
+                    self._target_patrol_region_id = None
                     print("Return Home requested: random flight cancelled.")
                 else:
                     print(f"Return Home ignored while {self.logic.state.value}.")
             elif normalized_key in (ord("N"), ord("n")):
+                self._patrol_route_waypoints.clear()
+                self._target_patrol_region_id = None
                 waypoint = self.logic.request_new_target(position)
                 print(f"New mission target: {self._format_position(waypoint)}")
             elif normalized_key in (ord("U"), ord("u")):
@@ -201,13 +230,71 @@ class AutonomousDrone(Supervisor):
 
     def _handle_realtime_commands(self, position: Position) -> None:
         for message in self.realtime_client.drain_commands():
-            command = message["command"]
+            command = CommandName(message["command"])
             if command == CommandName.RETURN_HOME:
                 if self.logic.request_return_home():
+                    self._patrol_route_waypoints.clear()
+                    self._target_patrol_region_id = None
                     print("Realtime command return_home accepted.")
                 else:
                     print(f"Realtime command return_home ignored while {self.logic.state.value}.")
+            elif command == CommandName.START_PATROL:
+                self._patrol_route_waypoints.clear()
+                self._target_patrol_region_id = None
+                self.logic.request_patrol(position)
+                print(f"Realtime command {command.value} accepted.")
+            elif command == CommandName.SET_PATROL_PRIORITIES:
+                priorities = message["params"]["priorities"]
+                self.patrol_regions.replace_priorities(
+                    [(entry["regionId"], entry["rank"]) for entry in priorities]
+                )
+                print("Realtime patrol priorities updated.")
+            elif command == CommandName.SET_PATROL_AREA_TYPES:
+                area_types = message["params"]["areaTypes"]
+                self.patrol_regions.replace_area_types(
+                    [(entry["regionId"], entry["areaType"]) for entry in area_types]
+                )
+                if self.logic.state is FlightState.PATROLLING:
+                    self._patrol_route_waypoints.clear()
+                    self._target_patrol_region_id = None
+                    self.logic.target = self._next_patrol_waypoint(
+                        position,
+                        completed=False,
+                    )
+                print("Realtime patrol area types updated.")
+            elif command == CommandName.SET_ROI:
+                self._patrol_route_waypoints.clear()
+                self._target_patrol_region_id = None
+                params = message["params"]
+                center = params["center"]
+                local_center = wgs84_to_local_meters(
+                    Wgs84Point(lat=center["lat"], lng=center["lon"]),
+                    DEFAULT_HOME,
+                    altitude_m=self.logic.config.takeoff_altitude,
+                )
+                self.logic.request_roi(
+                    position,
+                    (local_center.x, local_center.y),
+                    params["radiusM"],
+                )
+                # ROI missions intentionally override NO_FLY patrol routing;
+                # the restriction remains stored and resumes with PATROL.
+                print("Realtime command set_roi accepted.")
+            elif command == CommandName.CLEAR_ROI:
+                resume_patrol = self.logic.state in {
+                    FlightState.TAKING_OFF,
+                    FlightState.TRANSITING_TO_ROI,
+                    FlightState.ROI_PATROL,
+                }
+                self.logic.clear_roi(position)
+                if resume_patrol:
+                    self._patrol_route_waypoints.clear()
+                    self._target_patrol_region_id = None
+                    self.logic.request_patrol(position)
+                print("Realtime command clear_roi accepted.")
             elif command == CommandName.NEW_MISSION:
+                self._patrol_route_waypoints.clear()
+                self._target_patrol_region_id = None
                 waypoint = self.logic.request_new_target(position)
                 print(f"Realtime command new_mission: {self._format_position(waypoint)}")
             elif command == CommandName.CAMERA_TILT_UP:
@@ -232,7 +319,14 @@ class AutonomousDrone(Supervisor):
             self._camera_flight_state = state
             if state is FlightState.TAKING_OFF:
                 self.camera_gimbal.set_pitch(self.TAKEOFF_CAMERA_PITCH)
-            elif state in {FlightState.FLYING_RANDOMLY, FlightState.RETURNING_HOME}:
+            elif state in {
+                FlightState.HOLDING,
+                FlightState.TRANSITING_TO_ROI,
+                FlightState.ROI_PATROL,
+                FlightState.PATROLLING,
+                FlightState.FLYING_RANDOMLY,
+                FlightState.RETURNING_HOME,
+            }:
                 self.camera_gimbal.set_pitch(self.HORIZONTAL_CAMERA_PITCH)
             elif state in {FlightState.LANDING, FlightState.LANDED}:
                 self.camera_gimbal.set_pitch(self.camera_gimbal.maximum_pitch)
@@ -294,7 +388,11 @@ class AutonomousDrone(Supervisor):
         )
 
     def _kinematic_config_for_state(self) -> KinematicFlightConfig:
-        if self.logic.state is FlightState.FLYING_RANDOMLY:
+        if self.logic.state in {
+            FlightState.FLYING_RANDOMLY,
+            FlightState.ROI_PATROL,
+            FlightState.PATROLLING,
+        }:
             return self.SEARCH_KINEMATIC_FLIGHT_CONFIG
         return self.KINEMATIC_FLIGHT_CONFIG
 
@@ -374,8 +472,53 @@ class AutonomousDrone(Supervisor):
             heading_deg=(math.degrees(yaw) + 360.0) % 360.0,
             speed_mps=speed_mps,
             state=self.logic.state.value,
+            battery_percent=self._simulated_battery_percent,
+            target_patrol_region_id=self._target_patrol_region_id,
         )
         self.realtime_client.publish_telemetry(telemetry)
+
+    def _next_patrol_waypoint(
+        self,
+        position: Position,
+        completed: bool,
+    ) -> Position:
+        if completed and self._patrol_route_waypoints:
+            return self._patrol_route_waypoints.popleft()
+        if completed and self._target_patrol_region_id is not None:
+            self.patrol_planner.record_observation(self._target_patrol_region_id)
+        current = local_meters_to_wgs84(
+            LocalPosition(x=position[0], y=position[1], z=position[2]),
+            DEFAULT_HOME,
+        )
+        decision = self.patrol_planner.choose_next(current)
+        self._target_patrol_region_id = decision.region.id
+        local_target = wgs84_to_local_meters(
+            decision.region.center,
+            DEFAULT_HOME,
+            altitude_m=self.logic.config.takeoff_altitude,
+        )
+        try:
+            route = self.no_fly_router.route(
+                (position[0], position[1]),
+                (local_target.x, local_target.y),
+                self.patrol_regions.regions,
+            )
+        except NoFlyRouteUnavailable:
+            self._target_patrol_region_id = None
+            self._patrol_route_waypoints.clear()
+            print("No safe patrol route is currently available; holding position.")
+            return (
+                position[0],
+                position[1],
+                self.logic.config.takeoff_altitude,
+            )
+        route_waypoints = [
+            (x, y, self.logic.config.takeoff_altitude)
+            for x, y in route
+        ]
+        self._patrol_route_waypoints = deque(route_waypoints[1:])
+        print(f"Patrol target region: {decision.region.id}")
+        return route_waypoints[0]
 
     def _set_motor_velocities(
         self,

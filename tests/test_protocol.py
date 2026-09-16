@@ -6,12 +6,17 @@ from realtime_server.protocol import (
     build_detection_message,
     command_ack,
     encode_message,
+    mission_state_message,
+    mission_status_message,
     parse_json_message,
     validate_detection_message,
     validate_command_message,
+    validate_mission_state_message,
+    validate_mission_status_message,
     validate_role,
     validate_telemetry_message,
 )
+from services.mission_state import MissionState
 from services.gps import LocalPosition
 from services.telemetry import build_simulator_telemetry
 from services.video import JPEG_ENCODING, VideoFrame
@@ -36,6 +41,64 @@ def test_valid_telemetry_validates_and_serializes():
     assert validated["data"]["gps"]["lat"] > 32.085300
 
 
+def test_simulator_telemetry_accepts_configurable_battery_percent():
+    message = build_simulator_telemetry(
+        position_local=LocalPosition(0.0, 0.0, 15.0),
+        heading_deg=0.0,
+        speed_mps=0.0,
+        state="PATROL",
+        battery_percent=12.5,
+    )
+
+    assert message["data"]["batteryPercent"] == 12.5
+
+
+def test_mission_status_round_trips_authoritative_backend_state():
+    message = mission_status_message(
+        state=MissionState.ROI_PATROL,
+        active_roi={
+            "center": {"lat": 32.1, "lon": 34.8},
+            "radiusM": 250.0,
+        },
+        patrol_priorities=[{"regionId": "N-4", "rank": 1}],
+        current_patrol_region_id="N-3",
+        target_patrol_region_id="N-4",
+        battery_percent=18.0,
+        low_battery=True,
+        safety_rth_active=False,
+        rth_reason=None,
+    )
+
+    validated = validate_mission_status_message(
+        parse_json_message(encode_message(message))
+    )
+
+    assert validated == message
+    assert validated["state"] == "ROI_PATROL"
+    assert validated["activeRoi"]["radiusM"] == 250.0
+    assert validated["patrol"]["targetRegionId"] == "N-4"
+    assert validated["batteryRth"]["lowBattery"] is True
+
+
+def test_mission_status_missing_area_types_defaults_to_patrol():
+    message = mission_status_message(
+        state=MissionState.ON_GROUND,
+        active_roi=None,
+        patrol_priorities=[],
+        current_patrol_region_id=None,
+        target_patrol_region_id=None,
+        battery_percent=100.0,
+        low_battery=False,
+        safety_rth_active=False,
+        rth_reason=None,
+    )
+    del message["patrol"]["areaTypes"]
+
+    validated = validate_mission_status_message(message)
+
+    assert validated["patrol"]["areaTypes"] == []
+
+
 def test_valid_command_validates_and_serializes():
     raw = encode_message(
         {
@@ -54,6 +117,220 @@ def test_valid_command_validates_and_serializes():
         "command": "return_home",
         "params": {},
     }
+
+
+@pytest.mark.parametrize("command", ["start_patrol", "clear_roi", "return_home"])
+def test_valid_parameterless_mission_commands(command):
+    message = validate_command_message(
+        {
+            "type": "command",
+            "commandId": "mission-1",
+            "command": command,
+            "params": {},
+        }
+    )
+
+    assert message["command"] == command
+    assert message["params"] == {}
+
+
+def test_set_roi_accepts_zero_coordinate_and_radius_payload():
+    message = validate_command_message(
+        {
+            "type": "command",
+            "commandId": "roi-1",
+            "command": "set_roi",
+            "params": {
+                "center": {"lat": 0, "lon": 0},
+                "radiusM": 0,
+            },
+        }
+    )
+
+    assert message["params"] == {
+        "center": {"lat": 0.0, "lon": 0.0},
+        "radiusM": 0.0,
+    }
+
+
+def test_set_patrol_priorities_accepts_ranked_and_empty_sets():
+    ranked = validate_command_message(
+        {
+            "type": "command",
+            "commandId": "priorities-1",
+            "command": "set_patrol_priorities",
+            "params": {
+                "priorities": [
+                    {"regionId": "N-4", "rank": 1},
+                    {"regionId": "NE-4", "rank": 2},
+                ]
+            },
+        }
+    )
+    empty = validate_command_message(
+        {
+            "type": "command",
+            "commandId": "priorities-2",
+            "command": "set_patrol_priorities",
+            "params": {"priorities": []},
+        }
+    )
+
+    assert ranked["params"]["priorities"] == [
+        {"regionId": "N-4", "rank": 1},
+        {"regionId": "NE-4", "rank": 2},
+    ]
+    assert empty["params"] == {"priorities": []}
+
+
+def test_set_patrol_area_types_accepts_enum_values_and_empty_overrides():
+    typed = validate_command_message(
+        {
+            "type": "command",
+            "commandId": "area-types-1",
+            "command": "set_patrol_area_types",
+            "params": {
+                "areaTypes": [
+                    {"regionId": "N-1", "areaType": "IGNORE"},
+                    {"regionId": "N-2", "areaType": "NO_FLY"},
+                ]
+            },
+        }
+    )
+    empty = validate_command_message(
+        {
+            "type": "command",
+            "commandId": "area-types-2",
+            "command": "set_patrol_area_types",
+            "params": {"areaTypes": []},
+        }
+    )
+
+    assert typed["params"]["areaTypes"] == [
+        {"regionId": "N-1", "areaType": "IGNORE"},
+        {"regionId": "N-2", "areaType": "NO_FLY"},
+    ]
+    assert empty["params"] == {"areaTypes": []}
+
+
+@pytest.mark.parametrize("area_type", ["OTHER", "ignore", None, True])
+def test_set_patrol_area_types_rejects_unknown_type(area_type):
+    with pytest.raises(ProtocolError) as exc_info:
+        validate_command_message(
+            {
+                "type": "command",
+                "commandId": "area-types-bad",
+                "command": "set_patrol_area_types",
+                "params": {
+                    "areaTypes": [
+                        {"regionId": "N-1", "areaType": area_type}
+                    ]
+                },
+            }
+        )
+
+    assert exc_info.value.code == "invalid_params"
+
+
+@pytest.mark.parametrize(
+    "priorities",
+    [
+        None,
+        {},
+        ["N-4"],
+        [{"regionId": "BAD-1", "rank": 1}],
+        [{"regionId": "N-4", "rank": 0}],
+        [{"regionId": "N-4", "rank": True}],
+        [
+            {"regionId": "N-4", "rank": 1},
+            {"regionId": "N-4", "rank": 2},
+        ],
+        [
+            {"regionId": "N-4", "rank": 1},
+            {"regionId": "NE-4", "rank": 1},
+        ],
+        [
+            {"regionId": "N-4", "rank": 1},
+            {"regionId": "NE-4", "rank": 3},
+        ],
+    ],
+)
+def test_set_patrol_priorities_rejects_invalid_sets(priorities):
+    with pytest.raises(ProtocolError) as exc_info:
+        validate_command_message(
+            {
+                "type": "command",
+                "commandId": "priorities-bad",
+                "command": "set_patrol_priorities",
+                "params": {"priorities": priorities},
+            }
+        )
+
+    assert exc_info.value.code == "invalid_params"
+    assert exc_info.value.command_id == "priorities-bad"
+
+
+@pytest.mark.parametrize(
+    ("params", "field"),
+    [
+        ({}, "center"),
+        ({"center": {"lat": 0, "lon": 0}}, "radiusM"),
+        ({"center": {"lat": 91, "lon": 0}, "radiusM": 10}, "center.lat"),
+        ({"center": {"lat": 0, "lon": -181}, "radiusM": 10}, "center.lon"),
+        ({"center": {"lat": 0, "lon": 0}, "radiusM": -1}, "radiusM"),
+        ({"center": {"lat": True, "lon": 0}, "radiusM": 10}, "lat"),
+    ],
+)
+def test_set_roi_rejects_invalid_params(params, field):
+    with pytest.raises(ProtocolError) as exc_info:
+        validate_command_message(
+            {
+                "type": "command",
+                "commandId": "roi-bad",
+                "command": "set_roi",
+                "params": params,
+            }
+        )
+
+    assert exc_info.value.code == "invalid_params"
+    assert exc_info.value.command_id == "roi-bad"
+    assert exc_info.value.details["field"] == field
+
+
+def test_parameterless_mission_command_rejects_params():
+    with pytest.raises(ProtocolError) as exc_info:
+        validate_command_message(
+            {
+                "type": "command",
+                "commandId": "patrol-bad",
+                "command": "start_patrol",
+                "params": {"unexpected": True},
+            }
+        )
+
+    assert exc_info.value.code == "invalid_params"
+    assert exc_info.value.command_id == "patrol-bad"
+
+
+def test_mission_state_message_validates_and_serializes():
+    message = mission_state_message(MissionState.ON_GROUND)
+
+    assert validate_mission_state_message(
+        parse_json_message(encode_message(message))
+    ) == {
+        "type": "mission_state",
+        "state": "ON_GROUND",
+    }
+
+
+def test_unknown_mission_state_is_rejected():
+    with pytest.raises(ProtocolError) as exc_info:
+        validate_mission_state_message(
+            {"type": "mission_state", "state": "FLYING_RANDOMLY"}
+        )
+
+    assert exc_info.value.code == "validation_error"
+    assert exc_info.value.details["field"] == "state"
 
 
 def test_valid_detection_message_validates_and_serializes():

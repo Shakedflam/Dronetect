@@ -2,6 +2,7 @@ import type { RoiCenter } from './roi';
 
 /** 8-point compass direction a patrol region belongs to. */
 export type PatrolDirection = 'N' | 'NE' | 'E' | 'SE' | 'S' | 'SW' | 'W' | 'NW';
+export type PatrolAreaType = 'PATROL' | 'IGNORE' | 'NO_FLY';
 
 /**
  * One of the static cells the Home operational circle is divided into (8
@@ -25,6 +26,8 @@ export interface PatrolRegion {
   endBearingDeg: number;
   /** Representative point for markers / future backend consumption. */
   center: RoiCenter;
+  /** Missing serialized values are interpreted as PATROL for compatibility. */
+  areaType: PatrolAreaType;
   /** 1-based revisit-priority rank, or null if unranked. Several regions may share "unranked". */
   priorityRank: number | null;
 }
@@ -39,4 +42,5 @@ export interface PatrolConfig {
   regions: PatrolRegion[];
   /** Region ids in rank order — priorities[i] has rank i+1. */
   priorities: string[];
+  areaTypes: Record<string, PatrolAreaType>;
 }

@@ -1,6 +1,6 @@
 import { droneCommandService } from '../../services/droneCommandService';
-import { missionStateService } from '../../services/missionStateService';
 import { useMissionState } from '../../hooks/useMissionState';
+import { useMissionStatus } from '../../hooks/useMissionStatus';
 import { useRoi } from '../../hooks/useRoi';
 import styles from './ActionBar.module.css';
 
@@ -12,18 +12,17 @@ interface ActionBarProps {
 /**
  * Permanent control bar. RTH/New Mission/camera tilt are always available —
  * they're the drone-wide commands the realtime server currently supports.
- * Patrol/ROI/RTH additionally write a shared frontend-only
- * missionStateService (see types/missionState.ts) so the map/HUD can show
- * what the operator last commanded — decoupled from TelemetryData.state,
- * the backend's own flight-state-machine string. ROI_PATROL is declared in
- * that state but not reachable from any button yet (no automatic
- * transitions are implemented). Follow/Ignore/Engage only appear once the
+ * Patrol/ROI/RTH are backend commands, and mission state messages show
+ * the authoritative transition in the map/HUD.
+ * Follow/Ignore/Engage only appear once the
  * operator has selected a detected target (App owns that selection state);
  * they have no realtime server equivalent yet and remain mocked.
  */
 export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps) {
   const hasSelection = selectedTargetId !== null;
   const missionState = useMissionState();
+  const missionStatus = useMissionStatus();
+  const droneConnected = missionStatus?.droneConnected ?? false;
   const roi = useRoi();
   const roiMissionActive = missionState === 'TRANSIT_TO_ROI' || missionState === 'ROI_PATROL';
 
@@ -31,7 +30,6 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
     droneCommandService.returnToHome().catch((error: unknown) => {
       console.error('[ActionBar] returnToHome failed', error);
     });
-    missionStateService.setMissionState('RTH');
   }
 
   function handleNewMission() {
@@ -68,13 +66,17 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
     void droneCommandService.engageTarget(selectedTargetId);
   }
 
-  function handleTogglePatrol() {
-    missionStateService.setMissionState(missionState === 'PATROL' ? 'ON_GROUND' : 'PATROL');
+  function handleStartPatrol() {
+    droneCommandService.startPatrol().catch((error: unknown) => {
+      console.error('[ActionBar] startPatrol failed', error);
+    });
   }
 
   function handleTransitToRoi() {
     if (!roi) return;
-    missionStateService.setMissionState('TRANSIT_TO_ROI');
+    droneCommandService.setRoi(roi).catch((error: unknown) => {
+      console.error('[ActionBar] setRoi failed', error);
+    });
   }
 
   return (
@@ -84,6 +86,8 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
           type="button"
           className={`${styles.button} ${styles.rth}`}
           onClick={handleReturnToHome}
+          disabled={!droneConnected}
+          title={droneConnected ? undefined : 'Drone is not connected'}
         >
           RTH
         </button>
@@ -91,6 +95,7 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
           type="button"
           className={`${styles.button} ${styles.mission}`}
           onClick={handleNewMission}
+          disabled={!droneConnected}
         >
           NEW MISSION
         </button>
@@ -111,7 +116,8 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
         <button
           type="button"
           className={`${styles.button} ${styles.patrol} ${missionState === 'PATROL' ? styles.patrolActive : ''}`}
-          onClick={handleTogglePatrol}
+          onClick={handleStartPatrol}
+          disabled={!droneConnected}
           aria-pressed={missionState === 'PATROL'}
         >
           PATROL
@@ -120,7 +126,8 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
           type="button"
           className={`${styles.button} ${styles.roi} ${roiMissionActive ? styles.roiActive : ''}`}
           onClick={handleTransitToRoi}
-          disabled={!roi}
+          disabled={!roi || !droneConnected}
+          title={droneConnected ? undefined : 'Drone is not connected'}
           aria-pressed={roiMissionActive}
         >
           ROI
