@@ -18,13 +18,21 @@ def test_camera_gimbal_tilts_up_and_down():
     assert down_pitch == 0.7
 
 
+def test_camera_gimbal_sets_and_clamps_absolute_pitch():
+    gimbal = CameraGimbal()
+
+    assert gimbal.set_pitch(0.0) == 0.0
+    assert gimbal.set_pitch(2.0) == 1.7
+    assert gimbal.set_pitch(-2.0) == -0.5
+
+
 def test_camera_gimbal_clamps_to_safe_pitch_limits():
-    gimbal = CameraGimbal(pitch=0.99)
+    gimbal = CameraGimbal(pitch=1.69)
 
-    assert gimbal.tilt_down() == 1.0
-    assert gimbal.tilt_down() == 1.0
+    assert gimbal.tilt_down() == 1.7
+    assert gimbal.tilt_down() == 1.7
 
-    gimbal = CameraGimbal(pitch=-1.39)
+    gimbal = CameraGimbal(pitch=-0.49)
 
-    assert gimbal.tilt_up() == -1.4
-    assert gimbal.tilt_up() == -1.4
+    assert gimbal.tilt_up() == -0.5
+    assert gimbal.tilt_up() == -0.5

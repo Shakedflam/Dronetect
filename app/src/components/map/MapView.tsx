@@ -1,14 +1,35 @@
-import { useEffect, useRef, useState } from 'react';
-import { MapContainer, Marker, Polyline, Tooltip, TileLayer, useMap } from 'react-leaflet';
+import { useEffect, useRef, useState, type ChangeEvent } from 'react';
+import {
+  Circle,
+  MapContainer,
+  Marker,
+  Polygon,
+  Polyline,
+  Tooltip,
+  TileLayer,
+  useMap,
+  useMapEvents,
+} from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import type { Coordinates, DronePosition } from '../../types/drone';
+import type { RoiCenter } from '../../types/roi';
 import { useLocation } from '../../hooks/useLocation';
-import { HOME_REFERENCE } from '../../config/homeReference';
+import { useRoi } from '../../hooks/useRoi';
+import { roiService } from '../../services/roiService';
+import {
+  DEFAULT_ROI_RADIUS_METERS,
+  DEFAULT_ZOOM,
+  FOLLOW_PADDING,
+  HOME_RADIUS_METERS,
+  HOME_REFERENCE,
+  MAX_FOLLOW_ZOOM,
+  MAX_ROI_RADIUS_METERS,
+  MIN_ROI_RADIUS_METERS,
+} from '../../config/mapConfig';
 import { bearingDeg, euclideanDistanceMeters } from '../../utils/geo';
+import { clipRoiToHomeRange } from '../../utils/roiClipping';
 import styles from './MapView.module.css';
-
-const DEFAULT_ZOOM = 15;
 
 const droneIcon = L.divIcon({
   className: styles.droneIcon,
@@ -41,15 +62,6 @@ function formatDistance(meters: number): string {
   return `${Math.round(meters)} m`;
 }
 
-/** Padding, in pixels, kept between the drone/home bounds and the map edge. */
-const FOLLOW_PADDING: L.PointTuple = [64, 64];
-/**
- * Zoom cap for auto-follow. Deliberately higher than DEFAULT_ZOOM so that
- * when the drone is close to home the view zooms in and keeps the two
- * markers visually separated, instead of sitting at a fixed zoom that
- * crowds them together.
- */
-const MAX_FOLLOW_ZOOM = 18;
 /** Duration of each auto-follow flight, in seconds. */
 const FOLLOW_FLY_DURATION_S = 0.8;
 /**
@@ -115,12 +127,206 @@ function LiveTrackingControl({ position, home }: { position: DronePosition; home
   );
 }
 
+/** Clearly distinct from the blue home range, amber home line, and red/green markers. */
+const ROI_COLOR = '#c65ce0';
+/**
+ * Stroke weight of the invisible circle stacked on the visible ROI outline,
+ * purely to widen the draggable hit area along the boundary — the visible
+ * outline itself stays thin. A near-zero (not exactly zero) opacity keeps
+ * it invisible while still being "painted" enough for pointer-events hit
+ * testing in every browser.
+ */
+const ROI_BOUNDARY_HIT_WEIGHT = 28;
+const ROI_BOUNDARY_HIT_OPACITY = 0.001;
+/** Native DOM click-count threshold (`MouseEvent.detail`) treated as a triple-tap/triple-click. */
+const ROI_TRIPLE_CLICK_DETAIL = 3;
+
+const roiCenterIcon = L.divIcon({
+  className: styles.roiCenterIcon,
+  html: '<span class="' + styles.roiCenterDot + '"></span>',
+  iconSize: [14, 14],
+  iconAnchor: [7, 7],
+});
+
+function clampRoiRadius(radiusM: number): number {
+  return Math.min(MAX_ROI_RADIUS_METERS, Math.max(MIN_ROI_RADIUS_METERS, radiusM));
+}
+
+function toCoordinates(center: RoiCenter): Coordinates {
+  return { lat: center.lat, lng: center.lon };
+}
+
+/**
+ * Frontend-only "define a region of interest" tool: the operator places and
+ * resizes a circle on the map. Purely visual for now — no mission logic
+ * reads it. State lives in `roiService`, not here, so a future non-UI
+ * source (another machine reporting an ROI over some future connection)
+ * can call `roiService.setRoi(...)` directly and every subscriber —
+ * including this layer — picks it up the same way a click here does; this
+ * component never simulates or requires a map click to update the ROI.
+ */
+function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: number }) {
+  const roi = useRoi();
+  const [defining, setDefining] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const stopBoundaryDragRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (!panel) return;
+    // Otherwise clicks/scrolls on the panel (buttons, radius input) would
+    // bubble to the map and be treated as "place the ROI here".
+    L.DomEvent.disableClickPropagation(panel);
+    L.DomEvent.disableScrollPropagation(panel);
+    return () => stopBoundaryDragRef.current?.();
+  }, []);
+
+  const map = useMapEvents({
+    click(event) {
+      // A triple tap/click places (or moves) the ROI center regardless of
+      // "Define ROI" mode — an always-available shortcut alongside it.
+      const isTripleClick = event.originalEvent.detail >= ROI_TRIPLE_CLICK_DETAIL;
+      if (!isTripleClick && !defining) return;
+      roiService.setRoi({
+        center: { lat: event.latlng.lat, lon: event.latlng.lng },
+        radiusM: roi?.radiusM ?? DEFAULT_ROI_RADIUS_METERS,
+      });
+      if (defining) setDefining(false);
+    },
+  });
+
+  function handleBoundaryMouseDown(event: L.LeafletMouseEvent): void {
+    if (!roi) return;
+    const roiCenter = roi.center;
+    const centerCoords = toCoordinates(roiCenter);
+    L.DomEvent.stopPropagation(event.originalEvent);
+    stopBoundaryDragRef.current?.();
+    map.dragging.disable();
+    let active = true;
+
+    function onMove(moveEvent: L.LeafletMouseEvent): void {
+      const radiusM = clampRoiRadius(euclideanDistanceMeters(centerCoords, moveEvent.latlng));
+      roiService.setRoi({ center: roiCenter, radiusM });
+    }
+
+    function stopDragging(): void {
+      if (!active) return;
+      active = false;
+      map.dragging.enable();
+      map.off('mousemove', onMove);
+      map.off('mouseup', stopDragging);
+      document.removeEventListener('mouseup', stopDragging);
+      window.removeEventListener('blur', stopDragging);
+      if (stopBoundaryDragRef.current === stopDragging) {
+        stopBoundaryDragRef.current = null;
+      }
+    }
+
+    map.on('mousemove', onMove);
+    map.on('mouseup', stopDragging);
+    document.addEventListener('mouseup', stopDragging);
+    window.addEventListener('blur', stopDragging);
+    stopBoundaryDragRef.current = stopDragging;
+  }
+
+  function handleRadiusInputChange(event: ChangeEvent<HTMLInputElement>): void {
+    if (!roi) return;
+    const value = Number(event.target.value);
+    if (!Number.isFinite(value)) return;
+    roiService.setRoi({ center: roi.center, radiusM: clampRoiRadius(value) });
+  }
+
+  function handleClear(): void {
+    roiService.clearRoi();
+    setDefining(false);
+  }
+
+  const roiCenterCoords = roi ? toCoordinates(roi.center) : null;
+  const clippedFill =
+    roi && roiCenterCoords
+      ? clipRoiToHomeRange(home, homeRadiusM, { center: roiCenterCoords, radiusM: roi.radiusM })
+      : [];
+
+  return (
+    <>
+      {roi && roiCenterCoords && (
+        <>
+          {clippedFill.length > 0 && (
+            <Polygon
+              positions={clippedFill.map((point): [number, number] => [point.lat, point.lng])}
+              interactive={false}
+              pathOptions={{ stroke: false, fillColor: ROI_COLOR, fillOpacity: 0.22 }}
+            />
+          )}
+          <Circle
+            center={[roiCenterCoords.lat, roiCenterCoords.lng]}
+            radius={roi.radiusM}
+            interactive={false}
+            pathOptions={{ color: ROI_COLOR, weight: 2, opacity: 0.9, fill: false, dashArray: '4 4' }}
+          />
+          {/* Invisible, wider-stroke twin of the circle above: any point along
+              the circumference can be grabbed and dragged to resize. */}
+          <Circle
+            center={[roiCenterCoords.lat, roiCenterCoords.lng]}
+            radius={roi.radiusM}
+            interactive
+            eventHandlers={{ mousedown: handleBoundaryMouseDown }}
+            pathOptions={{
+              color: ROI_COLOR,
+              weight: ROI_BOUNDARY_HIT_WEIGHT,
+              opacity: ROI_BOUNDARY_HIT_OPACITY,
+              fill: false,
+              className: styles.roiBoundaryHandle,
+            }}
+          />
+          <Marker position={[roiCenterCoords.lat, roiCenterCoords.lng]} icon={roiCenterIcon} interactive={false} />
+        </>
+      )}
+
+      <div ref={panelRef} className={styles.roiPanel}>
+        <div className={styles.roiButtons}>
+          <button
+            type="button"
+            className={`${styles.roiButton} ${defining ? styles.roiButtonActive : ''}`}
+            onClick={() => setDefining((value) => !value)}
+          >
+            {defining ? 'Click Map to Place…' : roi ? 'Redefine ROI' : 'Define ROI'}
+          </button>
+          {roi && (
+            <button type="button" className={styles.roiButton} onClick={handleClear}>
+              Clear ROI
+            </button>
+          )}
+        </div>
+        {roi && (
+          <div className={styles.roiInfo}>
+            <span>LAT {roi.center.lat.toFixed(5)}</span>
+            <span>LON {roi.center.lon.toFixed(5)}</span>
+            <label className={styles.roiRadiusLabel}>
+              RADIUS
+              <input
+                type="number"
+                className={styles.roiRadiusInput}
+                min={MIN_ROI_RADIUS_METERS}
+                max={MAX_ROI_RADIUS_METERS}
+                value={Math.round(roi.radiusM)}
+                onChange={handleRadiusInputChange}
+              />
+              m
+            </label>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
 /**
  * Renders the interactive map and the drone's live position. Position comes
  * exclusively from useLocation()/LocationService, which is backed by the
  * live realtime server connection — this component never touches mock data
  * directly. The home marker is a static display anchor (HOME_REFERENCE),
- * not live telemetry — see config/homeReference.ts.
+ * not live telemetry — see config/mapConfig.ts.
  */
 export function MapView() {
   const position = useLocation();
@@ -146,10 +352,19 @@ export function MapView() {
         center={[position.lat, position.lng]}
         zoom={DEFAULT_ZOOM}
         className={styles.map}
+        // Off so a rapid double-click (the first two taps of an ROI
+        // triple-tap) doesn't zoom the map out from under the gesture.
+        doubleClickZoom={false}
       >
         <TileLayer
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        />
+        <Circle
+          center={[HOME_REFERENCE.lat, HOME_REFERENCE.lng]}
+          radius={HOME_RADIUS_METERS}
+          interactive={false}
+          pathOptions={{ color: '#3a6fd8', weight: 2, opacity: 0.55, fill: true, fillColor: '#3a6fd8', fillOpacity: 0.08 }}
         />
         <Polyline
           positions={[
@@ -166,6 +381,7 @@ export function MapView() {
         <Marker position={[HOME_REFERENCE.lat, HOME_REFERENCE.lng]} icon={homeIcon} />
         <Marker position={[position.lat, position.lng]} icon={droneIcon} />
         <LiveTrackingControl position={position} home={HOME_REFERENCE} />
+        <RoiLayer home={HOME_REFERENCE} homeRadiusM={HOME_RADIUS_METERS} />
       </MapContainer>
     </div>
   );

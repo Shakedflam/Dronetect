@@ -1,6 +1,7 @@
 .bar {
   flex-shrink: 0;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-md);
@@ -12,11 +13,13 @@
 
 .primaryGroup {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-sm);
 }
 
 .contextualGroup {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-sm);
 }
 
@@ -76,4 +79,15 @@
   background: transparent;
   border-color: var(--color-text-muted);
   color: var(--color-text-muted);
+}
+
+.patrol {
+  background: transparent;
+  border-color: var(--color-accent-blue);
+  color: var(--color-accent-blue);
+}
+
+.patrolActive {
+  background: var(--color-accent-blue);
+  color: #001426;
 }

@@ -52,6 +52,8 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
 
 class AutonomousDrone(Supervisor):
     K_VISUAL_PROPELLER_SPEED = 68.5
+    TAKEOFF_CAMERA_PITCH = -0.2
+    HORIZONTAL_CAMERA_PITCH = 0.0
     KINEMATIC_FLIGHT_CONFIG = KinematicFlightConfig(
         max_horizontal_speed_mps=7.0,
         horizontal_acceleration_mps2=3.0,
@@ -102,6 +104,7 @@ class AutonomousDrone(Supervisor):
         self.camera_gimbal = CameraGimbal()
         self.camera_pitch_motor = cast(Motor, self.getDevice("camera pitch"))
         self.camera_pitch_motor.setPosition(self.camera_gimbal.pitch)
+        self._camera_flight_state: FlightState | None = None
 
         self.motors: tuple[Motor, Motor, Motor, Motor] = (
             cast(Motor, self.getDevice("front left propeller")),
@@ -152,6 +155,7 @@ class AutonomousDrone(Supervisor):
                 yaw,
                 dt,
             )
+            self._update_camera_for_flight_state()
             self._update_markers()
             self._announce_changes()
             self._update_hud(
@@ -222,6 +226,19 @@ class AutonomousDrone(Supervisor):
             self.logic.state,
         )
 
+    def _update_camera_for_flight_state(self) -> None:
+        state = self.logic.state
+        if state is not self._camera_flight_state:
+            self._camera_flight_state = state
+            if state is FlightState.TAKING_OFF:
+                self.camera_gimbal.set_pitch(self.TAKEOFF_CAMERA_PITCH)
+            elif state in {FlightState.FLYING_RANDOMLY, FlightState.RETURNING_HOME}:
+                self.camera_gimbal.set_pitch(self.HORIZONTAL_CAMERA_PITCH)
+            elif state in {FlightState.LANDING, FlightState.LANDED}:
+                self.camera_gimbal.set_pitch(self.camera_gimbal.maximum_pitch)
+
+        self.camera_pitch_motor.setPosition(self.camera_gimbal.pitch)
+
     def _announce_changes(self) -> None:
         if self.logic.state is not self._announced_state:
             print(f"State: {self.logic.state.value}")
@@ -266,6 +283,7 @@ class AutonomousDrone(Supervisor):
         )
         self.translation.setSFVec3f(list(step.position))
         self.rotation.setSFRotation([0.0, 0.0, 1.0, step.yaw])
+        self.self_node.setVelocity([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self._kinematic_yaw = step.yaw
         self._horizontal_speed_mps = step.horizontal_speed_mps
         return (

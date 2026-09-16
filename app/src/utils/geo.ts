@@ -25,3 +25,24 @@ export function euclideanDistanceMeters(from: Coordinates, to: Coordinates): num
   const dy = (to.lat - from.lat) * METERS_PER_DEG_LAT;
   return Math.sqrt(dx * dx + dy * dy);
 }
+
+/**
+ * Inverse of `euclideanDistanceMeters`: the coordinate reached by walking
+ * `distanceMeters` from `from` along `bearingDegValue` (0 = north, clockwise),
+ * using the same flat-plane approximation — accurate enough at the few-km
+ * scale this app operates at, not for long distances or polar latitudes.
+ */
+export function destinationPoint(
+  from: Coordinates,
+  distanceMeters: number,
+  bearingDegValue: number
+): Coordinates {
+  const bearingRad = (bearingDegValue * Math.PI) / 180;
+  const dx = distanceMeters * Math.sin(bearingRad);
+  const dy = distanceMeters * Math.cos(bearingRad);
+  const metersPerDegLng = METERS_PER_DEG_LAT * Math.cos((from.lat * Math.PI) / 180);
+  return {
+    lat: from.lat + dy / METERS_PER_DEG_LAT,
+    lng: from.lng + dx / metersPerDegLng,
+  };
+}

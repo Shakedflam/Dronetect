@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { droneCommandService } from '../../services/droneCommandService';
 import styles from './ActionBar.module.css';
 
@@ -7,14 +8,17 @@ interface ActionBarProps {
 }
 
 /**
- * Permanent control bar. RTH/New Mission/camera tilt are always available —
- * these are the drone-wide commands the realtime server currently supports.
- * Follow/Ignore/Engage only appear once the operator has selected a
- * detected target (App owns that selection state); they have no realtime
- * server equivalent yet and remain mocked.
+ * Permanent control bar. RTH/New Mission/camera tilt/Patrol are always
+ * available — RTH/New Mission/tilt are the drone-wide commands the realtime
+ * server currently supports. Patrol is UI-only for now (a local toggle, no
+ * service call) — later it will mean "patrol/search normally, without
+ * first flying to a specific ROI". Follow/Ignore/Engage only appear once
+ * the operator has selected a detected target (App owns that selection
+ * state); they have no realtime server equivalent yet and remain mocked.
  */
 export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps) {
   const hasSelection = selectedTargetId !== null;
+  const [patrolActive, setPatrolActive] = useState(false);
 
   function handleReturnToHome() {
     droneCommandService.returnToHome().catch((error: unknown) => {
@@ -56,6 +60,10 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
     void droneCommandService.engageTarget(selectedTargetId);
   }
 
+  function handleTogglePatrol() {
+    setPatrolActive((value) => !value);
+  }
+
   return (
     <div className={styles.bar}>
       <div className={styles.primaryGroup}>
@@ -86,6 +94,13 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
           onClick={handleCameraTiltDown}
         >
           TILT DOWN
+        </button>
+        <button
+          type="button"
+          className={`${styles.button} ${styles.patrol} ${patrolActive ? styles.patrolActive : ''}`}
+          onClick={handleTogglePatrol}
+        >
+          PATROL
         </button>
       </div>
 
