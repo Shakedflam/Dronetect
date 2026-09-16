@@ -91,3 +91,20 @@
   background: var(--color-accent-blue);
   color: #001426;
 }
+
+.roi {
+  background: transparent;
+  border-color: #c65ce0;
+  color: #c65ce0;
+}
+
+.roiActive {
+  background: #c65ce0;
+  color: #190721;
+}
+
+.roi:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  filter: none;
+}

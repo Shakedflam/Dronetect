@@ -144,6 +144,12 @@
   background: var(--color-divider-hover);
 }
 
+@media (max-width: 700px) {
+  .recenterButton {
+    bottom: calc(var(--space-md) + 50px);
+  }
+}
+
 .roiPanel {
   position: absolute;
   top: var(--space-md);
@@ -234,5 +240,14 @@
 }
 
 .roiBoundaryHandle:active {
+  cursor: grabbing;
+}
+
+/** The invisible fill covering the ROI's interior — dragging it moves the whole ROI. */
+.roiMoveHandle {
+  cursor: move;
+}
+
+.roiMoveHandle:active {
   cursor: grabbing;
 }

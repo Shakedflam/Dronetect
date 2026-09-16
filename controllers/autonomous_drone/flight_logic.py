@@ -92,10 +92,7 @@ class FlightLogic:
             raise RuntimeError("Home position must be initialized before update().")
 
         if self.state is FlightState.IDLE:
-            self._idle_elapsed += max(0.0, dt)
             self.target = self.home
-            if self._idle_elapsed >= self.config.idle_duration:
-                self._start_takeoff(self.home)
 
         elif self.state is FlightState.TAKING_OFF:
             self.target = self._takeoff_target()

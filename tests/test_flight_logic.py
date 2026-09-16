@@ -25,7 +25,7 @@ def make_logic(**config_overrides):
 
 
 def finish_takeoff(logic):
-    logic.update(HOME, logic.config.idle_duration)
+    logic.request_new_target(HOME)
     logic.update((HOME[0], HOME[1], logic.config.takeoff_altitude), 0.1)
 
 
@@ -37,13 +37,19 @@ def test_initializes_idle_at_captured_home():
     assert logic.target == HOME
 
 
-def test_transitions_from_idle_to_takeoff_automatically():
+def test_stays_idle_until_a_mission_is_requested():
     logic = make_logic(idle_duration=1.0)
 
-    logic.update(HOME, 0.5)
+    logic.update(HOME, 60.0)
     assert logic.state is FlightState.IDLE
+    assert logic.target == HOME
 
-    logic.update(HOME, 0.5)
+
+def test_new_mission_instruction_starts_takeoff_from_idle():
+    logic = make_logic()
+
+    logic.request_new_target(HOME)
+
     assert logic.state is FlightState.TAKING_OFF
     assert logic.target == (HOME[0], HOME[1], logic.config.takeoff_altitude)
 

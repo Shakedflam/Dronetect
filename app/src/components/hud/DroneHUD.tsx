@@ -1,5 +1,6 @@
 import { useLocation } from '../../hooks/useLocation';
 import { useTelemetry } from '../../hooks/useTelemetry';
+import { useMissionState } from '../../hooks/useMissionState';
 import styles from './DroneHUD.module.css';
 
 function formatCoordinate(value: number): string {
@@ -19,6 +20,11 @@ function formatBattery(percent: number): string {
 }
 
 function formatState(state: string): string {
+  return state.replace(/_/g, ' ');
+}
+
+/** Same underscore-to-space formatting as formatState, applied to the frontend-only mission state. */
+function formatMissionState(state: string): string {
   return state.replace(/_/g, ' ');
 }
 
@@ -50,6 +56,7 @@ function HudRow({ label, value }: HudRowProps) {
 export function DroneHUD() {
   const position = useLocation();
   const telemetry = useTelemetry();
+  const missionState = useMissionState();
 
   const isReady = position !== null && telemetry !== null;
 
@@ -61,6 +68,7 @@ export function DroneHUD() {
           <HudRow label="ALTITUDE" value={formatAltitude(telemetry.altitudeM)} />
           <HudRow label="BATTERY" value={formatBattery(telemetry.batteryPercent)} />
           <HudRow label="STATE" value={formatState(telemetry.state)} />
+          <HudRow label="MISSION" value={formatMissionState(missionState)} />
           <HudRow label="LATITUDE" value={formatCoordinate(position.lat)} />
           <HudRow label="LONGITUDE" value={formatCoordinate(position.lng)} />
           {telemetry.destinationName !== undefined && (

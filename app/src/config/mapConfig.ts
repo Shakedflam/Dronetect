@@ -40,3 +40,6 @@ export const MIN_ROI_RADIUS_METERS = 25;
 
 /** Largest radius, in meters, the ROI drag handle / numeric input allow. */
 export const MAX_ROI_RADIUS_METERS = 5000;
+
+/** Number of concentric equal-area distance bands each patrol direction is divided into. */
+export const PATROL_BAND_COUNT = 4;

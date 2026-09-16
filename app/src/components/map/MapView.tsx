@@ -15,7 +15,9 @@ import 'leaflet/dist/leaflet.css';
 import type { Coordinates, DronePosition } from '../../types/drone';
 import type { RoiCenter } from '../../types/roi';
 import { useLocation } from '../../hooks/useLocation';
+import { useMissionState } from '../../hooks/useMissionState';
 import { useRoi } from '../../hooks/useRoi';
+import { missionStateService } from '../../services/missionStateService';
 import { roiService } from '../../services/roiService';
 import {
   DEFAULT_ROI_RADIUS_METERS,
@@ -29,6 +31,7 @@ import {
 } from '../../config/mapConfig';
 import { bearingDeg, euclideanDistanceMeters } from '../../utils/geo';
 import { clipRoiToHomeRange } from '../../utils/roiClipping';
+import { PatrolLayer } from './PatrolLayer';
 import styles from './MapView.module.css';
 
 const droneIcon = L.divIcon({
@@ -84,14 +87,35 @@ const FOLLOW_REFLY_MIN_INTERVAL_MS = FOLLOW_FLY_DURATION_S * 1000 - 100;
 function LiveTrackingControl({ position, home }: { position: DronePosition; home: Coordinates }) {
   const map = useMap();
   const [autoFollow, setAutoFollow] = useState(true);
+  const autoFollowRef = useRef(true);
   const hasCenteredOnce = useRef(false);
   const lastFlyAt = useRef(0);
 
   useEffect(() => {
-    const stopFollowing = () => setAutoFollow(false);
+    const stopFollowing = () => {
+      // Cancel any in-flight recenter animation immediately, rather than
+      // waiting for it to finish — otherwise the constant pane movement
+      // from a just-started flyToBounds can eat into the few pixels of
+      // mouse movement Leaflet needs to ever recognize a drag as a drag
+      // (dragstart wouldn't fire at all), which is what makes panning
+      // while the drone is actively moving feel like the map "fights
+      // back" instead of staying where it's dragged. Listening on
+      // mousedown/touchstart — the instant the user touches the map,
+      // before that threshold is even evaluated — instead of only
+      // dragstart closes that race.
+      map.stop();
+      autoFollowRef.current = false;
+      setAutoFollow(false);
+    };
+    map.on('mousedown', stopFollowing);
+    map.on('touchstart', stopFollowing);
     map.on('dragstart', stopFollowing);
+    map.on('patrolfocus', stopFollowing);
     return () => {
+      map.off('mousedown', stopFollowing);
+      map.off('touchstart', stopFollowing);
       map.off('dragstart', stopFollowing);
+      map.off('patrolfocus', stopFollowing);
     };
   }, [map]);
 
@@ -103,7 +127,7 @@ function LiveTrackingControl({ position, home }: { position: DronePosition; home
       lastFlyAt.current = performance.now();
       return;
     }
-    if (!autoFollow) return;
+    if (!autoFollowRef.current) return;
     const now = performance.now();
     if (now - lastFlyAt.current < FOLLOW_REFLY_MIN_INTERVAL_MS) return;
     lastFlyAt.current = now;
@@ -116,11 +140,12 @@ function LiveTrackingControl({ position, home }: { position: DronePosition; home
     <button
       type="button"
       className={styles.recenterButton}
-      onClick={() => {
-        // Bypass the throttle so Recenter reacts immediately.
-        lastFlyAt.current = 0;
-        setAutoFollow(true);
-      }}
+        onClick={() => {
+          // Bypass the throttle so Recenter reacts immediately.
+          lastFlyAt.current = 0;
+          autoFollowRef.current = true;
+          setAutoFollow(true);
+        }}
     >
       Recenter
     </button>
@@ -167,9 +192,12 @@ function toCoordinates(center: RoiCenter): Coordinates {
  */
 function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: number }) {
   const roi = useRoi();
+  const missionState = useMissionState();
   const [defining, setDefining] = useState(false);
   const panelRef = useRef<HTMLDivElement>(null);
-  const stopBoundaryDragRef = useRef<(() => void) | null>(null);
+  // Shared by both the boundary (resize) and interior (move) drag gestures
+  // below — only one can ever be active at a time, so one ref is enough.
+  const stopDragRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     const panel = panelRef.current;
@@ -178,7 +206,7 @@ function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: numbe
     // bubble to the map and be treated as "place the ROI here".
     L.DomEvent.disableClickPropagation(panel);
     L.DomEvent.disableScrollPropagation(panel);
-    return () => stopBoundaryDragRef.current?.();
+    return () => stopDragRef.current?.();
   }, []);
 
   const map = useMapEvents({
@@ -200,7 +228,7 @@ function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: numbe
     const roiCenter = roi.center;
     const centerCoords = toCoordinates(roiCenter);
     L.DomEvent.stopPropagation(event.originalEvent);
-    stopBoundaryDragRef.current?.();
+    stopDragRef.current?.();
     map.dragging.disable();
     let active = true;
 
@@ -217,8 +245,8 @@ function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: numbe
       map.off('mouseup', stopDragging);
       document.removeEventListener('mouseup', stopDragging);
       window.removeEventListener('blur', stopDragging);
-      if (stopBoundaryDragRef.current === stopDragging) {
-        stopBoundaryDragRef.current = null;
+      if (stopDragRef.current === stopDragging) {
+        stopDragRef.current = null;
       }
     }
 
@@ -226,7 +254,53 @@ function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: numbe
     map.on('mouseup', stopDragging);
     document.addEventListener('mouseup', stopDragging);
     window.addEventListener('blur', stopDragging);
-    stopBoundaryDragRef.current = stopDragging;
+    stopDragRef.current = stopDragging;
+  }
+
+  /**
+   * Drag-to-move: grabbing anywhere inside the circle (not on the boundary
+   * ring, which resizes instead — see the interactive circle's render order
+   * below) translates the ROI by the same lat/lng delta as the cursor, so
+   * the circle tracks the pointer exactly regardless of map projection,
+   * the same way dragging any other map object would.
+   */
+  function handleInteriorMouseDown(event: L.LeafletMouseEvent): void {
+    if (!roi) return;
+    const roiCenter = roi.center;
+    const radiusM = roi.radiusM;
+    const grabLatLng = event.latlng;
+    L.DomEvent.stopPropagation(event.originalEvent);
+    stopDragRef.current?.();
+    map.dragging.disable();
+    let active = true;
+
+    function onMove(moveEvent: L.LeafletMouseEvent): void {
+      const deltaLat = moveEvent.latlng.lat - grabLatLng.lat;
+      const deltaLng = moveEvent.latlng.lng - grabLatLng.lng;
+      roiService.setRoi({
+        center: { lat: roiCenter.lat + deltaLat, lon: roiCenter.lon + deltaLng },
+        radiusM,
+      });
+    }
+
+    function stopDragging(): void {
+      if (!active) return;
+      active = false;
+      map.dragging.enable();
+      map.off('mousemove', onMove);
+      map.off('mouseup', stopDragging);
+      document.removeEventListener('mouseup', stopDragging);
+      window.removeEventListener('blur', stopDragging);
+      if (stopDragRef.current === stopDragging) {
+        stopDragRef.current = null;
+      }
+    }
+
+    map.on('mousemove', onMove);
+    map.on('mouseup', stopDragging);
+    document.addEventListener('mouseup', stopDragging);
+    window.addEventListener('blur', stopDragging);
+    stopDragRef.current = stopDragging;
   }
 
   function handleRadiusInputChange(event: ChangeEvent<HTMLInputElement>): void {
@@ -238,6 +312,9 @@ function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: numbe
 
   function handleClear(): void {
     roiService.clearRoi();
+    if (missionState === 'TRANSIT_TO_ROI' || missionState === 'ROI_PATROL') {
+      missionStateService.setMissionState('ON_GROUND');
+    }
     setDefining(false);
   }
 
@@ -264,8 +341,26 @@ function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: numbe
             interactive={false}
             pathOptions={{ color: ROI_COLOR, weight: 2, opacity: 0.9, fill: false, dashArray: '4 4' }}
           />
-          {/* Invisible, wider-stroke twin of the circle above: any point along
-              the circumference can be grabbed and dragged to resize. */}
+          {/* Invisible fill covering the circle's interior: grabbing anywhere
+              in here (that isn't the boundary ring on top of it, below)
+              drags the whole ROI to a new location. Rendered before the
+              boundary-hit circle so that one — a thin ring hugging the
+              actual edge — wins the hit test near the boundary, leaving
+              this one to catch everything strictly inside it. */}
+          <Circle
+            center={[roiCenterCoords.lat, roiCenterCoords.lng]}
+            radius={roi.radiusM}
+            interactive
+            eventHandlers={{ mousedown: handleInteriorMouseDown }}
+            pathOptions={{
+              stroke: false,
+              fill: true,
+              fillOpacity: ROI_BOUNDARY_HIT_OPACITY,
+              className: styles.roiMoveHandle,
+            }}
+          />
+          {/* Invisible, wider-stroke twin of the outline circle: any point
+              along the circumference can be grabbed and dragged to resize. */}
           <Circle
             center={[roiCenterCoords.lat, roiCenterCoords.lng]}
             radius={roi.radiusM}
@@ -382,6 +477,7 @@ export function MapView() {
         <Marker position={[position.lat, position.lng]} icon={droneIcon} />
         <LiveTrackingControl position={position} home={HOME_REFERENCE} />
         <RoiLayer home={HOME_REFERENCE} homeRadiusM={HOME_RADIUS_METERS} />
+        <PatrolLayer home={HOME_REFERENCE} homeRadiusM={HOME_RADIUS_METERS} />
       </MapContainer>
     </div>
   );
