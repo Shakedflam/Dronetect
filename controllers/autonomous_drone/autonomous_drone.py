@@ -49,9 +49,21 @@ from services.gps import (
     local_meters_to_wgs84,
     wgs84_to_local_meters,
 )
+from services.flight_safety import CONNECTION_LOSS_REASON
 from services.no_fly_router import NoFlyRouteUnavailable, NoFlyRouter
+from services.polygon_coverage import (
+    CoveragePathUnavailable,
+    PolygonCoverageConfig,
+    PolygonCoveragePlanner,
+)
 from services.patrol_planner import PatrolPlanner
-from services.patrol_regions import PatrolRegionStore
+from services.patrol_progress import PausedPatrolCoverage
+from services.patrol_regions import (
+    PatrolAreaType,
+    PatrolRegion,
+    PatrolRegionStore,
+    patrol_region_polygon_points,
+)
 from services.telemetry import build_simulator_telemetry
 from world_markers import WorldMarkers
 
@@ -86,8 +98,16 @@ class AutonomousDrone(Supervisor):
         self.patrol_regions = PatrolRegionStore()
         self.patrol_planner = PatrolPlanner(store=self.patrol_regions)
         self.no_fly_router = NoFlyRouter()
+        self.polygon_coverage_planner = PolygonCoveragePlanner(
+            PolygonCoverageConfig(
+                lane_spacing_m=float(
+                    os.getenv("DRONTECT_PATROL_LANE_SPACING_M", "75.0")
+                )
+            )
+        )
         self._patrol_route_waypoints: deque[Position] = deque()
         self._target_patrol_region_id: str | None = None
+        self._paused_patrol_coverage: PausedPatrolCoverage | None = None
         self.logic = FlightLogic(
             FlightConfig(
                 takeoff_altitude=float(
@@ -147,6 +167,17 @@ class AutonomousDrone(Supervisor):
         self._simulated_battery_percent = float(
             os.getenv("DRONTECT_SIMULATED_BATTERY_PERCENT", "100.0")
         )
+        self._connection_loss_timeout_s = float(
+            os.getenv("DRONTECT_CONNECTION_LOSS_RTH_SECONDS", "3.0")
+        )
+        if (
+            not math.isfinite(self._connection_loss_timeout_s)
+            or self._connection_loss_timeout_s <= 0.0
+        ):
+            raise ValueError(
+                "DRONTECT_CONNECTION_LOSS_RTH_SECONDS must be a finite positive number"
+            )
+        self._connection_loss_rth_active = False
         self.realtime_client = SimulatorRealtimeClient()
         self.realtime_client.start()
         self.video_client = SimulatorVideoClient()
@@ -172,6 +203,7 @@ class AutonomousDrone(Supervisor):
                 self.logic.initialize_home(position)
                 print(f"Home captured at {self._format_position(position)}")
 
+            self._enforce_connection_loss_rth()
             self._handle_keyboard(position)
             self._handle_realtime_commands(position)
             self.logic.update(position, dt)
@@ -208,14 +240,16 @@ class AutonomousDrone(Supervisor):
             normalized_key = key & 0xFFFF
             if normalized_key in (ord("H"), ord("h")):
                 if self.logic.request_return_home():
-                    self._patrol_route_waypoints.clear()
-                    self._target_patrol_region_id = None
+                    self._clear_patrol_progress()
                     print("Return Home requested: random flight cancelled.")
                 else:
                     print(f"Return Home ignored while {self.logic.state.value}.")
             elif normalized_key in (ord("N"), ord("n")):
-                self._patrol_route_waypoints.clear()
-                self._target_patrol_region_id = None
+                if self._connection_loss_rth_active:
+                    print("New mission ignored during connection-loss safety RTH.")
+                    key = self.keyboard.getKey()
+                    continue
+                self._clear_patrol_progress()
                 waypoint = self.logic.request_new_target(position)
                 print(f"New mission target: {self._format_position(waypoint)}")
             elif normalized_key in (ord("U"), ord("u")):
@@ -231,16 +265,25 @@ class AutonomousDrone(Supervisor):
     def _handle_realtime_commands(self, position: Position) -> None:
         for message in self.realtime_client.drain_commands():
             command = CommandName(message["command"])
+            if self._connection_loss_rth_active and command in {
+                CommandName.START_PATROL,
+                CommandName.SET_ROI,
+                CommandName.CLEAR_ROI,
+                CommandName.NEW_MISSION,
+            }:
+                print(
+                    f"Realtime command {command.value} ignored during "
+                    "connection-loss safety RTH."
+                )
+                continue
             if command == CommandName.RETURN_HOME:
                 if self.logic.request_return_home():
-                    self._patrol_route_waypoints.clear()
-                    self._target_patrol_region_id = None
+                    self._clear_patrol_progress()
                     print("Realtime command return_home accepted.")
                 else:
                     print(f"Realtime command return_home ignored while {self.logic.state.value}.")
             elif command == CommandName.START_PATROL:
-                self._patrol_route_waypoints.clear()
-                self._target_patrol_region_id = None
+                self._clear_patrol_progress()
                 self.logic.request_patrol(position)
                 print(f"Realtime command {command.value} accepted.")
             elif command == CommandName.SET_PATROL_PRIORITIES:
@@ -254,17 +297,20 @@ class AutonomousDrone(Supervisor):
                 self.patrol_regions.replace_area_types(
                     [(entry["regionId"], entry["areaType"]) for entry in area_types]
                 )
-                if self.logic.state is FlightState.PATROLLING:
-                    self._patrol_route_waypoints.clear()
-                    self._target_patrol_region_id = None
-                    self.logic.target = self._next_patrol_waypoint(
-                        position,
-                        completed=False,
-                    )
+                if (
+                    self.logic.state is FlightState.PATROLLING
+                    or self._paused_patrol_coverage is not None
+                ):
+                    was_patrolling = self.logic.state is FlightState.PATROLLING
+                    self._clear_patrol_progress()
+                    if was_patrolling:
+                        self.logic.target = self._next_patrol_waypoint(
+                            position,
+                            completed=False,
+                        )
                 print("Realtime patrol area types updated.")
             elif command == CommandName.SET_ROI:
-                self._patrol_route_waypoints.clear()
-                self._target_patrol_region_id = None
+                self._pause_patrol_coverage(position)
                 params = message["params"]
                 center = params["center"]
                 local_center = wgs84_to_local_meters(
@@ -288,13 +334,21 @@ class AutonomousDrone(Supervisor):
                 }
                 self.logic.clear_roi(position)
                 if resume_patrol:
-                    self._patrol_route_waypoints.clear()
-                    self._target_patrol_region_id = None
-                    self.logic.request_patrol(position)
+                    had_checkpoint = self._paused_patrol_coverage is not None
+                    if had_checkpoint:
+                        if self._resume_paused_patrol(position):
+                            self.logic.request_patrol(position)
+                        else:
+                            print(
+                                "Paused patrol cannot currently be resumed safely; "
+                                "holding position."
+                            )
+                    else:
+                        self._clear_patrol_progress()
+                        self.logic.request_patrol(position)
                 print("Realtime command clear_roi accepted.")
             elif command == CommandName.NEW_MISSION:
-                self._patrol_route_waypoints.clear()
-                self._target_patrol_region_id = None
+                self._clear_patrol_progress()
                 waypoint = self.logic.request_new_target(position)
                 print(f"Realtime command new_mission: {self._format_position(waypoint)}")
             elif command == CommandName.CAMERA_TILT_UP:
@@ -474,15 +528,52 @@ class AutonomousDrone(Supervisor):
             state=self.logic.state.value,
             battery_percent=self._simulated_battery_percent,
             target_patrol_region_id=self._target_patrol_region_id,
+            aircraft_safety_rth_active=self._connection_loss_rth_active,
+            aircraft_safety_rth_reason=(
+                CONNECTION_LOSS_REASON
+                if self._connection_loss_rth_active
+                else None
+            ),
         )
         self.realtime_client.publish_telemetry(telemetry)
+
+    def _enforce_connection_loss_rth(self) -> None:
+        if self.logic.state is FlightState.LANDED:
+            self._connection_loss_rth_active = False
+            return
+        if self._connection_loss_rth_active:
+            return
+        if not self.realtime_client.connection_lost_for(
+            self._connection_loss_timeout_s
+        ):
+            return
+        airborne_states = {
+            FlightState.TAKING_OFF,
+            FlightState.HOLDING,
+            FlightState.TRANSITING_TO_ROI,
+            FlightState.ROI_PATROL,
+            FlightState.PATROLLING,
+            FlightState.FLYING_RANDOMLY,
+            FlightState.RETURNING_HOME,
+            FlightState.LANDING,
+        }
+        if self.logic.state not in airborne_states:
+            return
+        self._connection_loss_rth_active = True
+        self._clear_patrol_progress()
+        if self.logic.state not in {
+            FlightState.RETURNING_HOME,
+            FlightState.LANDING,
+        }:
+            self.logic.request_return_home()
+        print("Connection-loss safety RTH latched.")
 
     def _next_patrol_waypoint(
         self,
         position: Position,
         completed: bool,
     ) -> Position:
-        if completed and self._patrol_route_waypoints:
+        if self._patrol_route_waypoints:
             return self._patrol_route_waypoints.popleft()
         if completed and self._target_patrol_region_id is not None:
             self.patrol_planner.record_observation(self._target_patrol_region_id)
@@ -490,35 +581,154 @@ class AutonomousDrone(Supervisor):
             LocalPosition(x=position[0], y=position[1], z=position[2]),
             DEFAULT_HOME,
         )
-        decision = self.patrol_planner.choose_next(current)
-        self._target_patrol_region_id = decision.region.id
-        local_target = wgs84_to_local_meters(
-            decision.region.center,
-            DEFAULT_HOME,
-            altitude_m=self.logic.config.takeoff_altitude,
-        )
+        no_fly_polygons = [
+            patrol_region_polygon_points(region)
+            for region in self.patrol_regions.regions
+            if region.area_type is PatrolAreaType.NO_FLY
+        ]
+        candidate_waypoints: dict[str, list[Position]] = {}
+
+        def safe_route_distance(region: PatrolRegion) -> float | None:
+            try:
+                ordered, transit_distance = self._coverage_route_waypoints(
+                    position,
+                    region,
+                    no_fly_polygons,
+                )
+            except (CoveragePathUnavailable, NoFlyRouteUnavailable):
+                return None
+            candidate_waypoints[region.id] = ordered
+            return transit_distance
+
         try:
-            route = self.no_fly_router.route(
-                (position[0], position[1]),
-                (local_target.x, local_target.y),
-                self.patrol_regions.regions,
+            decision = self.patrol_planner.choose_next(
+                current,
+                route_distance_m=safe_route_distance,
             )
-        except NoFlyRouteUnavailable:
+        except RuntimeError as exc:
             self._target_patrol_region_id = None
             self._patrol_route_waypoints.clear()
-            print("No safe patrol route is currently available; holding position.")
+            print(f"No safe patrol coverage is currently available; holding position: {exc}")
             return (
                 position[0],
                 position[1],
                 self.logic.config.takeoff_altitude,
             )
-        route_waypoints = [
+        self._target_patrol_region_id = decision.region.id
+        ordered = candidate_waypoints[decision.region.id]
+        self._patrol_route_waypoints = deque(ordered[1:])
+        print(
+            f"Patrol target region: {decision.region.id} "
+            f"(safe route {decision.score.distance_m:.1f} m)"
+        )
+        return ordered[0]
+
+    def _coverage_route_waypoints(
+        self,
+        position: Position,
+        region: PatrolRegion,
+        no_fly_polygons: list[tuple[Wgs84Point, ...]],
+    ) -> tuple[list[Position], float]:
+        coverage = self.polygon_coverage_planner.plan(
+            patrol_region_polygon_points(region),
+            no_fly_polygons=no_fly_polygons,
+            outward_from=DEFAULT_HOME,
+        )
+        local_coverage = [
+            wgs84_to_local_meters(
+                waypoint,
+                DEFAULT_HOME,
+                altitude_m=self.logic.config.takeoff_altitude,
+            )
+            for waypoint in coverage
+        ]
+        first_coverage = local_coverage[0]
+        route = self.no_fly_router.route(
+            (position[0], position[1]),
+            (first_coverage.x, first_coverage.y),
+            self.patrol_regions.regions,
+        )
+        route_waypoints: list[Position] = [
             (x, y, self.logic.config.takeoff_altitude)
             for x, y in route
         ]
-        self._patrol_route_waypoints = deque(route_waypoints[1:])
-        print(f"Patrol target region: {decision.region.id}")
-        return route_waypoints[0]
+        transit_points = [
+            (position[0], position[1]),
+            *((waypoint[0], waypoint[1]) for waypoint in route_waypoints),
+        ]
+        transit_distance = sum(
+            math.dist(start, end)
+            for start, end in zip(transit_points, transit_points[1:])
+        )
+        coverage_waypoints: list[Position] = [
+            (waypoint.x, waypoint.y, waypoint.z)
+            for waypoint in local_coverage[1:]
+        ]
+        return (
+            self._deduplicate_waypoints(
+                [*route_waypoints, *coverage_waypoints]
+            ),
+            transit_distance,
+        )
+
+    def _pause_patrol_coverage(self, position: Position) -> None:
+        if (
+            self.logic.state is not FlightState.PATROLLING
+            or self._target_patrol_region_id is None
+            or self.logic.target is None
+        ):
+            return
+        self._paused_patrol_coverage = PausedPatrolCoverage(
+            region_id=self._target_patrol_region_id,
+            interruption_position=(
+                position[0],
+                position[1],
+                self.logic.config.takeoff_altitude,
+            ),
+            active_waypoint=self.logic.target,
+            remaining_waypoints=tuple(self._patrol_route_waypoints),
+        )
+        self._patrol_route_waypoints.clear()
+        self._target_patrol_region_id = None
+
+    def _resume_paused_patrol(self, position: Position) -> bool:
+        paused = self._paused_patrol_coverage
+        if paused is None:
+            return False
+        try:
+            route = self.no_fly_router.route(
+                (position[0], position[1]),
+                (
+                    paused.interruption_position[0],
+                    paused.interruption_position[1],
+                ),
+                self.patrol_regions.regions,
+            )
+        except NoFlyRouteUnavailable:
+            return False
+        return_route: list[Position] = [
+            (x, y, self.logic.config.takeoff_altitude)
+            for x, y in route
+        ]
+        self._patrol_route_waypoints = deque(
+            paused.resumed_waypoints(return_route)
+        )
+        self._target_patrol_region_id = paused.region_id
+        self._paused_patrol_coverage = None
+        return True
+
+    def _clear_patrol_progress(self) -> None:
+        self._patrol_route_waypoints.clear()
+        self._target_patrol_region_id = None
+        self._paused_patrol_coverage = None
+
+    @staticmethod
+    def _deduplicate_waypoints(waypoints: list[Position]) -> list[Position]:
+        deduplicated: list[Position] = []
+        for waypoint in waypoints:
+            if not deduplicated or math.dist(deduplicated[-1], waypoint) > 1e-7:
+                deduplicated.append(waypoint)
+        return deduplicated
 
     def _set_motor_velocities(
         self,

@@ -9,6 +9,7 @@ from typing import Protocol
 
 LOW_BATTERY_REASON = "low_battery"
 AIRCRAFT_RTH_REASON = "aircraft_safety_rth"
+CONNECTION_LOSS_REASON = "connection_lost"
 
 
 @dataclass(frozen=True, slots=True)

@@ -115,6 +115,34 @@ def test_normal_patrol_takes_off_and_continuously_requests_waypoints():
     assert logic.target == (0.0, 20.0, 12.0)
     assert calls == [(HOME, False), (first, True)]
 
+
+def test_manual_return_home_can_be_replaced_by_patrol_while_airborne():
+    logic = FlightLogic(
+        config=FlightConfig(takeoff_altitude=12.0),
+        patrol_waypoint_provider=lambda position, completed: (20.0, 0.0, 12.0),
+    )
+    logic.initialize_home(HOME)
+    airborne = (4.0, 2.0, 12.0)
+    logic.request_patrol(airborne)
+    assert logic.request_return_home() is True
+
+    waypoint = logic.request_patrol(airborne)
+
+    assert logic.state is FlightState.PATROLLING
+    assert logic.target == waypoint == (20.0, 0.0, 12.0)
+
+
+def test_manual_return_home_can_be_replaced_by_roi_while_airborne():
+    logic = make_logic(takeoff_altitude=12.0)
+    airborne = (4.0, 2.0, 12.0)
+    logic.request_mission_takeoff(airborne)
+    assert logic.request_return_home() is True
+
+    logic.request_roi(airborne, center=(100.0, 50.0), radius_m=20.0)
+
+    assert logic.state is FlightState.TRANSITING_TO_ROI
+    assert logic.target == (100.0, 50.0, 12.0)
+
 def test_mission_command_while_airborne_skips_takeoff_and_holds_position():
     logic = make_logic(takeoff_altitude=12.0)
     airborne = (3.0, -2.0, 12.0)

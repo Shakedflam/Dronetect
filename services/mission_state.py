@@ -44,7 +44,13 @@ VALID_MISSION_TRANSITIONS: dict[MissionState, frozenset[MissionState]] = {
             MissionState.RTH,
         }
     ),
-    MissionState.RTH: frozenset({MissionState.LANDING}),
+    MissionState.RTH: frozenset(
+        {
+            MissionState.PATROL,
+            MissionState.TRANSIT_TO_ROI,
+            MissionState.LANDING,
+        }
+    ),
     MissionState.LANDING: frozenset({MissionState.ON_GROUND}),
 }
 

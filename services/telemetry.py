@@ -30,6 +30,8 @@ def build_simulator_telemetry(
     state: str,
     battery_percent: float = SIMULATOR_BATTERY_PERCENT,
     target_patrol_region_id: str | None = None,
+    aircraft_safety_rth_active: bool = False,
+    aircraft_safety_rth_reason: str | None = None,
     timestamp: float | None = None,
 ) -> dict:
     """Build the JSON-compatible simulator telemetry message."""
@@ -50,5 +52,7 @@ def build_simulator_telemetry(
             "batteryPercent": battery_percent,
             "state": state,
             "targetPatrolRegionId": target_patrol_region_id,
+            "aircraftSafetyRthActive": aircraft_safety_rth_active,
+            "aircraftSafetyRthReason": aircraft_safety_rth_reason,
         },
     }

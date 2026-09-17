@@ -53,6 +53,22 @@ def test_simulator_telemetry_accepts_configurable_battery_percent():
     assert message["data"]["batteryPercent"] == 12.5
 
 
+def test_telemetry_round_trips_aircraft_safety_rth_state():
+    message = build_simulator_telemetry(
+        position_local=LocalPosition(0.0, 0.0, 15.0),
+        heading_deg=0.0,
+        speed_mps=0.0,
+        state="RETURNING_HOME",
+        aircraft_safety_rth_active=True,
+        aircraft_safety_rth_reason="connection_lost",
+    )
+
+    validated = validate_telemetry_message(message)
+
+    assert validated["data"]["aircraftSafetyRthActive"] is True
+    assert validated["data"]["aircraftSafetyRthReason"] == "connection_lost"
+
+
 def test_mission_status_round_trips_authoritative_backend_state():
     message = mission_status_message(
         state=MissionState.ROI_PATROL,

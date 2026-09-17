@@ -144,7 +144,7 @@ export function PatrolLayer({ home, homeRadiusM }: { home: Coordinates; homeRadi
           eventHandlers={{
             click: () => {
               if (editMode === 'PRIORITY') {
-                if (region.areaType === 'PATROL') patrolService.setPriority(region.id);
+                patrolService.setPriority(region.id);
               } else if (editMode !== null) {
                 patrolService.setAreaType(
                   region.id,

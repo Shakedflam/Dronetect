@@ -10,8 +10,9 @@ interface ActionBarProps {
 }
 
 /**
- * Permanent control bar. RTH/New Mission/camera tilt are always available —
- * they're the drone-wide commands the realtime server currently supports.
+ * Permanent control bar for drone-wide and mission commands.
+ * Mission overrides remain available during manual RTH, but not while a
+ * safety-triggered RTH is active.
  * Patrol/ROI/RTH are backend commands, and mission state messages show
  * the authoritative transition in the map/HUD.
  * Follow/Ignore/Engage only appear once the
@@ -23,6 +24,13 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
   const missionState = useMissionState();
   const missionStatus = useMissionStatus();
   const droneConnected = missionStatus?.droneConnected ?? false;
+  const safetyRthActive = missionStatus?.batteryRth.safetyRthActive ?? false;
+  const missionOverrideDisabled = !droneConnected || safetyRthActive;
+  const missionOverrideTitle = !droneConnected
+    ? 'Drone is not connected'
+    : safetyRthActive
+      ? 'Safety RTH cannot be overridden'
+      : undefined;
   const roi = useRoi();
   const roiMissionActive = missionState === 'TRANSIT_TO_ROI' || missionState === 'ROI_PATROL';
 
@@ -95,7 +103,8 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
           type="button"
           className={`${styles.button} ${styles.mission}`}
           onClick={handleNewMission}
-          disabled={!droneConnected}
+          disabled={missionOverrideDisabled}
+          title={missionOverrideTitle}
         >
           NEW MISSION
         </button>
@@ -117,7 +126,8 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
           type="button"
           className={`${styles.button} ${styles.patrol} ${missionState === 'PATROL' ? styles.patrolActive : ''}`}
           onClick={handleStartPatrol}
-          disabled={!droneConnected}
+          disabled={missionOverrideDisabled}
+          title={missionOverrideTitle}
           aria-pressed={missionState === 'PATROL'}
         >
           PATROL
@@ -126,8 +136,8 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
           type="button"
           className={`${styles.button} ${styles.roi} ${roiMissionActive ? styles.roiActive : ''}`}
           onClick={handleTransitToRoi}
-          disabled={!roi || !droneConnected}
-          title={droneConnected ? undefined : 'Drone is not connected'}
+          disabled={!roi || missionOverrideDisabled}
+          title={missionOverrideTitle}
           aria-pressed={roiMissionActive}
         >
           ROI

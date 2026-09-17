@@ -10,6 +10,7 @@ from services.patrol_regions import (
     PatrolRegionStore,
     generate_patrol_regions,
     patrol_band_outer_radii_m,
+    patrol_region_polygon_points,
 )
 
 
@@ -77,6 +78,15 @@ def test_region_center_sits_on_its_direction_bearing_from_home():
 
     assert east_band_1.center.lat == pytest.approx(DEFAULT_HOME.lat)
     assert east_band_1.center.lng > DEFAULT_HOME.lng
+
+
+def test_region_polygon_traces_outer_and_inner_sector_boundaries():
+    region = next(region for region in generate_patrol_regions() if region.id == "E-2")
+
+    points = patrol_region_polygon_points(region, arc_step_deg=5.0)
+
+    assert len(points) == 20
+    assert points == patrol_region_polygon_points(region, arc_step_deg=5.0)
 
 
 def test_priority_rank_defaults_to_unranked():

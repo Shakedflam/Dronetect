@@ -243,7 +243,11 @@ class RealtimeServer:
         previous_state = self.mission.state
         data = telemetry["data"]
         safety_signal = self.safety_rth_policy.evaluate(
-            FlightSafetySnapshot(battery_percent=data["batteryPercent"])
+            FlightSafetySnapshot(
+                battery_percent=data["batteryPercent"],
+                aircraft_rth_active=data["aircraftSafetyRthActive"],
+                aircraft_rth_reason=data["aircraftSafetyRthReason"],
+            )
         )
         self._battery_percent = float(data["batteryPercent"])
         self._target_patrol_region_id = data["targetPatrolRegionId"]

@@ -16,7 +16,7 @@ const PATROL_REGIONS: readonly PatrolRegion[] = generatePatrolRegions(HOME_REFER
 export interface PatrolService {
   subscribe(listener: (config: PatrolConfig) => void): Unsubscribe;
   getConfig(): PatrolConfig;
-  /** Assigns the next rank if `regionId` is unranked; clears its rank (and compacts the rest) if it's already ranked. */
+  /** Assigns the next rank, restoring the region to PATROL first; clears its rank if it is already ranked. */
   setPriority(regionId: string): void;
   setAreaType(regionId: string, areaType: PatrolAreaType): void;
   clearPriorities(): void;
@@ -100,12 +100,21 @@ function createInMemoryPatrolService(): PatrolService {
     getConfig: buildConfig,
     setPriority(regionId) {
       const idx = priorityOrder.indexOf(regionId);
+      let restoredToPatrol = false;
       if (idx === -1) {
+        if ((areaTypes[regionId] ?? 'PATROL') !== 'PATROL') {
+          areaTypes = { ...areaTypes };
+          delete areaTypes[regionId];
+          restoredToPatrol = true;
+        }
         priorityOrder = [...priorityOrder, regionId];
       } else {
         priorityOrder = priorityOrder.filter((id) => id !== regionId);
       }
       notify();
+      // WebSocket messages are emitted in call order, so the backend restores
+      // the region to PATROL before accepting the new priority ordering.
+      if (restoredToPatrol) publishAreaTypes();
       publishPriorities();
     },
     setAreaType(regionId, areaType) {

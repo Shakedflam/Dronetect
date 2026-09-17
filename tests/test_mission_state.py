@@ -69,6 +69,8 @@ def test_declares_the_complete_mission_state_set():
         (MissionState.ROI_PATROL, MissionState.PATROL),
         (MissionState.ROI_PATROL, MissionState.TRANSIT_TO_ROI),
         (MissionState.ROI_PATROL, MissionState.RTH),
+        (MissionState.RTH, MissionState.PATROL),
+        (MissionState.RTH, MissionState.TRANSIT_TO_ROI),
         (MissionState.RTH, MissionState.LANDING),
         (MissionState.LANDING, MissionState.ON_GROUND),
     ],

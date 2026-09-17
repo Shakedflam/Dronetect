@@ -58,6 +58,7 @@ class PatrolRegionScorer:
         *,
         now: float,
         unobserved_since: float,
+        travel_distance_m: float | None = None,
     ) -> PatrolScore:
         timestamp = _validated_timestamp(now, "now")
         baseline = _validated_timestamp(unobserved_since, "unobserved_since")
@@ -68,7 +69,11 @@ class PatrolRegionScorer:
         )
         age_seconds = max(0.0, timestamp - observation_time)
         priority_multiplier = self.priority_multiplier(region.priority)
-        distance_m = wgs84_distance_m(current_position, region.center)
+        distance_m = (
+            wgs84_distance_m(current_position, region.center)
+            if travel_distance_m is None
+            else _validated_distance(travel_distance_m)
+        )
         travel_seconds = distance_m / self.config.nominal_travel_speed_mps
         total = (
             age_seconds * self.config.age_weight * priority_multiplier
@@ -116,23 +121,33 @@ class PatrolPlanner:
         self,
         current_position: Wgs84Point,
         now: float | None = None,
+        *,
+        route_distance_m: Callable[[PatrolRegion], float | None] | None = None,
     ) -> PatrolDecision:
         timestamp = self._resolve_time(now)
-        decisions = [
-            PatrolDecision(
-                region=region,
-                score=self.scorer.score(
-                    region,
-                    current_position,
-                    now=timestamp,
-                    unobserved_since=self.started_at,
-                ),
+        decisions: list[PatrolDecision] = []
+        for region in self.store.regions:
+            if region.area_type is not PatrolAreaType.PATROL:
+                continue
+            travel_distance = (
+                None if route_distance_m is None else route_distance_m(region)
             )
-            for region in self.store.regions
-            if region.area_type is PatrolAreaType.PATROL
-        ]
+            if route_distance_m is not None and travel_distance is None:
+                continue
+            decisions.append(
+                PatrolDecision(
+                    region=region,
+                    score=self.scorer.score(
+                        region,
+                        current_position,
+                        now=timestamp,
+                        unobserved_since=self.started_at,
+                        travel_distance_m=travel_distance,
+                    ),
+                )
+            )
         if not decisions:
-            raise RuntimeError("Cannot plan patrol without regions")
+            raise RuntimeError("Cannot plan patrol without reachable regions")
 
         return min(
             decisions,
@@ -166,3 +181,12 @@ def _validated_timestamp(value: float, name: str) -> float:
     if not math.isfinite(timestamp) or timestamp < 0:
         raise ValueError(f"{name} must be a finite non-negative timestamp")
     return timestamp
+
+
+def _validated_distance(value: float) -> float:
+    if isinstance(value, bool):
+        raise ValueError("travel_distance_m must be a finite non-negative number")
+    distance = float(value)
+    if not math.isfinite(distance) or distance < 0.0:
+        raise ValueError("travel_distance_m must be a finite non-negative number")
+    return distance

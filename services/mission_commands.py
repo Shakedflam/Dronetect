@@ -98,10 +98,10 @@ class MissionCommandService:
             CommandName.RETURN_HOME,
         }:
             raise ValueError(f"Not a mission command: {command.value}")
-        if command in {CommandName.START_PATROL, CommandName.SET_ROI} and self.state in {
-            MissionState.RTH,
-            MissionState.LANDING,
-        }:
+        if (
+            command in {CommandName.START_PATROL, CommandName.SET_ROI}
+            and self.state is MissionState.LANDING
+        ):
             raise InvalidMissionCommand(command, self.state)
 
     def observe_altitude(self, altitude_m: float) -> MissionState:
@@ -174,6 +174,7 @@ class MissionCommandService:
             MissionState.PATROL,
             MissionState.TRANSIT_TO_ROI,
             MissionState.ROI_PATROL,
+            MissionState.RTH,
         }:
             self._post_takeoff_intent = None
             self._state_machine.transition_to(requested)

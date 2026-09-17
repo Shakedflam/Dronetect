@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 from queue import Empty, Queue
-from threading import Event, Thread
-from typing import Any
+from threading import Event, Lock, Thread
+import time
+from typing import Any, Callable
 
 from realtime_server.protocol import (
     encode_message,
@@ -28,12 +29,39 @@ QUEUE_TIMEOUT_S = 0.1
 class SimulatorRealtimeClient:
     """Non-blocking realtime server client for Webots' synchronous loop."""
 
-    def __init__(self, url: str | None = None) -> None:
+    def __init__(
+        self,
+        url: str | None = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.url = url or os.getenv("DRONTECT_SIMULATOR_WS_URL", DEFAULT_SERVER_URL)
         self._outgoing: Queue[dict[str, Any]] = Queue(maxsize=10)
         self._commands: Queue[dict[str, Any]] = Queue()
         self._stop = Event()
         self._thread: Thread | None = None
+        self._clock = clock
+        self._connected = Event()
+        self._ever_connected = Event()
+        self._connection_state_lock = Lock()
+        self._disconnected_at: float | None = None
+
+    @property
+    def connected(self) -> bool:
+        return self._connected.is_set()
+
+    def connection_lost_for(self, timeout_s: float) -> bool:
+        """Return true after an established command link exceeds its grace period."""
+        if timeout_s <= 0.0:
+            raise ValueError("timeout_s must be positive")
+        if self.connected or not self._ever_connected.is_set():
+            return False
+        with self._connection_state_lock:
+            disconnected_at = self._disconnected_at
+        return (
+            disconnected_at is not None
+            and self._clock() - disconnected_at >= timeout_s
+        )
 
     def start(self) -> None:
         if connect is None or self._thread is not None:
@@ -75,21 +103,38 @@ class SimulatorRealtimeClient:
             try:
                 assert connect is not None
                 async with connect(self.url) as websocket:
-                    print(f"Realtime command link connected: {self.url}")
-                    receiver = asyncio.create_task(self._receive_commands(websocket))
-                    sender = asyncio.create_task(self._send_telemetry(websocket))
-                    done, pending = await asyncio.wait(
-                        {receiver, sender},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for task in pending:
-                        task.cancel()
-                    for task in done:
-                        task.result()
+                    self._mark_connected()
+                    try:
+                        print(f"Realtime command link connected: {self.url}")
+                        receiver = asyncio.create_task(self._receive_commands(websocket))
+                        sender = asyncio.create_task(self._send_telemetry(websocket))
+                        done, pending = await asyncio.wait(
+                            {receiver, sender},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for task in pending:
+                            task.cancel()
+                        for task in done:
+                            task.result()
+                    finally:
+                        self._mark_disconnected()
             except Exception as exc:
                 if not self._stop.is_set():
                     print(f"Realtime command link unavailable: {exc}")
                     await asyncio.sleep(RECONNECT_DELAY_S)
+
+    def _mark_connected(self) -> None:
+        with self._connection_state_lock:
+            self._disconnected_at = None
+        self._ever_connected.set()
+        self._connected.set()
+
+    def _mark_disconnected(self) -> None:
+        self._connected.clear()
+        if not self._ever_connected.is_set():
+            return
+        with self._connection_state_lock:
+            self._disconnected_at = self._clock()
 
     async def _receive_commands(self, websocket) -> None:
         async for raw in websocket:

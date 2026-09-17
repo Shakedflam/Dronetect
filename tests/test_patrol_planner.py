@@ -57,6 +57,67 @@ def test_travel_cost_prefers_closer_region_when_age_and_priority_match():
     assert near_score.total > far_score.total
 
 
+def test_safe_route_distance_override_is_used_for_travel_cost():
+    region = PatrolRegionStore().get("N-1")
+    scorer = PatrolRegionScorer()
+
+    direct = scorer.score(
+        region,
+        DEFAULT_HOME,
+        now=100.0,
+        unobserved_since=0.0,
+        travel_distance_m=100.0,
+    )
+    detour = scorer.score(
+        region,
+        DEFAULT_HOME,
+        now=100.0,
+        unobserved_since=0.0,
+        travel_distance_m=800.0,
+    )
+
+    assert direct.distance_m == pytest.approx(100.0)
+    assert detour.distance_m == pytest.approx(800.0)
+    assert detour.travel_seconds > direct.travel_seconds
+    assert detour.total < direct.total
+
+
+def test_next_selection_uses_safe_route_distance_and_skips_unreachable_regions():
+    store = PatrolRegionStore()
+    store.replace_area_types(
+        [
+            (region.id, PatrolAreaType.IGNORE)
+            for region in store.regions
+            if region.id not in {"N-1", "S-1", "E-1"}
+        ]
+    )
+    planner = PatrolPlanner(store=store, started_at=0.0)
+    route_distances = {"N-1": 900.0, "S-1": 100.0, "E-1": None}
+
+    decision = planner.choose_next(
+        DEFAULT_HOME,
+        now=100.0,
+        route_distance_m=lambda region: route_distances[region.id],
+    )
+
+    assert decision.region.id == "S-1"
+    assert decision.score.distance_m == pytest.approx(100.0)
+
+
+@pytest.mark.parametrize("distance", [-1.0, math.inf, math.nan, True])
+def test_invalid_safe_route_distance_is_rejected(distance):
+    region = PatrolRegionStore().get("N-1")
+
+    with pytest.raises(ValueError, match="travel_distance_m"):
+        PatrolRegionScorer().score(
+            region,
+            DEFAULT_HOME,
+            now=100.0,
+            unobserved_since=0.0,
+            travel_distance_m=distance,
+        )
+
+
 def test_old_low_priority_region_eventually_beats_recent_high_priority_region():
     store = PatrolRegionStore()
     high = store.set_priority("N-1", 1)

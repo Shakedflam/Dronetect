@@ -174,13 +174,41 @@ def test_return_home_replaces_active_mission_intent():
     assert missions.post_takeoff_intent is None
 
 
-def test_new_mission_intent_is_rejected_during_return_home():
+def test_manual_return_home_can_be_overridden_with_roi_before_landing():
     missions = MissionCommandService()
     missions.apply(CommandName.START_PATROL, {})
+    missions.observe_altitude(15.0)
     missions.apply(CommandName.RETURN_HOME, {})
 
+    state = missions.apply(
+        CommandName.SET_ROI,
+        {"center": {"lat": 32.0, "lon": 34.0}, "radiusM": 50.0},
+    )
+
+    assert state is MissionState.TRANSIT_TO_ROI
+    assert missions.safety_rth_active is False
+
+
+def test_manual_return_home_can_be_overridden_with_patrol_before_landing():
+    missions = _missions_in_flying_state(MissionState.PATROL)
+    missions.apply(CommandName.RETURN_HOME, {})
+
+    assert missions.apply(CommandName.START_PATROL, {}) is MissionState.PATROL
+
+
+@pytest.mark.parametrize("command", [CommandName.START_PATROL, CommandName.SET_ROI])
+def test_manual_return_home_cannot_be_overridden_after_landing_starts(command):
+    missions = _missions_in_flying_state(MissionState.PATROL)
+    missions.apply(CommandName.RETURN_HOME, {})
+    missions.observe_flight_state("LANDING")
+    params = (
+        {"center": {"lat": 32.0, "lon": 34.0}, "radiusM": 50.0}
+        if command is CommandName.SET_ROI
+        else {}
+    )
+
     with pytest.raises(InvalidMissionCommand):
-        missions.apply(CommandName.SET_ROI, {"center": {"lat": 0, "lon": 0}, "radiusM": 0})
+        missions.apply(command, params)
 
 
 def _missions_in_flying_state(state: MissionState) -> MissionCommandService:

@@ -766,6 +766,40 @@ def test_low_battery_telemetry_starts_safety_rth_and_commands_drone():
     asyncio.run(scenario())
 
 
+def test_aircraft_connection_loss_rth_is_latched_by_backend():
+    class RecordingDrone:
+        def __init__(self):
+            self.commands = []
+
+        async def send_command(self, command):
+            self.commands.append(command)
+
+    async def scenario():
+        realtime_server = RealtimeServer()
+        realtime_server.mission.apply(CommandName.START_PATROL, {})
+        realtime_server.mission.observe_altitude(15.0)
+        drone = RecordingDrone()
+        realtime_server.drone = drone
+
+        await realtime_server._route_drone_telemetry(
+            build_simulator_telemetry(
+                position_local=LocalPosition(0.0, 0.0, 15.0),
+                heading_deg=0.0,
+                speed_mps=0.0,
+                state="RETURNING_HOME",
+                aircraft_safety_rth_active=True,
+                aircraft_safety_rth_reason="connection_lost",
+            )
+        )
+
+        assert realtime_server.mission.state is MissionState.RTH
+        assert realtime_server.mission.safety_rth_active is True
+        assert realtime_server.mission.safety_rth_reason == "connection_lost"
+        assert drone.commands[0]["command"] == CommandName.RETURN_HOME.value
+
+    asyncio.run(scenario())
+
+
 def test_new_mission_command_cannot_override_active_safety_rth():
     async def scenario():
         realtime_server = RealtimeServer()

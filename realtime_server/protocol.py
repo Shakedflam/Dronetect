@@ -305,6 +305,13 @@ def validate_telemetry_message(message: dict[str, Any]) -> dict[str, Any]:
     source = _required_string(message, "source")
     data = _required_object(message, "data")
     gps = _required_object(data, "gps")
+    aircraft_safety_rth_active = data.get("aircraftSafetyRthActive", False)
+    if not isinstance(aircraft_safety_rth_active, bool):
+        raise ProtocolError(
+            "validation_error",
+            "aircraftSafetyRthActive must be a boolean.",
+            details={"field": "aircraftSafetyRthActive"},
+        )
 
     return {
         "type": MESSAGE_TYPE_TELEMETRY,
@@ -322,6 +329,10 @@ def validate_telemetry_message(message: dict[str, Any]) -> dict[str, Any]:
             "state": _required_string(data, "state"),
             "targetPatrolRegionId": _optional_string(
                 data, "targetPatrolRegionId"
+            ),
+            "aircraftSafetyRthActive": aircraft_safety_rth_active,
+            "aircraftSafetyRthReason": _optional_string(
+                data, "aircraftSafetyRthReason"
             ),
         },
     }

@@ -118,6 +118,46 @@ def generate_patrol_regions(
     return regions
 
 
+def patrol_region_polygon_points(
+    region: PatrolRegion,
+    home: Wgs84Point = DEFAULT_HOME,
+    *,
+    arc_step_deg: float = 2.5,
+) -> tuple[Wgs84Point, ...]:
+    """Return a geographic polygon tracing one annular patrol sector.
+
+    The outer arc is walked from the region's start bearing to its end
+    bearing, then the inner arc is walked in reverse. Chords are kept short
+    by ``arc_step_deg`` so coverage and no-fly geometry closely follow the
+    circular region boundaries.
+    """
+    if not math.isfinite(arc_step_deg) or arc_step_deg <= 0.0:
+        raise ValueError("arc_step_deg must be a finite positive number")
+
+    sweep_deg = (region.end_bearing_deg - region.start_bearing_deg) % 360.0
+    steps = max(1, math.ceil(sweep_deg / arc_step_deg))
+    bearings = [
+        region.start_bearing_deg + sweep_deg * index / steps
+        for index in range(steps + 1)
+    ]
+    outer = [
+        destination_point(home, region.outer_radius_m, bearing)
+        for bearing in bearings
+    ]
+    inner = [
+        destination_point(home, region.inner_radius_m, bearing)
+        for bearing in reversed(bearings)
+    ]
+
+    points: list[Wgs84Point] = []
+    for point in [*outer, *inner]:
+        if not points or point != points[-1]:
+            points.append(point)
+    if len(points) > 1 and points[0] == points[-1]:
+        points.pop()
+    return tuple(points)
+
+
 class PatrolRegionStore:
     """Own mutable patrol metadata while keeping region geometry immutable."""
 
