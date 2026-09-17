@@ -1,6 +1,6 @@
 import type { CSSProperties } from 'react';
 import type { DetectedTarget, NormalizedBox } from '../../types/drone';
-import type { CoverTransform } from './useVideoCoverTransform';
+import type { FitTransform } from './useVideoFitTransform';
 import { useSmoothedTargets } from './useSmoothedTargets';
 import styles from './DetectionOverlay.module.css';
 
@@ -8,15 +8,15 @@ interface DetectionOverlayProps {
   targets: DetectedTarget[];
   selectedTargetId: string | null;
   onSelectTarget: (targetId: string) => void;
-  transform: CoverTransform | null;
+  transform: FitTransform | null;
 }
 
 const MIN_TARGET_WIDTH_PX = 48;
 const MIN_TARGET_HEIGHT_PX = 36;
 
-function toDisplayRect(box: NormalizedBox, transform: CoverTransform): CSSProperties {
+function toDisplayRect(box: NormalizedBox, transform: FitTransform): CSSProperties {
   // Re-project the box (normalized against the detector's own frame size)
-  // into the video's intrinsic pixel space before applying the cover crop.
+  // into the video's intrinsic pixel space before applying the fit/zoom transform.
   const left = box.x1 * transform.videoWidth * transform.scale - transform.offsetX;
   const top = box.y1 * transform.videoHeight * transform.scale - transform.offsetY;
   const right = box.x2 * transform.videoWidth * transform.scale - transform.offsetX;
@@ -46,8 +46,9 @@ function formatTrackNumber(trackId: string): string {
  * Draws one bounding box per detected target on top of the video feed.
  * Boxes are normalized against the detector's own frame size (which can
  * differ from the video's intrinsic resolution); `transform` re-projects
- * them into the video's displayed area, accounting for object-fit: cover,
- * so they stay aligned as the element is resized. Tapping a box selects it
+ * them into the video's displayed area, accounting for the active fit mode
+ * (contain/cover) and digital zoom, so they stay aligned as the element is
+ * resized or the operator zooms in. Tapping a box selects it
  * — with multiple targets in frame, the operator has to pick one before
  * Follow/Ignore/Engage become available.
  */

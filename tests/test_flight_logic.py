@@ -229,6 +229,17 @@ def test_new_roi_during_roi_patrol_returns_through_transit():
     assert logic.target == (200.0, 0.0, 12.0)
 
 
+def test_new_roi_during_roi_transit_immediately_replaces_destination():
+    logic = make_logic(takeoff_altitude=12.0)
+    airborne = (0.0, 0.0, 12.0)
+    logic.request_roi(airborne, center=(100.0, 0.0), radius_m=20.0)
+
+    logic.request_roi((25.0, 0.0, 12.0), center=(200.0, 50.0), radius_m=30.0)
+
+    assert logic.state is FlightState.TRANSITING_TO_ROI
+    assert logic.target == (200.0, 50.0, 12.0)
+
+
 def test_start_patrol_interrupts_roi_patrol_and_holds():
     logic = make_logic(takeoff_altitude=12.0)
     airborne = (10.0, 0.0, 12.0)

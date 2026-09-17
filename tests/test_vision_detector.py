@@ -122,7 +122,7 @@ def test_create_drone_detector_uses_default_image_size(monkeypatch, tmp_path):
     detector = create_drone_detector(model_path=model_path, logger=lambda _: None)
 
     assert isinstance(detector, YoloDroneDetector)
-    assert detector.image_size == 960
+    assert detector.image_size == 768
 
 
 class FakeYoloModel:

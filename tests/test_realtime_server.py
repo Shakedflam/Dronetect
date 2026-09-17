@@ -701,6 +701,37 @@ def test_roi_arrival_updates_state_without_touching_normal_patrol_ages():
     asyncio.run(scenario())
 
 
+def test_vision_detections_are_forwarded_to_connected_drone():
+    class RecordingDrone:
+        def __init__(self):
+            self.messages = []
+
+        async def send_command(self, message):
+            self.messages.append(message)
+
+    async def scenario():
+        realtime_server = RealtimeServer()
+        drone = RecordingDrone()
+        realtime_server.drone = drone
+        detections = {
+            "type": "detections",
+            "frameId": 5,
+            "timestampMs": 1000,
+            "frameWidth": 640,
+            "frameHeight": 480,
+            "detections": [],
+        }
+
+        await realtime_server._route_vision_detections(detections)
+
+        assert len(drone.messages) == 1
+        assert drone.messages[0]["type"] == "detections"
+        assert drone.messages[0]["frameId"] == 5
+        assert "detectionAgeMs" in drone.messages[0]
+
+    asyncio.run(scenario())
+
+
 def test_low_battery_telemetry_starts_safety_rth_and_commands_drone():
     class RecordingDrone:
         def __init__(self):
@@ -738,6 +769,7 @@ def test_low_battery_telemetry_starts_safety_rth_and_commands_drone():
         assert len(drone.commands) == 1
         assert drone.commands[0]["command"] == CommandName.RETURN_HOME.value
         assert drone.commands[0]["commandId"].startswith("safety-rth-")
+        assert drone.commands[0]["safetyReason"] == "low_battery"
 
         await realtime_server._route_drone_telemetry(
             build_simulator_telemetry(
@@ -796,6 +828,7 @@ def test_aircraft_connection_loss_rth_is_latched_by_backend():
         assert realtime_server.mission.safety_rth_active is True
         assert realtime_server.mission.safety_rth_reason == "connection_lost"
         assert drone.commands[0]["command"] == CommandName.RETURN_HOME.value
+        assert drone.commands[0]["safetyReason"] == "connection_lost"
 
     asyncio.run(scenario())
 

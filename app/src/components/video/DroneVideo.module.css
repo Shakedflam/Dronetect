@@ -11,7 +11,10 @@
   inset: 0;
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  /* object-fit and transform (zoom) are set inline from DroneVideo.tsx,
+     driven by the operator's fit-mode/zoom controls. */
+  transform-origin: 50% 50%;
+  transition: transform 0.15s ease;
 }
 
 .feedPlaceholder {
@@ -52,4 +55,70 @@
   font-family: var(--font-mono);
   font-size: 13px;
   letter-spacing: 0.12em;
+}
+
+.videoControls {
+  position: absolute;
+  right: var(--space-md);
+  bottom: var(--space-md);
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.zoomGroup {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--color-panel);
+  border: 1px solid var(--color-panel-border);
+  backdrop-filter: blur(6px);
+}
+
+.controlButton {
+  min-width: 32px;
+  min-height: 28px;
+  padding: 2px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-panel-border);
+  background: var(--color-panel);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: filter 0.15s ease, transform 0.05s ease;
+}
+
+.zoomGroup .controlButton {
+  border: none;
+  backdrop-filter: none;
+  min-width: 26px;
+}
+
+.controlButton:hover:not(:disabled) {
+  filter: brightness(1.25);
+}
+
+.controlButton:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+.controlButton:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.zoomReadout {
+  min-width: 34px;
+  text-align: center;
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
 }

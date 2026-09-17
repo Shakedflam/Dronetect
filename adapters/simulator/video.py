@@ -214,7 +214,10 @@ def _resize_to_fit(image, max_width: int, max_height: int):
     scale = min(max_width / image.width, max_height / image.height)
     width = max(1, int(round(image.width * scale)))
     height = max(1, int(round(image.height * scale)))
-    return image.resize((width, height), Image.Resampling.BILINEAR)
+    # LANCZOS gives a visibly sharper downscale than bilinear for a modest,
+    # one-time CPU cost per frame — worth it since this runs once per frame,
+    # not per pixel-neighborhood lookup during playback.
+    return image.resize((width, height), Image.Resampling.LANCZOS)
 
 
 def _put_latest(queue: Queue, item: object) -> None:

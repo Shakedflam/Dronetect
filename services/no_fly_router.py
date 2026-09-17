@@ -110,6 +110,51 @@ class NoFlyRouter:
         path.reverse()
         return self._simplify(path, obstacles)[1:]
 
+    def egress_route(
+        self,
+        start: Point2,
+        destination: Point2,
+        regions: tuple[PatrolRegion, ...] | list[PatrolRegion],
+    ) -> list[Point2]:
+        """Leave containing NO_FLY cells, then route normally to destination.
+
+        Only the initial segment may occupy cells containing ``start``. It may
+        not enter another cell, and after it exits it may not re-enter.
+        """
+        no_fly = [region for region in regions if region.area_type is PatrolAreaType.NO_FLY]
+        if not no_fly:
+            return [destination]
+        max_radius_m = max(region.outer_radius_m for region in regions)
+        obstacles = [self._expanded_obstacle(region, max_radius_m) for region in no_fly]
+        containing = [obstacle for obstacle in obstacles if self._inside(start, obstacle)]
+        if not containing:
+            return self.route(start, destination, regions)
+
+        candidates = self._candidate_points(containing, max_radius_m)
+        candidates.extend(
+            self._direct_egress_candidates(start, destination, containing, max_radius_m)
+        )
+        best: tuple[float, list[Point2]] | None = None
+        for candidate in self._deduplicate(candidates):
+            if self._inside_any(candidate, obstacles):
+                continue
+            if not self._valid_egress_segment(start, candidate, containing, obstacles):
+                continue
+            try:
+                onward = self.route(candidate, destination, regions)
+            except NoFlyRouteUnavailable:
+                continue
+            path = [candidate, *onward]
+            length = sum(
+                math.dist(left, right)
+                for left, right in zip([start, *path], path)
+            )
+            if best is None or length < best[0]:
+                best = (length, path)
+        if best is None:
+            raise NoFlyRouteUnavailable("No egress route out of the active NO_FLY area")
+        return best[1]
+
     def segment_crosses_no_fly(
         self,
         start: Point2,
@@ -211,6 +256,76 @@ class NoFlyRouter:
             ):
                 return True
         return False
+
+    @staticmethod
+    def _inside(point: Point2, obstacle: _PolarObstacle) -> bool:
+        radius = math.hypot(*point)
+        bearing = math.degrees(math.atan2(point[0], point[1])) % 360.0
+        angular_offset = (bearing - obstacle.start_bearing_deg) % 360.0
+        return (
+            1e-7 < angular_offset < obstacle.sweep_deg - 1e-7
+            and obstacle.inner_radius_m + 1e-6 < radius < obstacle.outer_radius_m - 1e-6
+        )
+
+    def _direct_egress_candidates(
+        self,
+        start: Point2,
+        destination: Point2,
+        obstacles: list[_PolarObstacle],
+        max_radius_m: float,
+    ) -> list[Point2]:
+        start_radius = math.hypot(*start)
+        start_bearing = math.degrees(math.atan2(start[0], start[1])) % 360.0
+        destination_bearing = math.degrees(math.atan2(destination[0], destination[1])) % 360.0
+        offset = self._BOUNDARY_OFFSET_M
+        candidates: list[Point2] = []
+        for obstacle in obstacles:
+            bearings = (start_bearing, destination_bearing)
+            if obstacle.inner_radius_m > offset:
+                candidates.extend(
+                    self._polar(obstacle.inner_radius_m - offset, bearing)
+                    for bearing in bearings
+                )
+            if obstacle.outer_radius_m < max_radius_m - offset:
+                candidates.extend(
+                    self._polar(obstacle.outer_radius_m + offset, bearing)
+                    for bearing in bearings
+                )
+            radius = min(
+                obstacle.outer_radius_m + offset,
+                max(obstacle.inner_radius_m - offset, start_radius),
+            )
+            candidates.extend(
+                (
+                    self._polar(radius, obstacle.start_bearing_deg - 0.01),
+                    self._polar(radius, obstacle.start_bearing_deg + obstacle.sweep_deg + 0.01),
+                )
+            )
+        return candidates
+
+    def _valid_egress_segment(
+        self,
+        start: Point2,
+        destination: Point2,
+        containing: list[_PolarObstacle],
+        all_obstacles: list[_PolarObstacle],
+    ) -> bool:
+        other_obstacles = [item for item in all_obstacles if item not in containing]
+        steps = max(1, math.ceil(math.dist(start, destination) / self.config.collision_sample_m))
+        exited = False
+        for index in range(1, steps + 1):
+            fraction = index / steps
+            point = (
+                start[0] + (destination[0] - start[0]) * fraction,
+                start[1] + (destination[1] - start[1]) * fraction,
+            )
+            if self._inside_any(point, other_obstacles):
+                return False
+            inside_source = self._inside_any(point, containing)
+            if exited and inside_source:
+                return False
+            exited = exited or not inside_source
+        return exited
 
     def _simplify(
         self,

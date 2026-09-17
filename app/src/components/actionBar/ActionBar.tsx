@@ -1,12 +1,19 @@
+import { useEffect, useRef } from 'react';
 import { droneCommandService } from '../../services/droneCommandService';
 import { useMissionState } from '../../hooks/useMissionState';
 import { useMissionStatus } from '../../hooks/useMissionStatus';
 import { useRoi } from '../../hooks/useRoi';
+import type { Roi } from '../../types/roi';
 import styles from './ActionBar.module.css';
 
 interface ActionBarProps {
   selectedTargetId: string | null;
   onClearSelection: () => void;
+}
+
+function roiKey(roi: Roi | null): string | null {
+  if (!roi) return null;
+  return `${roi.center.lat}:${roi.center.lon}:${roi.radiusM}`;
 }
 
 /**
@@ -33,6 +40,23 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
       : undefined;
   const roi = useRoi();
   const roiMissionActive = missionState === 'TRANSIT_TO_ROI' || missionState === 'ROI_PATROL';
+  const lastSentRoiRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!roi || !roiMissionActive || missionOverrideDisabled) return;
+    const key = roiKey(roi);
+    if (key === lastSentRoiRef.current) return;
+
+    // Map dragging emits many intermediate ROI positions. Send the settled
+    // location instead of flooding the aircraft command link on every pixel.
+    const timer = window.setTimeout(() => {
+      lastSentRoiRef.current = key;
+      droneCommandService.setRoi(roi).catch((error: unknown) => {
+        console.error('[ActionBar] automatic ROI update failed', error);
+      });
+    }, 200);
+    return () => window.clearTimeout(timer);
+  }, [roi, roiMissionActive, missionOverrideDisabled]);
 
   function handleReturnToHome() {
     droneCommandService.returnToHome().catch((error: unknown) => {
@@ -82,6 +106,7 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
 
   function handleTransitToRoi() {
     if (!roi) return;
+    lastSentRoiRef.current = roiKey(roi);
     droneCommandService.setRoi(roi).catch((error: unknown) => {
       console.error('[ActionBar] setRoi failed', error);
     });

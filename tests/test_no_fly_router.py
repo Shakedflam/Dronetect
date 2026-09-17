@@ -73,6 +73,36 @@ def test_router_chooses_shorter_side_of_asymmetric_no_fly_crossing():
         assert not router.segment_crosses_no_fly(left, right, store.regions)
 
 
+def test_egress_route_leaves_containing_zone_then_enforces_all_no_fly():
+    store = PatrolRegionStore(home_radius_m=300.0)
+    store.set_area_type("N-1", PatrolAreaType.NO_FLY)
+    store.set_area_type("NE-1", PatrolAreaType.NO_FLY)
+    router = NoFlyRouter(NoFlyRoutingConfig(clearance_m=5.0, collision_sample_m=1.0))
+    start = (0.0, 60.0)
+    destination = (-100.0, -150.0)
+
+    route = router.egress_route(start, destination, store.regions)
+
+    assert route[-1] == destination
+    assert len(route) >= 2
+    # The first leg is the sole egress exception. Normal enforcement applies
+    # from its endpoint onward, including the adjacent NE restricted cell.
+    for left, right in zip(route, route[1:]):
+        assert not router.segment_crosses_no_fly(left, right, store.regions)
+
+
+def test_egress_route_uses_normal_router_when_start_is_outside_no_fly():
+    store = PatrolRegionStore(home_radius_m=300.0)
+    store.set_area_type("N-1", PatrolAreaType.NO_FLY)
+    router = NoFlyRouter(NoFlyRoutingConfig(clearance_m=5.0))
+    start = (-200.0, -100.0)
+    destination = (200.0, -100.0)
+
+    assert router.egress_route(start, destination, store.regions) == router.route(
+        start, destination, store.regions
+    )
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

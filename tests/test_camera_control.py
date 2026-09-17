@@ -1,3 +1,5 @@
+import pytest
+
 from controllers.autonomous_drone.camera_control import CameraGimbal
 
 
@@ -36,3 +38,16 @@ def test_camera_gimbal_clamps_to_safe_pitch_limits():
 
     assert gimbal.tilt_up() == -0.5
     assert gimbal.tilt_up() == -0.5
+
+
+def test_camera_gimbal_moves_smoothly_toward_tracking_pitch():
+    gimbal = CameraGimbal(pitch=0.12)
+
+    assert gimbal.move_toward(0.5, max_delta=0.02) == pytest.approx(0.14)
+    assert gimbal.move_toward(0.15, max_delta=0.02) == pytest.approx(0.15)
+
+
+def test_camera_gimbal_smooth_move_respects_safe_limits():
+    gimbal = CameraGimbal(pitch=1.69)
+
+    assert gimbal.move_toward(3.0, max_delta=0.02) == 1.7

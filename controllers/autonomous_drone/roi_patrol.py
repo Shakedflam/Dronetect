@@ -25,6 +25,27 @@ class RoiPatrolPlan(Protocol):
 
     def clear(self) -> None: ...
 
+    def snapshot(self) -> "RoiPatrolProgress": ...
+
+    def restore(self, progress: "RoiPatrolProgress") -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RoiPatrolProgress:
+    """Exact generated ROI path and the next waypoint cursor."""
+
+    waypoints: tuple[Position, ...]
+    next_index: int
+
+    @property
+    def remaining_path(self) -> tuple[Position, ...]:
+        if not self.waypoints:
+            return ()
+        return (
+            self.waypoints[self.next_index :]
+            + self.waypoints[: self.next_index]
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class RoiPatrolConfig:
@@ -110,6 +131,17 @@ class LawnMowerRoiPatrolPlanner:
     def clear(self) -> None:
         self._waypoints = ()
         self._next_index = 0
+
+    def snapshot(self) -> RoiPatrolProgress:
+        return RoiPatrolProgress(self._waypoints, self._next_index)
+
+    def restore(self, progress: RoiPatrolProgress) -> None:
+        if progress.waypoints and not 0 <= progress.next_index < len(progress.waypoints):
+            raise ValueError("ROI progress next_index is outside its waypoint path")
+        if not progress.waypoints and progress.next_index != 0:
+            raise ValueError("Empty ROI progress must use next_index zero")
+        self._waypoints = progress.waypoints
+        self._next_index = progress.next_index
 
 
 def _horizontal_distance(first: Position, second: Position) -> float:

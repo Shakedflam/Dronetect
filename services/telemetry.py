@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import time
+from typing import Any
 
 from services.gps import LocalPosition, local_meters_to_wgs84
 
@@ -32,6 +33,7 @@ def build_simulator_telemetry(
     target_patrol_region_id: str | None = None,
     aircraft_safety_rth_active: bool = False,
     aircraft_safety_rth_reason: str | None = None,
+    target_follow_diagnostics: dict[str, Any] | None = None,
     timestamp: float | None = None,
 ) -> dict:
     """Build the JSON-compatible simulator telemetry message."""
@@ -54,5 +56,6 @@ def build_simulator_telemetry(
             "targetPatrolRegionId": target_patrol_region_id,
             "aircraftSafetyRthActive": aircraft_safety_rth_active,
             "aircraftSafetyRthReason": aircraft_safety_rth_reason,
+            "targetFollowDiagnostics": target_follow_diagnostics,
         },
     }

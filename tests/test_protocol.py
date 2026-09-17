@@ -69,6 +69,40 @@ def test_telemetry_round_trips_aircraft_safety_rth_state():
     assert validated["data"]["aircraftSafetyRthReason"] == "connection_lost"
 
 
+def test_telemetry_round_trips_target_follow_diagnostics():
+    diagnostics = {
+        "flightState": "TARGET_LOST_SEARCH",
+        "trackerId": "drone-7",
+        "detectionConfidence": 0.91,
+        "imageCenterError": {"x": 0.25, "y": -0.05},
+        "confirmation": {"hits": 2, "requiredHits": 2, "progress": 1.0},
+        "estimatedImageVelocity": {
+            "x": 0.07,
+            "y": -0.02,
+            "magnitude": 0.073,
+            "directionDeg": -15.9,
+        },
+        "boundingBoxScale": 0.1,
+        "boundingBoxAreaRatio": 0.01,
+        "standoffError": 0.015,
+        "targetLostDurationS": 0.4,
+        "patrolInterrupted": True,
+        "patrolResumeState": "PATROL",
+        "patrolResumeStatus": "interrupted",
+    }
+    message = build_simulator_telemetry(
+        position_local=LocalPosition(0.0, 0.0, 15.0),
+        heading_deg=0.0,
+        speed_mps=0.0,
+        state="TARGET_FOLLOW",
+        target_follow_diagnostics=diagnostics,
+    )
+
+    validated = validate_telemetry_message(message)
+
+    assert validated["data"]["targetFollowDiagnostics"] == diagnostics
+
+
 def test_mission_status_round_trips_authoritative_backend_state():
     message = mission_status_message(
         state=MissionState.ROI_PATROL,
@@ -559,10 +593,32 @@ def test_unknown_command_is_rejected():
                 "params": {},
             }
         )
-
     assert exc_info.value.code == "unsupported_command"
     assert exc_info.value.command_id == "cmd-1"
 
+
+def test_safety_reason_round_trips_only_on_return_home():
+    command = validate_command_message(
+        {
+            "type": "command",
+            "commandId": "safety-rth-1",
+            "command": "return_home",
+            "params": {},
+            "safetyReason": "low_battery",
+        }
+    )
+    assert command["safetyReason"] == "low_battery"
+
+    with pytest.raises(ProtocolError):
+        validate_command_message(
+            {
+                "type": "command",
+                "commandId": "cmd-2",
+                "command": "start_patrol",
+                "params": {},
+                "safetyReason": "low_battery",
+            }
+        )
 
 def test_missing_required_fields_produce_structured_errors():
     with pytest.raises(ProtocolError) as exc_info:

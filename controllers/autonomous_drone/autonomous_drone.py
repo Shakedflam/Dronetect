@@ -12,6 +12,7 @@
 """Webots adapter for the autonomous generic-quadcopter proof of concept."""
 
 from collections import deque
+from dataclasses import replace
 import math
 import os
 from pathlib import Path
@@ -26,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from adapters.simulator.client import SimulatorRealtimeClient
 from adapters.simulator.video import SimulatorVideoClient
 from camera_control import CameraGimbal
+from pursuit import PursuitConfig
 from flight_logic import (
     advance_kinematic_flight,
     FlightConfig,
@@ -50,6 +52,10 @@ from services.gps import (
     wgs84_to_local_meters,
 )
 from services.flight_safety import CONNECTION_LOSS_REASON
+from services.mission_interruption import (
+    InterruptedMissionType,
+    MissionInterruptionContext,
+)
 from services.no_fly_router import NoFlyRouteUnavailable, NoFlyRouter
 from services.polygon_coverage import (
     CoveragePathUnavailable,
@@ -76,16 +82,17 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
 class AutonomousDrone(Supervisor):
     K_VISUAL_PROPELLER_SPEED = 68.5
     TAKEOFF_CAMERA_PITCH = -0.2
-    HORIZONTAL_CAMERA_PITCH = 0.0
+    # Keep a small amount of ground in view during horizontal flight.
+    HORIZONTAL_CAMERA_PITCH = 0.16
     KINEMATIC_FLIGHT_CONFIG = KinematicFlightConfig(
-        max_horizontal_speed_mps=7.0,
+        max_horizontal_speed_mps=12.0,
         horizontal_acceleration_mps2=3.0,
         max_ascent_speed_mps=5.0,
         max_descent_speed_mps=3.0,
         max_yaw_rate_rad_s=math.radians(150.0),
     )
     SEARCH_KINEMATIC_FLIGHT_CONFIG = KinematicFlightConfig(
-        max_horizontal_speed_mps=3.5,
+        max_horizontal_speed_mps=12.0,
         horizontal_acceleration_mps2=1.5,
         max_ascent_speed_mps=5.0,
         max_descent_speed_mps=3.0,
@@ -108,6 +115,9 @@ class AutonomousDrone(Supervisor):
         self._patrol_route_waypoints: deque[Position] = deque()
         self._target_patrol_region_id: str | None = None
         self._paused_patrol_coverage: PausedPatrolCoverage | None = None
+        self._active_roi_id: str | None = None
+        self._mission_interruption: MissionInterruptionContext | None = None
+        self._mission_return_prepared = False
         self.logic = FlightLogic(
             FlightConfig(
                 takeoff_altitude=float(
@@ -122,8 +132,76 @@ class AutonomousDrone(Supervisor):
                 roi_arrival_tolerance=float(
                     os.getenv("DRONTECT_ROI_ARRIVAL_TOLERANCE_M", "10.0")
                 ),
+                target_min_confidence=float(
+                    os.getenv("DRONTECT_TARGET_MIN_CONFIDENCE", "0.45")
+                ),
+                target_confirmation_hits=int(
+                    os.getenv("DRONTECT_TARGET_CONFIRMATION_HITS", "2")
+                ),
+                target_acquisition_timeout_s=float(
+                    os.getenv("DRONTECT_TARGET_ACQUISITION_TIMEOUT_S", "2.5")
+                ),
+                target_lost_search_timeout_s=float(
+                    os.getenv("DRONTECT_TARGET_LOST_SEARCH_TIMEOUT_S", "2.0")
+                ),
+                target_yaw_gain=float(
+                    os.getenv("DRONTECT_TARGET_YAW_GAIN", "0.35")
+                ),
+                target_yaw_prediction_horizon_s=float(
+                    os.getenv("DRONTECT_TARGET_YAW_PREDICTION_SECONDS", "0.5")
+                ),
+                target_yaw_deadband_ratio=float(
+                    os.getenv("DRONTECT_TARGET_YAW_DEADBAND_RATIO", "0.04")
+                ),
+                target_velocity_smoothing=float(
+                    os.getenv("DRONTECT_TARGET_VELOCITY_SMOOTHING", "0.35")
+                ),
+                target_max_yaw_rate_rad_s=math.radians(
+                    float(os.getenv("DRONTECT_TARGET_MAX_YAW_RATE_DEG_S", "18.0"))
+                ),
+                target_search_yaw_rate_rad_s=math.radians(
+                    float(os.getenv("DRONTECT_TARGET_SEARCH_YAW_RATE_DEG_S", "10.0"))
+                ),
+                target_gimbal_pitch_gain=float(
+                    os.getenv("DRONTECT_TARGET_GIMBAL_PITCH_GAIN", "0.25")
+                ),
+                target_center_tolerance_x=float(
+                    os.getenv("DRONTECT_TARGET_CENTER_TOLERANCE_X", "0.08")
+                ),
+                target_center_tolerance_y=float(
+                    os.getenv("DRONTECT_TARGET_CENTER_TOLERANCE_Y", "0.12")
+                ),
+                target_follow_step_m=float(
+                    os.getenv("DRONTECT_TARGET_FOLLOW_STEP_M", "6.0")
+                ),
+                target_standoff_box_area_ratio=float(
+                    os.getenv("DRONTECT_TARGET_STANDOFF_BOX_AREA_RATIO", "0.025")
+                ),
+                target_collision_avoidance_step_m=float(
+                    os.getenv("DRONTECT_TARGET_COLLISION_AVOIDANCE_STEP_M", "3.0")
+                ),
+                target_takeoff_pursuit_clearance_m=float(
+                    os.getenv("DRONTECT_TARGET_TAKEOFF_PURSUIT_CLEARANCE_M", "2.0")
+                ),
+                target_takeoff_pursuit_ascent_mps=float(
+                    os.getenv("DRONTECT_TARGET_TAKEOFF_PURSUIT_ASCENT_MPS", "2.0")
+                ),
             ),
             patrol_waypoint_provider=self._next_patrol_waypoint,
+            pursuit_config=PursuitConfig(
+                stable_duration_s=float(os.getenv("DRONTECT_PURSUIT_STABLE_SECONDS", "0.8")),
+                observation_timeout_s=float(os.getenv("DRONTECT_PURSUIT_OBSERVATION_TIMEOUT_SECONDS", "1.5")),
+                max_speed_mps=float(os.getenv("DRONTECT_PURSUIT_MAX_SPEED_MPS", "4.0")),
+                acceleration_mps2=float(os.getenv("DRONTECT_PURSUIT_ACCELERATION_MPS2", "2.0")),
+                geofence_radius_m=max(region.outer_radius_m for region in self.patrol_regions.regions),
+            ),
+        )
+        self._target_tracking_flight_config = KinematicFlightConfig(
+            max_horizontal_speed_mps=self.SEARCH_KINEMATIC_FLIGHT_CONFIG.max_horizontal_speed_mps,
+            horizontal_acceleration_mps2=self.SEARCH_KINEMATIC_FLIGHT_CONFIG.horizontal_acceleration_mps2,
+            max_ascent_speed_mps=self.SEARCH_KINEMATIC_FLIGHT_CONFIG.max_ascent_speed_mps,
+            max_descent_speed_mps=self.SEARCH_KINEMATIC_FLIGHT_CONFIG.max_descent_speed_mps,
+            max_yaw_rate_rad_s=self.logic.config.target_max_yaw_rate_rad_s,
         )
 
         self.markers = WorldMarkers(self)
@@ -134,6 +212,9 @@ class AutonomousDrone(Supervisor):
             raise RuntimeError("Autonomous drone requires translation and rotation fields.")
 
         self.camera = cast(Camera, self.getDevice("camera"))
+        self.logic.pursuit.config = replace(
+            self.logic.pursuit.config, horizontal_fov_rad=self.camera.getFov(),
+        )
         #orientation: roll, pitch, yaw
         self.imu = cast(InertialUnit, self.getDevice("inertial unit"))
         self.gps = cast(GPS, self.getDevice("gps"))
@@ -144,6 +225,9 @@ class AutonomousDrone(Supervisor):
         self.keyboard.enable(self.time_step)
 
         self.camera_gimbal = CameraGimbal()
+        self._target_gimbal_max_rate_rad_s = float(
+            os.getenv("DRONTECT_TARGET_GIMBAL_MAX_RATE_RAD_S", "0.20")
+        )
         self.camera_pitch_motor = cast(Motor, self.getDevice("camera pitch"))
         self.camera_pitch_motor.setPosition(self.camera_gimbal.pitch)
         self._camera_flight_state: FlightState | None = None
@@ -159,6 +243,7 @@ class AutonomousDrone(Supervisor):
             motor.setVelocity(0.0)
 
         self._announced_state = None
+        self._announced_diagnostic_state: str | None = None
         self._announced_random_target = None
         self._elapsed_time = 0.0
         self._last_hud_update_time = -1.0
@@ -178,6 +263,8 @@ class AutonomousDrone(Supervisor):
                 "DRONTECT_CONNECTION_LOSS_RTH_SECONDS must be a finite positive number"
             )
         self._connection_loss_rth_active = False
+        self._safety_rth_active = False
+        self._safety_rth_reason: str | None = None
         self.realtime_client = SimulatorRealtimeClient()
         self.realtime_client.start()
         self.video_client = SimulatorVideoClient()
@@ -206,7 +293,10 @@ class AutonomousDrone(Supervisor):
             self._enforce_connection_loss_rth()
             self._handle_keyboard(position)
             self._handle_realtime_commands(position)
+            state_before_detection = self.logic.state
+            self._handle_vision_detections(position, yaw)
             self.logic.update(position, dt)
+            self._coordinate_mission_resume(position, state_before_detection)
             position, yaw, speed_mps, vertical_speed_mps = self._apply_kinematic_flight(
                 position,
                 yaw,
@@ -245,8 +335,8 @@ class AutonomousDrone(Supervisor):
                 else:
                     print(f"Return Home ignored while {self.logic.state.value}.")
             elif normalized_key in (ord("N"), ord("n")):
-                if self._connection_loss_rth_active:
-                    print("New mission ignored during connection-loss safety RTH.")
+                if self._safety_rth_active:
+                    print("New mission ignored during safety RTH.")
                     key = self.keyboard.getKey()
                     continue
                 self._clear_patrol_progress()
@@ -265,7 +355,7 @@ class AutonomousDrone(Supervisor):
     def _handle_realtime_commands(self, position: Position) -> None:
         for message in self.realtime_client.drain_commands():
             command = CommandName(message["command"])
-            if self._connection_loss_rth_active and command in {
+            if self._safety_rth_active and command in {
                 CommandName.START_PATROL,
                 CommandName.SET_ROI,
                 CommandName.CLEAR_ROI,
@@ -273,17 +363,23 @@ class AutonomousDrone(Supervisor):
             }:
                 print(
                     f"Realtime command {command.value} ignored during "
-                    "connection-loss safety RTH."
+                    "safety RTH."
                 )
                 continue
             if command == CommandName.RETURN_HOME:
+                safety_reason = message.get("safetyReason")
+                if isinstance(safety_reason, str):
+                    self._safety_rth_active = True
+                    self._safety_rth_reason = safety_reason
                 if self.logic.request_return_home():
                     self._clear_patrol_progress()
+                    self._active_roi_id = None
                     print("Realtime command return_home accepted.")
                 else:
                     print(f"Realtime command return_home ignored while {self.logic.state.value}.")
             elif command == CommandName.START_PATROL:
                 self._clear_patrol_progress()
+                self._active_roi_id = None
                 self.logic.request_patrol(position)
                 print(f"Realtime command {command.value} accepted.")
             elif command == CommandName.SET_PATROL_PRIORITIES:
@@ -310,6 +406,7 @@ class AutonomousDrone(Supervisor):
                         )
                 print("Realtime patrol area types updated.")
             elif command == CommandName.SET_ROI:
+                self._discard_mission_interruption()
                 self._pause_patrol_coverage(position)
                 params = message["params"]
                 center = params["center"]
@@ -323,16 +420,19 @@ class AutonomousDrone(Supervisor):
                     (local_center.x, local_center.y),
                     params["radiusM"],
                 )
+                self._active_roi_id = f"roi:{message['commandId']}"
                 # ROI missions intentionally override NO_FLY patrol routing;
                 # the restriction remains stored and resumes with PATROL.
                 print("Realtime command set_roi accepted.")
             elif command == CommandName.CLEAR_ROI:
+                self._discard_mission_interruption()
                 resume_patrol = self.logic.state in {
                     FlightState.TAKING_OFF,
                     FlightState.TRANSITING_TO_ROI,
                     FlightState.ROI_PATROL,
                 }
                 self.logic.clear_roi(position)
+                self._active_roi_id = None
                 if resume_patrol:
                     had_checkpoint = self._paused_patrol_coverage is not None
                     if had_checkpoint:
@@ -349,6 +449,7 @@ class AutonomousDrone(Supervisor):
                 print("Realtime command clear_roi accepted.")
             elif command == CommandName.NEW_MISSION:
                 self._clear_patrol_progress()
+                self._active_roi_id = None
                 waypoint = self.logic.request_new_target(position)
                 print(f"Realtime command new_mission: {self._format_position(waypoint)}")
             elif command == CommandName.CAMERA_TILT_UP:
@@ -359,6 +460,178 @@ class AutonomousDrone(Supervisor):
                 pitch = self.camera_gimbal.tilt_down()
                 self.camera_pitch_motor.setPosition(pitch)
                 print(f"Realtime command camera_tilt_down: {pitch:.2f}")
+
+    def _handle_vision_detections(self, position: Position, yaw: float) -> None:
+        allow_landing_intercept = (
+            self.logic.state is FlightState.LANDING
+            and not self._safety_rth_active
+        )
+        for message in self.realtime_client.drain_detections():
+            detections = message["detections"]
+            if self.logic.would_intercept(
+                detections,
+                allow_landing_intercept=allow_landing_intercept,
+            ):
+                self._capture_mission_interruption(position)
+            self.logic.observe_detections(
+                detections,
+                frame_width=message["frameWidth"],
+                frame_height=message["frameHeight"],
+                position=position,
+                yaw=yaw,
+                camera_pitch=self.camera_gimbal.pitch,
+                allow_landing_intercept=allow_landing_intercept,
+            )
+
+    def _coordinate_mission_resume(
+        self,
+        position: Position,
+        state_before_detection: FlightState,
+    ) -> None:
+        context = self._mission_interruption
+        if context is None:
+            return
+        if self.logic.state is FlightState.TARGET_RETURN:
+            if not self._mission_return_prepared or not self.logic.target_return_ready:
+                self._prepare_mission_return(position, context)
+            return
+        target_states = {
+            FlightState.TARGET_ACQUISITION,
+            FlightState.TARGET_FOLLOW,
+            FlightState.TARGET_PURSUIT,
+            FlightState.TARGET_RETURN,
+        }
+        if (
+            self.logic.tracked_target_id is None
+            and self.logic.state not in target_states
+            and (
+                state_before_detection in target_states
+                or self.logic.state.value == context.source_state
+            )
+        ):
+            self._restore_mission_interruption(context)
+
+    def _prepare_mission_return(
+        self,
+        position: Position,
+        context: MissionInterruptionContext,
+    ) -> None:
+        try:
+            route = self.no_fly_router.egress_route(
+                (position[0], position[1]),
+                (
+                    context.interruption_position[0],
+                    context.interruption_position[1],
+                ),
+                self.patrol_regions.regions,
+            )
+        except NoFlyRouteUnavailable as exc:
+            self.logic.hold_target_return(position)
+            self._mission_return_prepared = False
+            print(f"Mission resume waiting for a safe NO_FLY egress route: {exc}")
+            return
+        altitude = self.logic.config.takeoff_altitude
+        waypoints: list[Position] = [
+            (x, y, altitude) for x, y in route
+        ]
+        waypoints[-1] = context.interruption_position
+        self.logic.set_target_return_route(
+            self._deduplicate_waypoints(waypoints)
+        )
+        self._mission_return_prepared = True
+
+    def _capture_mission_interruption(self, position: Position) -> None:
+        if self._mission_interruption is not None:
+            return
+        state = self.logic.state
+        pending_state = self.logic.pending_mission_state
+        effective_state = pending_state if state is FlightState.TAKING_OFF else state
+        exact_position = (float(position[0]), float(position[1]), float(position[2]))
+
+        if effective_state is FlightState.PATROLLING:
+            active_waypoint = (
+                self.logic.pending_mission_waypoint
+                if state is FlightState.TAKING_OFF
+                else self.logic.target
+            )
+            progress = None
+            if self._target_patrol_region_id is not None and active_waypoint is not None:
+                progress = PausedPatrolCoverage(
+                    region_id=self._target_patrol_region_id,
+                    interruption_position=exact_position,
+                    active_waypoint=active_waypoint,
+                    remaining_waypoints=tuple(self._patrol_route_waypoints),
+                )
+            context = MissionInterruptionContext(
+                source_type=InterruptedMissionType.PATROL,
+                source_state=state.value,
+                interruption_position=exact_position,
+                active_id=self._target_patrol_region_id,
+                active_waypoint=active_waypoint,
+                remaining_path=tuple(self._patrol_route_waypoints),
+                progress=progress,
+            )
+            self._patrol_route_waypoints.clear()
+            self._target_patrol_region_id = None
+        elif effective_state in {
+            FlightState.TRANSITING_TO_ROI,
+            FlightState.ROI_PATROL,
+        }:
+            roi_progress = self.logic.roi_patrol_planner.snapshot()
+            active_waypoint = (
+                self.logic.pending_mission_waypoint
+                if state is FlightState.TAKING_OFF
+                else self.logic.target
+            )
+            context = MissionInterruptionContext(
+                source_type=InterruptedMissionType.ROI,
+                source_state=state.value,
+                interruption_position=exact_position,
+                active_id=self._active_roi_id,
+                active_waypoint=active_waypoint,
+                remaining_path=roi_progress.remaining_path,
+                progress=roi_progress,
+            )
+            self.logic.roi_patrol_planner.clear()
+        else:
+            context = MissionInterruptionContext(
+                source_type=InterruptedMissionType.FLIGHT_STATE,
+                source_state=state.value,
+                interruption_position=exact_position,
+                active_id=None,
+                active_waypoint=self.logic.target,
+                remaining_path=(),
+            )
+        self._mission_interruption = context
+        self._mission_return_prepared = False
+
+    def _restore_mission_interruption(
+        self,
+        context: MissionInterruptionContext,
+    ) -> None:
+        if context.source_type is InterruptedMissionType.PATROL:
+            progress = context.progress
+            if isinstance(progress, PausedPatrolCoverage):
+                self._target_patrol_region_id = progress.region_id
+                self._patrol_route_waypoints = deque(progress.remaining_waypoints)
+                if self.logic.state is not FlightState.TAKING_OFF:
+                    self.logic.target = progress.active_waypoint
+        elif context.source_type is InterruptedMissionType.ROI:
+            progress = context.progress
+            if progress is not None:
+                self.logic.roi_patrol_planner.restore(progress)
+            self._active_roi_id = context.active_id
+            if (
+                context.active_waypoint is not None
+                and self.logic.state is not FlightState.TAKING_OFF
+            ):
+                self.logic.target = context.active_waypoint
+        self._mission_interruption = None
+        self._mission_return_prepared = False
+
+    def _discard_mission_interruption(self) -> None:
+        self._mission_interruption = None
+        self._mission_return_prepared = False
 
     def _update_markers(self) -> None:
         self.markers.update(
@@ -378,16 +651,57 @@ class AutonomousDrone(Supervisor):
                 FlightState.TRANSITING_TO_ROI,
                 FlightState.ROI_PATROL,
                 FlightState.PATROLLING,
+                FlightState.TARGET_ACQUISITION,
+                FlightState.TARGET_FOLLOW,
+                FlightState.TARGET_PURSUIT,
+                FlightState.TARGET_RETURN,
                 FlightState.FLYING_RANDOMLY,
                 FlightState.RETURNING_HOME,
             }:
-                self.camera_gimbal.set_pitch(self.HORIZONTAL_CAMERA_PITCH)
+                if state not in {
+                    FlightState.TARGET_ACQUISITION,
+                    FlightState.TARGET_FOLLOW,
+                    FlightState.TARGET_PURSUIT,
+                }:
+                    self.camera_gimbal.set_pitch(self.HORIZONTAL_CAMERA_PITCH)
             elif state in {FlightState.LANDING, FlightState.LANDED}:
                 self.camera_gimbal.set_pitch(self.camera_gimbal.maximum_pitch)
 
+        if state in {FlightState.TARGET_ACQUISITION, FlightState.TARGET_FOLLOW, FlightState.TARGET_PURSUIT}:
+            desired_pitch = (
+                self.logic.target_camera_pitch
+                if self.logic.target_camera_pitch is not None
+                else self.HORIZONTAL_CAMERA_PITCH
+            )
+            self.camera_gimbal.move_toward(
+                desired_pitch,
+                self._target_gimbal_max_rate_rad_s * self.time_step / 1000.0,
+            )
         self.camera_pitch_motor.setPosition(self.camera_gimbal.pitch)
 
     def _announce_changes(self) -> None:
+        diagnostic_state = self.logic.diagnostic_state
+        previous_diagnostic_state = self._announced_diagnostic_state
+        if diagnostic_state != previous_diagnostic_state:
+            logged_transitions = {
+                ("PATROL", "TARGET_ACQUISITION"),
+                ("TARGET_ACQUISITION", "TARGET_FOLLOW"),
+                ("TARGET_ACQUISITION", "PATROL"),
+                ("TARGET_FOLLOW", "TARGET_LOST_SEARCH"),
+                ("TARGET_LOST_SEARCH", "TARGET_FOLLOW"),
+                ("TARGET_LOST_SEARCH", "PATROL"),
+                ("TARGET_FOLLOW", "TARGET_PURSUIT"),
+                ("TARGET_PURSUIT", "TARGET_LOST_SEARCH"),
+                ("TARGET_LOST_SEARCH", "TARGET_PURSUIT"),
+                ("TARGET_LOST_SEARCH", "TARGET_RETURN"),
+                ("TARGET_PURSUIT", "TARGET_RETURN"),
+                ("TARGET_RETURN", "PATROL"),
+            }
+            transition = (previous_diagnostic_state, diagnostic_state)
+            if transition in logged_transitions:
+                print(f"Flight transition: {transition[0]} -> {transition[1]}")
+            self._announced_diagnostic_state = diagnostic_state
+
         if self.logic.state is not self._announced_state:
             print(f"State: {self.logic.state.value}")
             self._announced_state = self.logic.state
@@ -428,6 +742,9 @@ class AutonomousDrone(Supervisor):
             horizontal_speed_mps=self._horizontal_speed_mps,
             dt=dt,
             config=self._kinematic_config_for_state(),
+            desired_yaw=self.logic.target_yaw,
+            velocity_command=(self.logic.pursuit.velocity
+                              if self.logic.state is FlightState.TARGET_PURSUIT else None),
         )
         self.translation.setSFVec3f(list(step.position))
         self.rotation.setSFRotation([0.0, 0.0, 1.0, step.yaw])
@@ -442,6 +759,14 @@ class AutonomousDrone(Supervisor):
         )
 
     def _kinematic_config_for_state(self) -> KinematicFlightConfig:
+        if self.logic.state is FlightState.TARGET_RETURN:
+            return replace(self.SEARCH_KINEMATIC_FLIGHT_CONFIG, yaw_hold_horizontal_distance_m=0.0)
+        if self.logic.state in {
+            FlightState.TARGET_ACQUISITION,
+            FlightState.TARGET_FOLLOW,
+            FlightState.TARGET_PURSUIT,
+        }:
+            return self._target_tracking_flight_config
         if self.logic.state in {
             FlightState.FLYING_RANDOMLY,
             FlightState.ROI_PATROL,
@@ -528,18 +853,17 @@ class AutonomousDrone(Supervisor):
             state=self.logic.state.value,
             battery_percent=self._simulated_battery_percent,
             target_patrol_region_id=self._target_patrol_region_id,
-            aircraft_safety_rth_active=self._connection_loss_rth_active,
-            aircraft_safety_rth_reason=(
-                CONNECTION_LOSS_REASON
-                if self._connection_loss_rth_active
-                else None
-            ),
+            aircraft_safety_rth_active=self._safety_rth_active,
+            aircraft_safety_rth_reason=self._safety_rth_reason,
+            target_follow_diagnostics=self.logic.target_follow_diagnostics(),
         )
         self.realtime_client.publish_telemetry(telemetry)
 
     def _enforce_connection_loss_rth(self) -> None:
         if self.logic.state is FlightState.LANDED:
             self._connection_loss_rth_active = False
+            self._safety_rth_active = False
+            self._safety_rth_reason = None
             return
         if self._connection_loss_rth_active:
             return
@@ -553,6 +877,10 @@ class AutonomousDrone(Supervisor):
             FlightState.TRANSITING_TO_ROI,
             FlightState.ROI_PATROL,
             FlightState.PATROLLING,
+            FlightState.TARGET_ACQUISITION,
+            FlightState.TARGET_FOLLOW,
+            FlightState.TARGET_PURSUIT,
+            FlightState.TARGET_RETURN,
             FlightState.FLYING_RANDOMLY,
             FlightState.RETURNING_HOME,
             FlightState.LANDING,
@@ -560,6 +888,8 @@ class AutonomousDrone(Supervisor):
         if self.logic.state not in airborne_states:
             return
         self._connection_loss_rth_active = True
+        self._safety_rth_active = True
+        self._safety_rth_reason = CONNECTION_LOSS_REASON
         self._clear_patrol_progress()
         if self.logic.state not in {
             FlightState.RETURNING_HOME,
@@ -718,6 +1048,7 @@ class AutonomousDrone(Supervisor):
         return True
 
     def _clear_patrol_progress(self) -> None:
+        self._discard_mission_interruption()
         self._patrol_route_waypoints.clear()
         self._target_patrol_region_id = None
         self._paused_patrol_coverage = None
@@ -748,4 +1079,5 @@ class AutonomousDrone(Supervisor):
         return f"({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})"
 
 
-AutonomousDrone().run()
+if __name__ == "__main__":
+    AutonomousDrone().run()

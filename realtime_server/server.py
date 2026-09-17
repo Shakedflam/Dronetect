@@ -277,6 +277,7 @@ class RealtimeServer:
             "commandId": f"safety-rth-{uuid.uuid4()}",
             "command": CommandName.RETURN_HOME.value,
             "params": {},
+            "safetyReason": self.mission.safety_rth_reason or "safety_rth",
         }
         try:
             await drone.send_command(command)
@@ -348,6 +349,15 @@ class RealtimeServer:
                 f"count={len(detections['detections'])} "
                 f"tablet_connected={self.tablet is not None}"
             )
+        drone = self.drone
+        if drone is not None:
+            try:
+                # The SDK transport can carry validated server-to-aircraft
+                # messages as well as operator commands.
+                await drone.send_command(routed_detections)
+            except ConnectionClosed:
+                if self.drone is drone:
+                    self.drone = None
         await self._send_to_tablet(encode_message(routed_detections))
 
     async def _route_tablet_message(
@@ -359,6 +369,18 @@ class RealtimeServer:
             command = validate_command_message(parse_json_message(raw))
         except ProtocolError as exc:
             await tablet.send(encode_message(exc.to_message()))
+            return
+
+        if "safetyReason" in command:
+            await tablet.send(
+                encode_message(
+                    ProtocolError(
+                        "invalid_params",
+                        "safetyReason is reserved for backend safety commands.",
+                        command_id=command["commandId"],
+                    ).to_message()
+                )
+            )
             return
 
         command_name = CommandName(command["command"])

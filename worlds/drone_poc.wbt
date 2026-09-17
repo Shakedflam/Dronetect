@@ -6,7 +6,6 @@ EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/project
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/appearances/protos/SandyGround.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/road/protos/Road.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/appearances/protos/Pavement.proto"
-EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/buildings/protos/Windmill.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/buildings/protos/SmallManor.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/factory/manhole/protos/SquareManhole.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/factory/containers/protos/CardboardBox.proto"
@@ -61,24 +60,6 @@ Road {
   appearance Pavement {
     type "black stone"
   }
-}
-Windmill {
-  translation -43.8656 -19.8433 0
-  rotation -7.19228e-09 2.6842e-08 1 0.523601
-}
-Windmill {
-  translation -44.258 -27.3356 0
-  rotation -7.19228e-09 2.6842e-08 1 0.523601
-  name "windmill(1)"
-}
-Windmill {
-  translation -46.2448 30.573 0
-  rotation -7.19228e-09 2.6842e-08 1 0.523601
-  name "windmill(2)"
-}
-Windmill {
-  translation -38.75 23.4 0
-  name "windmill(3)"
 }
 SmallManor {
   translation -50.35 11.25 0
@@ -310,8 +291,8 @@ Mavic2Pro {
   supervisor TRUE
   cameraSlot [
     Camera {
-      width 960
-      height 540
+      width 1280
+      height 720
       near 0.2
     }
   ]

@@ -1,4 +1,5 @@
 import type { MissionState } from '../../types/missionState';
+import type { TargetFollowDiagnostics } from '../../types/drone';
 import type { Unsubscribe } from './unsubscribe';
 
 /**
@@ -22,6 +23,7 @@ export interface TelemetryMessage {
     batteryPercent: number;
     state: string;
     targetPatrolRegionId: string | null;
+    targetFollowDiagnostics?: TargetFollowDiagnostics | null;
   };
 }
 
@@ -127,6 +129,7 @@ function isTelemetryMessage(value: unknown): value is TelemetryMessage {
   if (typeof data !== 'object' || data === null) return false;
 
   const gps = data.gps as Record<string, unknown> | undefined;
+  const diagnostics = data.targetFollowDiagnostics;
   return (
     typeof gps === 'object' &&
     gps !== null &&
@@ -137,7 +140,48 @@ function isTelemetryMessage(value: unknown): value is TelemetryMessage {
     typeof data.speedMps === 'number' &&
     typeof data.batteryPercent === 'number' &&
     typeof data.state === 'string' &&
-    (data.targetPatrolRegionId === null || typeof data.targetPatrolRegionId === 'string')
+    (data.targetPatrolRegionId === null || typeof data.targetPatrolRegionId === 'string') &&
+    (diagnostics === undefined || diagnostics === null || isTargetFollowDiagnostics(diagnostics))
+  );
+}
+
+function isTargetFollowDiagnostics(value: unknown): value is TargetFollowDiagnostics {
+  if (typeof value !== 'object' || value === null) return false;
+  const diagnostics = value as Record<string, unknown>;
+  const error = diagnostics.imageCenterError as Record<string, unknown> | undefined;
+  const confirmation = diagnostics.confirmation as Record<string, unknown> | undefined;
+  const velocity = diagnostics.estimatedImageVelocity as Record<string, unknown> | undefined;
+  const pursuit = diagnostics.pursuit as Record<string, unknown> | undefined;
+  const validVector = (value: unknown) => {
+    if (typeof value !== 'object' || value === null) return false;
+    const vector = value as Record<string, unknown>;
+    return ['x', 'y', 'z'].every((axis) => typeof vector[axis] === 'number' && Number.isFinite(vector[axis]));
+  };
+  return (
+    (pursuit === undefined || (typeof pursuit === 'object' && pursuit !== null &&
+      typeof pursuit.state === 'string' &&
+      (pursuit.constraint === null || typeof pursuit.constraint === 'string') &&
+      validVector(pursuit.velocityCommand) && validVector(pursuit.estimatedMotion))) &&
+    typeof diagnostics.flightState === 'string' &&
+    (diagnostics.trackerId === null || typeof diagnostics.trackerId === 'string') &&
+    (diagnostics.detectionConfidence === null || typeof diagnostics.detectionConfidence === 'number') &&
+    typeof error === 'object' && error !== null &&
+    typeof error.x === 'number' && typeof error.y === 'number' &&
+    typeof confirmation === 'object' && confirmation !== null &&
+    typeof confirmation.hits === 'number' &&
+    typeof confirmation.requiredHits === 'number' &&
+    typeof confirmation.progress === 'number' &&
+    typeof velocity === 'object' && velocity !== null &&
+    typeof velocity.x === 'number' && typeof velocity.y === 'number' &&
+    typeof velocity.magnitude === 'number' &&
+    (velocity.directionDeg === null || typeof velocity.directionDeg === 'number') &&
+    typeof diagnostics.boundingBoxScale === 'number' &&
+    typeof diagnostics.boundingBoxAreaRatio === 'number' &&
+    typeof diagnostics.standoffError === 'number' &&
+    typeof diagnostics.targetLostDurationS === 'number' &&
+    typeof diagnostics.patrolInterrupted === 'boolean' &&
+    (diagnostics.patrolResumeState === null || typeof diagnostics.patrolResumeState === 'string') &&
+    typeof diagnostics.patrolResumeStatus === 'string'
   );
 }
 

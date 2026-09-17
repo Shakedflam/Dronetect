@@ -10,9 +10,11 @@ import time
 from typing import Any, Callable
 
 from realtime_server.protocol import (
+    MESSAGE_TYPE_DETECTIONS,
     encode_message,
     parse_json_message,
     validate_command_message,
+    validate_detection_message,
 )
 
 try:
@@ -38,6 +40,7 @@ class SimulatorRealtimeClient:
         self.url = url or os.getenv("DRONTECT_SIMULATOR_WS_URL", DEFAULT_SERVER_URL)
         self._outgoing: Queue[dict[str, Any]] = Queue(maxsize=10)
         self._commands: Queue[dict[str, Any]] = Queue()
+        self._detections: Queue[dict[str, Any]] = Queue(maxsize=2)
         self._stop = Event()
         self._thread: Thread | None = None
         self._clock = clock
@@ -95,6 +98,15 @@ class SimulatorRealtimeClient:
             except Empty:
                 return commands
 
+    def drain_detections(self) -> list[dict[str, Any]]:
+        """Return pending vision frames, dropping old backlog under load."""
+        detections: list[dict[str, Any]] = []
+        while True:
+            try:
+                detections.append(self._detections.get_nowait())
+            except Empty:
+                return detections
+
     def _run_loop(self) -> None:
         asyncio.run(self._connect_forever())
 
@@ -139,7 +151,17 @@ class SimulatorRealtimeClient:
     async def _receive_commands(self, websocket) -> None:
         async for raw in websocket:
             try:
-                command = validate_command_message(parse_json_message(str(raw)))
+                message = parse_json_message(str(raw))
+                if message.get("type") == MESSAGE_TYPE_DETECTIONS:
+                    detection = validate_detection_message(message)
+                    if self._detections.full():
+                        try:
+                            self._detections.get_nowait()
+                        except Empty:
+                            pass
+                    self._detections.put_nowait(detection)
+                    continue
+                command = validate_command_message(message)
             except Exception:
                 continue
             self._commands.put(command)

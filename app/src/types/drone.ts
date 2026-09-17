@@ -20,10 +20,40 @@ export interface TelemetryData {
   batteryPercent: number;
   /** Flight-state machine value from the realtime server, e.g. IDLE, FLYING_RANDOMLY, RETURNING_HOME. */
   state: string;
+  targetFollowDiagnostics: TargetFollowDiagnostics | null;
   /** Mock-only field with no realtime server equivalent; absent on live telemetry. */
   destinationName?: string;
   /** Mock-only field with no realtime server equivalent; absent on live telemetry. */
   etaSeconds?: number;
+}
+
+export interface TargetFollowDiagnostics {
+  pursuit?: {
+    state: string;
+    /** Local-world velocity command in m/s. */
+    velocityCommand: { x: number; y: number; z: number };
+    /** Image-motion control cue rotated to world axes; not measured target speed. */
+    estimatedMotion: { x: number; y: number; z: number };
+    constraint: string | null;
+  };
+  flightState: string;
+  trackerId: string | null;
+  detectionConfidence: number | null;
+  imageCenterError: { x: number; y: number };
+  confirmation: { hits: number; requiredHits: number; progress: number };
+  estimatedImageVelocity: {
+    x: number;
+    y: number;
+    magnitude: number;
+    directionDeg: number | null;
+  };
+  boundingBoxScale: number;
+  boundingBoxAreaRatio: number;
+  standoffError: number;
+  targetLostDurationS: number;
+  patrolInterrupted: boolean;
+  patrolResumeState: string | null;
+  patrolResumeStatus: string;
 }
 
 /**

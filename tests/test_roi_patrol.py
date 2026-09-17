@@ -31,6 +31,20 @@ def test_lawnmower_plan_cycles_forever():
     assert len(set(planner.waypoints)) == 4
 
 
+def test_roi_progress_snapshot_restores_exact_next_waypoint():
+    planner = LawnMowerRoiPatrolPlanner(RoiPatrolConfig(lane_count=3))
+    planner.reset((0.0, 0.0), 20.0, 10.0, (-20.0, 0.0, 10.0))
+    planner.next_waypoint()
+    progress = planner.snapshot()
+    expected = planner.next_waypoint()
+
+    restored = LawnMowerRoiPatrolPlanner(RoiPatrolConfig(lane_count=3))
+    restored.restore(progress)
+
+    assert restored.next_waypoint() == expected
+    assert progress.remaining_path[0] == expected
+
+
 def test_tiny_roi_degrades_safely_to_center_hold():
     planner = LawnMowerRoiPatrolPlanner(RoiPatrolConfig(boundary_margin_m=2.0))
 

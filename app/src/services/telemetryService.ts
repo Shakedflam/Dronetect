@@ -24,6 +24,7 @@ function createRealtimeServerTelemetryService(): TelemetryService {
           altitudeM: message.data.altitudeM,
           batteryPercent: message.data.batteryPercent,
           state: message.data.state,
+          targetFollowDiagnostics: message.data.targetFollowDiagnostics ?? null,
         });
       });
     },

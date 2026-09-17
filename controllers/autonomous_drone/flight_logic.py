@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import deque
 from enum import Enum
 import math
 import random
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 try:
+    from .pursuit import PursuitConfig, PursuitController
     from .roi_patrol import LawnMowerRoiPatrolPlanner, RoiPatrolPlan
 except ImportError:  # Webots loads this directory as top-level modules.
+    from pursuit import PursuitConfig, PursuitController
     from roi_patrol import LawnMowerRoiPatrolPlanner, RoiPatrolPlan
 
 
@@ -28,6 +31,10 @@ class FlightState(Enum):
     TRANSITING_TO_ROI = "TRANSITING_TO_ROI"
     ROI_PATROL = "ROI_PATROL"
     PATROLLING = "PATROLLING"
+    TARGET_ACQUISITION = "TARGET_ACQUISITION"
+    TARGET_FOLLOW = "TARGET_FOLLOW"
+    TARGET_PURSUIT = "TARGET_PURSUIT"
+    TARGET_RETURN = "TARGET_RETURN"
     FLYING_RANDOMLY = "FLYING_RANDOMLY"
     RETURNING_HOME = "RETURNING_HOME"
     LANDING = "LANDING"
@@ -47,6 +54,32 @@ class FlightConfig:
     landing_rate: float = 0.35
     landed_height: float = 0.12
     roi_arrival_tolerance: float = 10.0
+    target_min_confidence: float = 0.43
+    target_confirmation_hits: int = 2
+    # Must exceed the expected interval between vision frames so a tentative
+    # track can receive its confirming hit while the aircraft remains stopped.
+    target_acquisition_timeout_s: float = 2.5
+    target_lost_search_timeout_s: float = 2.0
+    target_yaw_gain: float = 0.35
+    target_yaw_prediction_horizon_s: float = 0.5
+    target_yaw_deadband_ratio: float = 0.04
+    target_velocity_smoothing: float = 0.35
+    target_max_yaw_rate_rad_s: float = math.radians(18.0)
+    target_gimbal_pitch_gain: float = 0.25
+    target_center_tolerance_x: float = 0.08
+    target_center_tolerance_y: float = 0.12
+    target_search_yaw_rate_rad_s: float = math.radians(10.0)
+    target_follow_step_m: float = 6.0
+    target_lateral_motion_gain_m: float = 4.0
+    target_vertical_gain_m: float = 3.0
+    target_standoff_box_area_ratio: float = 0.025
+    target_standoff_deadband_ratio: float = 0.005
+    target_approach_growth_ratio_per_s: float = 0.04
+    target_collision_avoidance_step_m: float = 3.0
+    # A takeoff interrupted by a confirmed target may begin cautious pursuit
+    # above the hard floor instead of climbing to the normal cruise altitude.
+    target_takeoff_pursuit_clearance_m: float = 2.0
+    target_takeoff_pursuit_ascent_mps: float = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +110,7 @@ class FlightLogic:
         rng: RandomSource | None = None,
         roi_patrol_planner: RoiPatrolPlan | None = None,
         patrol_waypoint_provider: Callable[[Position, bool], Position] | None = None,
+        pursuit_config: PursuitConfig | None = None,
     ) -> None:
         self.config = config or FlightConfig()
         self.rng = rng or random.Random()
@@ -92,6 +126,35 @@ class FlightLogic:
         self._queued_state: FlightState | None = None
         self._roi_center: tuple[float, float] | None = None
         self._roi_radius = 0.0
+        self._elapsed_time = 0.0
+        self._patrol_resume_target: Position | None = None
+        self._patrol_resume_checkpoint: Position | None = None
+        self._target_resume_state: FlightState | None = None
+        self._tracked_target_id: str | None = None
+        self._followed_track_ids: set[str] = set()
+        self._target_hits = 0
+        self._target_confidence: float | None = None
+        self._target_last_seen_at = 0.0
+        self._target_last_center = (0.5, 0.5)
+        self._target_velocity = (0.0, 0.0)
+        self._target_area_ratio = 0.0
+        self._target_previous_area_ratio: float | None = None
+        self._target_area_growth_per_s = 0.0
+        self._target_visible = False
+        self._target_confirmed = False
+        self._target_yaw: float | None = None
+        self._target_camera_pitch: float | None = None
+        self._target_last_yaw = 0.0
+        self.pursuit = PursuitController(pursuit_config or PursuitConfig())
+        self._stable_since: float | None = None
+        self._pursuit_usable = False
+        self._pursuit_started = False
+        self._pursuit_growth = 0.0
+        self._pursuit_sample: tuple[float, float, float] | None = None
+        self._pursuit_image_motion = (0.0, 0.0)
+        self._takeoff_pursuit_vertical_velocity = 0.0
+        self._target_return_waypoints: deque[Position] = deque()
+        self._target_return_ready = True
 
     def initialize_home(self, position: Position) -> None:
         """Capture home once from the first valid simulated GPS reading."""
@@ -107,6 +170,8 @@ class FlightLogic:
         """Advance state and target selection by one simulation timestep."""
         if self.home is None:
             raise RuntimeError("Home position must be initialized before update().")
+        dt = max(0.0, dt)
+        self._elapsed_time += dt
 
         if self.state is FlightState.IDLE:
             self.target = self.home
@@ -145,6 +210,83 @@ class FlightLogic:
             if self.target is None or self._has_reached(position, self.target):
                 self.target = self._next_patrol_waypoint(position, completed=True)
 
+        elif self.state is FlightState.TARGET_ACQUISITION:
+            self.target = self._target_acquisition_target(position)
+            if (
+                self._target_resume_state is FlightState.TAKING_OFF
+                and self._target_confirmed
+                and self._target_is_centered()
+                and self._has_reached(position, self.target)
+            ):
+                self._start_target_follow(position, self._target_last_yaw)
+                return
+            if self._elapsed_time - self._target_last_seen_at > self.config.target_acquisition_timeout_s:
+                self.complete_target_follow()
+
+        elif self.state in {FlightState.TARGET_FOLLOW, FlightState.TARGET_PURSUIT}:
+            if (
+                self._target_visible
+                and self._elapsed_time - self._target_last_seen_at
+                > self.config.target_acquisition_timeout_s
+            ):
+                self._target_visible = False
+            if self._target_visible and self._elapsed_time - self._target_last_seen_at > self.pursuit.config.observation_timeout_s:
+                self._target_visible = False
+                self._pursuit_usable = False
+            if self._target_visible:
+                self.target = self._target_tracking_hold_target(position)
+                if (self.state is FlightState.TARGET_FOLLOW and self._stable_since is not None
+                        and self._pursuit_usable
+                        and self._pursuit_altitude_is_safe(position)
+                        and self._elapsed_time - self._stable_since >= self.pursuit.config.stable_duration_s):
+                    self.state = FlightState.TARGET_PURSUIT
+                    self._pursuit_started = True
+                if self.state is FlightState.TARGET_PURSUIT and self._pursuit_usable:
+                    self.pursuit.update(
+                        position=position, home=self.home, yaw=self._target_last_yaw,
+                        image_velocity=self._pursuit_image_motion, area=self._target_area_ratio,
+                        growth=self._pursuit_growth,
+                        desired_area=self.config.target_standoff_box_area_ratio,
+                        area_deadzone=self.config.target_standoff_deadband_ratio,
+                        collision_growth=self.config.target_approach_growth_ratio_per_s,
+                        collision_detected=(self._target_area_growth_per_s >= self.config.target_approach_growth_ratio_per_s),
+                        collision_side=(-1.0 if self._target_last_center[0] >= 0.5 else 1.0)
+                            * self.config.target_collision_avoidance_step_m,
+                        lateral_gain=self.config.target_lateral_motion_gain_m, dt=dt,
+                    )
+                    self._continue_takeoff_during_pursuit(position, dt)
+                else:
+                    self.pursuit.stop()
+                    self._takeoff_pursuit_vertical_velocity = 0.0
+            else:
+                self.pursuit.stop()
+                self._takeoff_pursuit_vertical_velocity = 0.0
+                self._stable_since = None
+                self._pursuit_sample = None
+                self._pursuit_growth = 0.0
+                self._pursuit_image_motion = (0.0, 0.0)
+                self.target = self._target_tracking_hold_target(position)
+                lost_for = self._elapsed_time - self._target_last_seen_at
+                predicted_x = self._target_last_center[0] + self._target_velocity[0] * lost_for
+                image_error = predicted_x - 0.5
+                search_direction = math.copysign(1.0, image_error) if abs(image_error) > 1e-6 else 1.0
+                self._target_yaw = normalized_angle(
+                    (self._target_yaw or self._target_last_yaw)
+                    - self._target_velocity[0] * self.config.target_yaw_gain * dt
+                    - search_direction * self.config.target_search_yaw_rate_rad_s * dt
+                )
+                if lost_for > self.config.target_lost_search_timeout_s:
+                    self.complete_target_follow()
+
+        elif self.state is FlightState.TARGET_RETURN:
+            if not self._target_return_ready:
+                self.target = position
+            elif self.target is not None and math.dist(position, self.target) <= 1e-6:
+                if self._target_return_waypoints:
+                    self.target = self._target_return_waypoints.popleft()
+                else:
+                    self._resume_patrol_after_target()
+
         elif self.state is FlightState.FLYING_RANDOMLY:
             if self.target is None:
                 self.target = self.choose_random_waypoint()
@@ -182,6 +324,10 @@ class FlightLogic:
             FlightState.TRANSITING_TO_ROI,
             FlightState.ROI_PATROL,
             FlightState.PATROLLING,
+            FlightState.TARGET_ACQUISITION,
+            FlightState.TARGET_FOLLOW,
+            FlightState.TARGET_PURSUIT,
+            FlightState.TARGET_RETURN,
             FlightState.FLYING_RANDOMLY,
         }:
             return False
@@ -192,6 +338,7 @@ class FlightLogic:
         self._roi_center = None
         self._roi_radius = 0.0
         self.roi_patrol_planner.clear()
+        self._clear_target_tracking()
         self.target = self._home_at_cruise_altitude()
         return True
 
@@ -220,6 +367,7 @@ class FlightLogic:
         self._roi_center = None
         self._roi_radius = 0.0
         self.roi_patrol_planner.clear()
+        self._clear_target_tracking()
         waypoint = self._next_patrol_waypoint(position, completed=False)
         safe_altitude = self.config.takeoff_altitude - self.config.vertical_tolerance
         if position[2] < safe_altitude:
@@ -246,6 +394,7 @@ class FlightLogic:
         self._roi_center = center
         self._roi_radius = radius_m
         self.roi_patrol_planner.clear()
+        self._clear_target_tracking()
         roi_target = (center[0], center[1], self.config.takeoff_altitude)
         safe_altitude = self.config.takeoff_altitude - self.config.vertical_tolerance
         if position[2] < safe_altitude:
@@ -279,6 +428,7 @@ class FlightLogic:
         self._roi_center = None
         self._roi_radius = 0.0
         self.roi_patrol_planner.clear()
+        self._clear_target_tracking()
         waypoint = self.choose_random_waypoint()
         safe_altitude = (
             self.config.takeoff_altitude - self.config.vertical_tolerance
@@ -307,6 +457,518 @@ class FlightLogic:
             if previous is None or not self._has_reached(candidate, previous):
                 return candidate
         return candidate
+
+    @property
+    def target_yaw(self) -> float | None:
+        """Absolute yaw guidance used while acquiring or following a target."""
+        return self._target_yaw
+
+    @property
+    def tracked_target_id(self) -> str | None:
+        return self._tracked_target_id
+
+    @property
+    def target_camera_pitch(self) -> float | None:
+        """Absolute gimbal pitch guidance for vertical image centering."""
+        return self._target_camera_pitch
+
+    @property
+    def patrol_resume_checkpoint(self) -> Position | None:
+        """Exact patrol position captured before any target movement begins."""
+        return self._patrol_resume_checkpoint
+
+    @property
+    def pending_mission_state(self) -> FlightState | None:
+        return self._queued_state
+
+    @property
+    def pending_mission_waypoint(self) -> Position | None:
+        return self._queued_waypoint
+
+    @property
+    def target_return_ready(self) -> bool:
+        return self._target_return_ready
+
+    @property
+    def diagnostic_state(self) -> str:
+        """Externally visible autonomous state without changing flight behavior."""
+        if self.state in {FlightState.TARGET_FOLLOW, FlightState.TARGET_PURSUIT} and not self._target_visible:
+            return "TARGET_LOST_SEARCH"
+        if self.state is FlightState.PATROLLING:
+            return "PATROL"
+        return self.state.value
+
+    def target_follow_diagnostics(self) -> dict[str, Any]:
+        """Return a JSON-compatible snapshot for simulator validation."""
+        required_hits = max(1, self.config.target_confirmation_hits)
+        confirmation_hits = min(self._target_hits, required_hits)
+        velocity_x, velocity_y = self._target_velocity
+        velocity_magnitude = math.hypot(velocity_x, velocity_y)
+        velocity_direction_deg = (
+            math.degrees(math.atan2(velocity_y, velocity_x))
+            if velocity_magnitude > 1e-9
+            else None
+        )
+        box_scale = math.sqrt(max(0.0, self._target_area_ratio))
+        standoff_error = (
+            self.config.target_standoff_box_area_ratio - self._target_area_ratio
+        )
+        target_lost_duration_s = (
+            max(0.0, self._elapsed_time - self._target_last_seen_at)
+            if self._tracked_target_id is not None and not self._target_visible
+            else 0.0
+        )
+        resume_state = self._target_resume_state
+        resume_state_name = (
+            "PATROL"
+            if resume_state is FlightState.PATROLLING
+            else resume_state.value if resume_state is not None else None
+        )
+        patrol_interrupted = resume_state is not None
+        return {
+            "pursuit": {
+                "state": self.state.value,
+                "velocityCommand": dict(zip(("x", "y", "z"), self.pursuit.velocity)),
+                "estimatedMotion": dict(zip(("x", "y", "z"), self.pursuit.motion)),
+                "constraint": self.pursuit.constraint,
+            },
+            "flightState": self.diagnostic_state,
+            "trackerId": self._tracked_target_id,
+            "detectionConfidence": self._target_confidence,
+            "imageCenterError": {
+                "x": self._target_last_center[0] - 0.5,
+                "y": self._target_last_center[1] - 0.5,
+            },
+            "confirmation": {
+                "hits": confirmation_hits,
+                "requiredHits": required_hits,
+                "progress": confirmation_hits / required_hits,
+            },
+            "estimatedImageVelocity": {
+                "x": velocity_x,
+                "y": velocity_y,
+                "magnitude": velocity_magnitude,
+                "directionDeg": velocity_direction_deg,
+            },
+            "boundingBoxScale": box_scale,
+            "boundingBoxAreaRatio": self._target_area_ratio,
+            "standoffError": standoff_error,
+            "targetLostDurationS": target_lost_duration_s,
+            "patrolInterrupted": patrol_interrupted,
+            "patrolResumeState": resume_state_name,
+            "patrolResumeStatus": ("returning_to_checkpoint" if self.state is FlightState.TARGET_RETURN
+                                   else "interrupted" if patrol_interrupted else "inactive"),
+        }
+
+    def observe_detections(
+        self,
+        detections: list[dict[str, Any]],
+        *,
+        frame_width: int,
+        frame_height: int,
+        position: Position,
+        yaw: float,
+        camera_pitch: float = 0.0,
+        allow_landing_intercept: bool = False,
+    ) -> None:
+        """Apply one tracker frame to patrol interception/follow guidance.
+
+        Takeoff and mission navigation may be interrupted, but their exact
+        state and target remain independent from target-follow guidance.
+        """
+        if frame_width <= 0 or frame_height <= 0:
+            return
+        interruptible_states = {
+            FlightState.TAKING_OFF,
+            FlightState.TRANSITING_TO_ROI,
+            FlightState.ROI_PATROL,
+            FlightState.PATROLLING,
+            FlightState.TARGET_ACQUISITION,
+            FlightState.TARGET_FOLLOW,
+            FlightState.TARGET_PURSUIT,
+        }
+        if allow_landing_intercept:
+            interruptible_states.add(FlightState.LANDING)
+        if self.state not in interruptible_states:
+            return
+
+        selected = self._select_target_detection(detections)
+        if selected is None:
+            self.pursuit.stop()
+            self._stable_since = None
+            self._pursuit_usable = False
+            self._pursuit_sample = None
+            self._pursuit_growth = 0.0
+            self._pursuit_image_motion = (0.0, 0.0)
+            if self.state is FlightState.TARGET_ACQUISITION:
+                self._target_visible = False
+            elif self.state in {FlightState.TARGET_FOLLOW, FlightState.TARGET_PURSUIT}:
+                self._target_visible = False
+                self.target = position
+            self._target_camera_pitch = None
+            return
+
+        track_id = str(selected["trackId"])
+        interception_start_states = {
+            FlightState.TAKING_OFF,
+            FlightState.TRANSITING_TO_ROI,
+            FlightState.ROI_PATROL,
+            FlightState.PATROLLING,
+        }
+        if allow_landing_intercept:
+            interception_start_states.add(FlightState.LANDING)
+        if self.state in interception_start_states:
+            if track_id in self._followed_track_ids:
+                return
+            self._target_resume_state = self.state
+            self._patrol_resume_target = self.target
+            self._patrol_resume_checkpoint = (
+                float(position[0]), float(position[1]), float(position[2])
+            )
+            self.state = FlightState.TARGET_ACQUISITION
+            self.target = self._target_acquisition_target(position)
+            self._tracked_target_id = track_id
+            self._target_hits = 0
+            self._target_velocity = (0.0, 0.0)
+        elif track_id != self._tracked_target_id:
+            self.pursuit.stop()
+            self._stable_since = None
+            self._pursuit_sample = None
+            self._pursuit_growth = 0.0
+            self._pursuit_image_motion = (0.0, 0.0)
+            if self.state is FlightState.TARGET_PURSUIT:
+                self.state = FlightState.TARGET_FOLLOW
+            # A tentative false positive or a lost track must not prevent a
+            # newly confirmed target from taking over the same hover/search
+            # session. This is a handoff, not a duplicate follow session.
+            self._tracked_target_id = track_id
+            self._target_velocity = (0.0, 0.0)
+            if self.state is FlightState.TARGET_ACQUISITION:
+                self._target_hits = 0
+                self._target_confirmed = False
+            elif selected.get("trackState") != "confirmed":
+                self.state = FlightState.TARGET_ACQUISITION
+                self.target = self._target_acquisition_target(position)
+                self._target_hits = 0
+                self._target_confirmed = False
+            else:
+                self._followed_track_ids.add(track_id)
+
+        box = selected["box"]
+        center = (
+            (float(box[0]) + float(box[2])) / (2.0 * frame_width),
+            (float(box[1]) + float(box[3])) / (2.0 * frame_height),
+        )
+        velocity = selected.get("velocityPxPerSec", {})
+        measured_velocity = (
+            float(velocity.get("x", 0.0)) / frame_width,
+            float(velocity.get("y", 0.0)) / frame_height,
+        )
+        smoothing = max(0.0, min(1.0, self.config.target_velocity_smoothing))
+        normalized_velocity = (
+            self._target_velocity[0] * (1.0 - smoothing)
+            + measured_velocity[0] * smoothing,
+            self._target_velocity[1] * (1.0 - smoothing)
+            + measured_velocity[1] * smoothing,
+        )
+        area_ratio = max(0.0, float(box[2]) - float(box[0])) * max(
+            0.0, float(box[3]) - float(box[1])
+        ) / (frame_width * frame_height)
+        is_visible = selected.get("trackState") != "lost"
+        self._pursuit_usable = is_visible and selected.get("trackState") == "confirmed"
+        stable = self._pursuit_usable and abs(center[0] - 0.5) <= self.config.target_center_tolerance_x and abs(center[1] - 0.5) <= self.config.target_center_tolerance_y
+        if not stable:
+            self._stable_since = None
+        elif self.state is FlightState.TARGET_FOLLOW and self._stable_since is None:
+            self._stable_since = self._elapsed_time
+        if not self._pursuit_usable:
+            self.pursuit.stop()
+            self._pursuit_sample = None
+            self._pursuit_growth = 0.0
+            self._pursuit_image_motion = (0.0, 0.0)
+            if self.state is FlightState.TARGET_PURSUIT:
+                self.target = position
+                is_visible = False
+        else:
+            if self._pursuit_sample is not None:
+                sample_time, sample_area, sample_yaw = self._pursuit_sample
+                sample_dt = self._elapsed_time - sample_time
+                if sample_dt > 1e-6:
+                    alpha = 1 - math.exp(-sample_dt / self.pursuit.config.smoothing_time_s)
+                    self._pursuit_growth += alpha * ((area_ratio - sample_area) / sample_dt - self._pursuit_growth)
+                    # Near image center, remove optical flow due to own yaw.
+                    # This preserves lateral following while yaw holds a target
+                    # centered. It does not recover absolute metric velocity.
+                    yaw_rate = normalized_angle(yaw - sample_yaw) / sample_dt
+                    motion_x = measured_velocity[0] - yaw_rate / self.pursuit.config.horizontal_fov_rad
+                    self._pursuit_image_motion = (
+                        self._pursuit_image_motion[0] + alpha * (motion_x - self._pursuit_image_motion[0]),
+                        0.0,
+                    )
+            self._pursuit_sample = (self._elapsed_time, area_ratio, yaw)
+        elapsed_since_seen = max(1e-6, self._elapsed_time - self._target_last_seen_at)
+        if is_visible and self._target_previous_area_ratio is not None:
+            self._target_area_growth_per_s = (
+                area_ratio - self._target_previous_area_ratio
+            ) / elapsed_since_seen
+        if is_visible:
+            self._target_previous_area_ratio = area_ratio
+            self._target_last_seen_at = self._elapsed_time
+        self._target_area_ratio = area_ratio
+        self._target_confidence = float(selected.get("confidence", 0.0))
+        self._target_last_center = center
+        self._target_velocity = normalized_velocity
+        self._target_visible = is_visible
+        self._target_last_yaw = yaw
+        predicted_error = max(
+            -0.5,
+            min(
+                0.5,
+                center[0]
+                - 0.5
+                + normalized_velocity[0]
+                * self.config.target_yaw_prediction_horizon_s,
+            ),
+        )
+        if abs(predicted_error) <= self.config.target_yaw_deadband_ratio:
+            predicted_error = 0.0
+        self._target_yaw = normalized_angle(
+            yaw - predicted_error * self.config.target_yaw_gain
+        )
+        # Image Y grows downward and positive gimbal pitch tilts downward.
+        self._target_camera_pitch = (
+            camera_pitch + (center[1] - 0.5) * self.config.target_gimbal_pitch_gain
+            if is_visible
+            else None
+        )
+
+        if not self._target_visible:
+            return
+        self._target_hits += 1
+        confirmed = (
+            selected.get("trackState") == "confirmed"
+            and self._target_hits >= max(1, self.config.target_confirmation_hits)
+        )
+        self._target_confirmed = self._target_confirmed or confirmed
+        if self.state is FlightState.TARGET_ACQUISITION and confirmed:
+            if self._target_resume_state is FlightState.TAKING_OFF:
+                # Start visual follow as soon as the tracker confirms. The
+                # takeoff climb continues vertically until pursuit altitude is safe.
+                self._start_target_follow(position, yaw)
+            else:
+                self._start_target_follow(position, yaw)
+
+    def would_intercept(
+        self,
+        detections: list[dict[str, Any]],
+        *,
+        allow_landing_intercept: bool = False,
+    ) -> bool:
+        """Return whether a tracker frame can interrupt normal patrol."""
+        states = {
+            FlightState.TAKING_OFF,
+            FlightState.TRANSITING_TO_ROI,
+            FlightState.ROI_PATROL,
+            FlightState.PATROLLING,
+        }
+        if allow_landing_intercept:
+            states.add(FlightState.LANDING)
+        return self.state in states and self._select_target_detection(detections) is not None
+
+    def _select_target_detection(
+        self,
+        detections: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        candidates = [
+            detection
+            for detection in detections
+            if isinstance(detection, dict)
+            and float(detection.get("confidence", 0.0)) >= self.config.target_min_confidence
+            and isinstance(detection.get("trackId"), str)
+            and isinstance(detection.get("box"), (list, tuple))
+            and len(detection["box"]) == 4
+        ]
+        if self._tracked_target_id is not None:
+            active = next(
+                (item for item in candidates if item["trackId"] == self._tracked_target_id),
+                None,
+            )
+            alternatives = [
+                item
+                for item in candidates
+                if item["trackId"] != self._tracked_target_id
+                and item["trackId"] not in self._followed_track_ids
+                and item.get("trackState") != "lost"
+            ]
+            confirmed_alternatives = [
+                item for item in alternatives if item.get("trackState") == "confirmed"
+            ]
+            if active is None or active.get("trackState") == "lost":
+                pool = confirmed_alternatives or alternatives
+                return max(
+                    pool,
+                    key=lambda item: float(item["confidence"]),
+                    default=active,
+                )
+            if (
+                self.state is FlightState.TARGET_ACQUISITION
+                and active.get("trackState") != "confirmed"
+                and confirmed_alternatives
+            ):
+                return max(
+                    confirmed_alternatives,
+                    key=lambda item: float(item["confidence"]),
+                )
+            return active
+        candidates = [
+            item
+            for item in candidates
+            if item["trackId"] not in self._followed_track_ids
+            and item.get("trackState") != "lost"
+        ]
+        return max(candidates, key=lambda item: float(item["confidence"]), default=None)
+
+    def _target_acquisition_target(self, position: Position) -> Position:
+        if (
+            self._target_resume_state is FlightState.TAKING_OFF
+            and self._patrol_resume_target is not None
+        ):
+            return (position[0], position[1], self._patrol_resume_target[2])
+        return position
+
+    def _target_tracking_hold_target(self, position: Position) -> Position:
+        """Hover horizontally and preserve the pursuit altitude floor."""
+        if self._target_resume_state is FlightState.TAKING_OFF:
+            return (
+                position[0],
+                position[1],
+                max(position[2], self._takeoff_pursuit_altitude()),
+            )
+        if self._target_resume_state is FlightState.LANDING:
+            assert self.home is not None
+            floor = self.home[2] + self.pursuit.config.minimum_height_m
+            return (position[0], position[1], max(position[2], floor))
+        return position
+
+    def _pursuit_altitude_is_safe(self, position: Position) -> bool:
+        assert self.home is not None
+        if self._target_resume_state is FlightState.TAKING_OFF:
+            floor = self.home[2] + self.pursuit.config.minimum_height_m
+            return position[2] >= floor + self.config.vertical_tolerance
+        return position[2] >= self.home[2] + self.pursuit.config.minimum_height_m
+
+    def _takeoff_pursuit_altitude(self) -> float:
+        """Return a safe launch height without requiring normal cruise height."""
+        assert self.home is not None
+        floor = self.home[2] + self.pursuit.config.minimum_height_m
+        minimum = floor + self.config.vertical_tolerance
+        useful_clearance = floor + self.config.target_takeoff_pursuit_clearance_m
+        return max(minimum, min(self.config.takeoff_altitude, useful_clearance))
+
+    def _continue_takeoff_during_pursuit(self, position: Position, dt: float) -> None:
+        """Combine height-limited horizontal pursuit with a bounded ascent."""
+        if self._target_resume_state is not FlightState.TAKING_OFF or dt <= 0.0:
+            self._takeoff_pursuit_vertical_velocity = 0.0
+            return
+        if self.pursuit.constraint == "collision":
+            self._takeoff_pursuit_vertical_velocity = 0.0
+            return
+        altitude_error = self._takeoff_pursuit_altitude() - position[2]
+        desired = min(
+            self.config.target_takeoff_pursuit_ascent_mps,
+            max(0.0, altitude_error / dt),
+        )
+        max_delta = self.pursuit.config.acceleration_mps2 * dt
+        delta = desired - self._takeoff_pursuit_vertical_velocity
+        self._takeoff_pursuit_vertical_velocity += max(
+            -max_delta,
+            min(max_delta, delta),
+        )
+        velocity = self.pursuit.velocity
+        self.pursuit.velocity = (
+            velocity[0],
+            velocity[1],
+            self._takeoff_pursuit_vertical_velocity,
+        )
+
+    def _target_is_centered(self) -> bool:
+        return (
+            abs(self._target_last_center[0] - 0.5)
+            <= self.config.target_center_tolerance_x
+            and abs(self._target_last_center[1] - 0.5)
+            <= self.config.target_center_tolerance_y
+        )
+
+    def _start_target_follow(self, position: Position, yaw: float) -> None:
+        self.state = FlightState.TARGET_FOLLOW
+        if self._tracked_target_id is not None:
+            self._followed_track_ids.add(self._tracked_target_id)
+        self.target = position
+        self._stable_since = self._elapsed_time if self._target_is_centered() else None
+
+    def complete_target_follow(self) -> None:
+        """Stop pursuit, return to the interruption point, then restore navigation."""
+        self.pursuit.stop()
+        self._target_yaw = None
+        self._target_camera_pitch = None
+        if self._pursuit_started and self._patrol_resume_checkpoint is not None:
+            self.state = FlightState.TARGET_RETURN
+            self.target = self._patrol_resume_checkpoint
+            self._target_return_waypoints.clear()
+            self._target_return_ready = True
+        else:
+            self._resume_patrol_after_target()
+
+    def set_target_return_route(self, waypoints: list[Position]) -> None:
+        """Install a safety-routed path whose last point is the checkpoint."""
+        if self.state is not FlightState.TARGET_RETURN:
+            raise RuntimeError("Target return route requires TARGET_RETURN state")
+        if not waypoints:
+            raise ValueError("Target return route must contain at least one waypoint")
+        self.target = waypoints[0]
+        self._target_return_waypoints = deque(waypoints[1:])
+        self._target_return_ready = True
+
+    def hold_target_return(self, position: Position) -> None:
+        """Hover while a safe mission-resume route is unavailable."""
+        if self.state is not FlightState.TARGET_RETURN:
+            raise RuntimeError("Target return hold requires TARGET_RETURN state")
+        self.pursuit.stop()
+        self.target = position
+        self._target_return_waypoints.clear()
+        self._target_return_ready = False
+
+    def _resume_patrol_after_target(self) -> None:
+        resume_target = self._patrol_resume_target
+        self.state = self._target_resume_state or FlightState.PATROLLING
+        self.target = resume_target
+        self._clear_target_tracking(preserve_followed_ids=True)
+
+    def _clear_target_tracking(self, *, preserve_followed_ids: bool = False) -> None:
+        self.pursuit.stop()
+        self._stable_since = None
+        self._pursuit_usable = False
+        self._pursuit_started = False
+        self._pursuit_growth = 0.0
+        self._pursuit_sample = None
+        self._pursuit_image_motion = (0.0, 0.0)
+        self._takeoff_pursuit_vertical_velocity = 0.0
+        self._target_return_waypoints.clear()
+        self._target_return_ready = True
+        self._patrol_resume_target = None
+        self._patrol_resume_checkpoint = None
+        self._target_resume_state = None
+        self._tracked_target_id = None
+        self._target_hits = 0
+        self._target_confidence = None
+        self._target_visible = False
+        self._target_confirmed = False
+        self._target_yaw = None
+        self._target_camera_pitch = None
+        self._target_previous_area_ratio = None
+        self._target_area_growth_per_s = 0.0
+        if not preserve_followed_ids:
+            self._followed_track_ids.clear()
 
     def _home_at_cruise_altitude(self) -> Position:
         assert self.home is not None
@@ -432,6 +1094,8 @@ def advance_kinematic_flight(
     horizontal_speed_mps: float,
     dt: float,
     config: KinematicFlightConfig | None = None,
+    desired_yaw: float | None = None,
+    velocity_command: Position | None = None,
 ) -> KinematicFlightStep:
     """Advance a DJI-like high-level flight model toward a target pose.
 
@@ -449,12 +1113,29 @@ def advance_kinematic_flight(
     horizontal_distance = math.hypot(dx, dy)
 
     should_hold_horizontal = horizontal_distance <= cfg.yaw_hold_horizontal_distance_m
-    desired_yaw = yaw if should_hold_horizontal else math.atan2(dy, dx)
+    navigation_yaw = yaw if should_hold_horizontal else math.atan2(dy, dx)
+    commanded_yaw = navigation_yaw if desired_yaw is None else desired_yaw
     next_yaw = move_angle_toward(
         yaw,
-        desired_yaw,
+        commanded_yaw,
         cfg.max_yaw_rate_rad_s * dt,
     )
+
+    if velocity_command is not None:
+        # Pursuit has already smoothed and constrained the vector. Integrating
+        # it directly avoids waypoint dead zones and a second speed ramp.
+        next_position: Position = (
+            position[0] + velocity_command[0] * dt,
+            position[1] + velocity_command[1] * dt,
+            position[2] + velocity_command[2] * dt,
+        )
+        return KinematicFlightStep(
+            position=next_position,
+            yaw=next_yaw,
+            horizontal_speed_mps=math.hypot(velocity_command[0], velocity_command[1]),
+            speed_mps=math.sqrt(sum(v * v for v in velocity_command)),
+            vertical_speed_mps=velocity_command[2],
+        )
 
     desired_horizontal_speed = (
         0.0

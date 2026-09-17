@@ -104,12 +104,23 @@ def validate_command_message(message: dict[str, Any]) -> dict[str, Any]:
             raise ProtocolError(exc.code, exc.message, command_id=command_id, details=exc.details) from exc
         raise
 
-    return {
+    validated = {
         "type": MESSAGE_TYPE_COMMAND,
         "commandId": command_id,
         "command": command,
         "params": params,
     }
+    safety_reason = message.get("safetyReason")
+    if safety_reason is not None:
+        if command != CommandName.RETURN_HOME or not isinstance(safety_reason, str) or not safety_reason:
+            raise ProtocolError(
+                "validation_error",
+                "safetyReason is valid only for return_home and must be a non-empty string.",
+                command_id=command_id,
+                details={"field": "safetyReason"},
+            )
+        validated["safetyReason"] = safety_reason
+    return validated
 
 
 def mission_state_message(state: MissionState) -> dict[str, str]:
@@ -312,6 +323,11 @@ def validate_telemetry_message(message: dict[str, Any]) -> dict[str, Any]:
             "aircraftSafetyRthActive must be a boolean.",
             details={"field": "aircraftSafetyRthActive"},
         )
+    target_follow_diagnostics = data.get("targetFollowDiagnostics")
+    if target_follow_diagnostics is not None:
+        target_follow_diagnostics = _validate_target_follow_diagnostics(
+            target_follow_diagnostics
+        )
 
     return {
         "type": MESSAGE_TYPE_TELEMETRY,
@@ -334,7 +350,76 @@ def validate_telemetry_message(message: dict[str, Any]) -> dict[str, Any]:
             "aircraftSafetyRthReason": _optional_string(
                 data, "aircraftSafetyRthReason"
             ),
+            "targetFollowDiagnostics": target_follow_diagnostics,
         },
+    }
+
+
+def _validate_target_follow_diagnostics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ProtocolError(
+            "validation_error",
+            "targetFollowDiagnostics must be an object or null.",
+            details={"field": "targetFollowDiagnostics"},
+        )
+    image_error = _required_object(value, "imageCenterError")
+    confirmation = _required_object(value, "confirmation")
+    velocity = _required_object(value, "estimatedImageVelocity")
+    direction = velocity.get("directionDeg")
+    confidence = value.get("detectionConfidence")
+    if confidence is not None:
+        confidence = _required_number(value, "detectionConfidence")
+    if direction is not None:
+        direction = _required_number(velocity, "directionDeg")
+    for key in ("patrolInterrupted",):
+        if not isinstance(value.get(key), bool):
+            raise ProtocolError(
+                "validation_error",
+                f"{key} must be a boolean.",
+                details={"field": key},
+            )
+    pursuit = value.get("pursuit")
+    extra = {}
+    if pursuit is not None:
+        pursuit = _required_object(value, "pursuit")
+        vectors = {}
+        for key in ("velocityCommand", "estimatedMotion"):
+            vector = _required_object(pursuit, key)
+            vectors[key] = {axis: _required_number(vector, axis) for axis in ("x", "y", "z")}
+            if not all(math.isfinite(number) for number in vectors[key].values()):
+                raise ProtocolError("validation_error", "Pursuit vectors must be finite.")
+        extra["pursuit"] = {
+            "state": _required_string(pursuit, "state"),
+            "constraint": _optional_string(pursuit, "constraint"),
+            **vectors,
+        }
+    return {
+        **extra,
+        "flightState": _required_string(value, "flightState"),
+        "trackerId": _optional_string(value, "trackerId"),
+        "detectionConfidence": confidence,
+        "imageCenterError": {
+            "x": _required_number(image_error, "x"),
+            "y": _required_number(image_error, "y"),
+        },
+        "confirmation": {
+            "hits": _required_int(confirmation, "hits"),
+            "requiredHits": _required_int(confirmation, "requiredHits"),
+            "progress": _required_number(confirmation, "progress"),
+        },
+        "estimatedImageVelocity": {
+            "x": _required_number(velocity, "x"),
+            "y": _required_number(velocity, "y"),
+            "magnitude": _required_number(velocity, "magnitude"),
+            "directionDeg": direction,
+        },
+        "boundingBoxScale": _required_number(value, "boundingBoxScale"),
+        "boundingBoxAreaRatio": _required_number(value, "boundingBoxAreaRatio"),
+        "standoffError": _required_number(value, "standoffError"),
+        "targetLostDurationS": _required_number(value, "targetLostDurationS"),
+        "patrolInterrupted": value["patrolInterrupted"],
+        "patrolResumeState": _optional_string(value, "patrolResumeState"),
+        "patrolResumeStatus": _required_string(value, "patrolResumeStatus"),
     }
 
 
