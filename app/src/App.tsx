@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react';
 import { ActionBar } from './components/actionBar/ActionBar';
 import { ResizableSplitView } from './components/layout/ResizableSplitView';
 import { DroneHUD } from './components/hud/DroneHUD';
 import { MapView } from './components/map/MapView';
 import { DroneVideo } from './components/video/DroneVideo';
 import { useDetection } from './hooks/useDetection';
+import { useTelemetry } from './hooks/useTelemetry';
+import { useTargetSelection } from './hooks/useTargetSelection';
 import styles from './App.module.css';
 
 /**
@@ -15,15 +16,10 @@ import styles from './App.module.css';
  */
 function App() {
   const targets = useDetection();
-  const [selectedTargetId, setSelectedTargetId] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (selectedTargetId === null) return;
-    const stillPresent = targets.some((target) => target.id === selectedTargetId);
-    if (!stillPresent) {
-      setSelectedTargetId(null);
-    }
-  }, [targets, selectedTargetId]);
+  const telemetry = useTelemetry();
+  const decision = telemetry?.targetFollowDiagnostics?.targetDecision;
+  const [selectedTargetId, setSelectedTargetId] = useTargetSelection(
+    targets.map((target) => target.id), decision?.trackId ?? null);
 
   return (
     <div className={styles.app}>
@@ -44,6 +40,8 @@ function App() {
       />
       <ActionBar
         selectedTargetId={selectedTargetId}
+        canApprove={Boolean(decision?.canApprove && decision.trackId === selectedTargetId && targets.some((target) => target.id === selectedTargetId))}
+        canReject={Boolean(selectedTargetId && decision?.rejectableTrackIds.includes(selectedTargetId))}
         onClearSelection={() => setSelectedTargetId(null)}
       />
     </div>

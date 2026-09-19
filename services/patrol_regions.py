@@ -7,11 +7,19 @@ from enum import StrEnum
 import math
 import time
 
+from config.shared_config import shared_config
 from services.gps import DEFAULT_HOME, Wgs84Point, destination_point
 
 
-HOME_RADIUS_M = 2500.0
-PATROL_BAND_COUNT = 4
+# Sourced from config/shared.json (see config/shared_config.py): the frontend
+# generates its own copy of this same direction x band grid (for map display
+# and click-to-rank/click-to-restrict) from that same file, and only region
+# IDs (e.g. "SW-1") cross the wire -- never geometry. A mismatch here would
+# make the frontend's polygons/priority badges point at different real-world
+# places than the regions this store (and the geofence derived from it)
+# actually flies against.
+HOME_RADIUS_M = shared_config.home_radius_m
+PATROL_BAND_COUNT = shared_config.patrol_band_count
 SECTOR_HALF_WIDTH_DEG = 22.5
 
 PATROL_DIRECTIONS: tuple[tuple[float, str], ...] = (

@@ -5,9 +5,7 @@ import type { Roi } from '../types/roi';
  * Abstraction over the high-level commands the operator can issue.
  * returnToHome/newMission/cameraTiltUp/cameraTiltDown are real realtime
  * server commands, sent over the shared `realtimeServerConnection`.
- * followTarget/ignoreTarget/engageTarget have no realtime server equivalent
- * (the protocol only supports the four commands above) and remain mocked
- * until the backend grows support for them.
+ * Approve/Reject act on a specific acquisition candidate. Engage remains mocked.
  */
 export interface DroneCommandService {
   startPatrol(): Promise<void>;
@@ -17,8 +15,8 @@ export interface DroneCommandService {
   newMission(): Promise<void>;
   cameraTiltUp(): Promise<void>;
   cameraTiltDown(): Promise<void>;
-  followTarget(targetId: string): Promise<void>;
-  ignoreTarget(targetId: string): Promise<void>;
+  approveTarget(targetId: string): Promise<void>;
+  rejectTarget(targetId: string): Promise<void>;
   engageTarget(targetId: string): Promise<void>;
 }
 
@@ -42,8 +40,8 @@ function createDroneCommandService(): DroneCommandService {
     newMission: () => realtimeServerConnection.sendCommand('new_mission'),
     cameraTiltUp: () => realtimeServerConnection.sendCommand('camera_tilt_up'),
     cameraTiltDown: () => realtimeServerConnection.sendCommand('camera_tilt_down'),
-    followTarget: (targetId) => mockCommand(`FOLLOW target=${targetId}`),
-    ignoreTarget: (targetId) => mockCommand(`IGNORE target=${targetId}`),
+    approveTarget: (trackId) => realtimeServerConnection.sendCommand('approve_target', { trackId }),
+    rejectTarget: (trackId) => realtimeServerConnection.sendCommand('reject_target', { trackId }),
     engageTarget: (targetId) => mockCommand(`ENGAGE target=${targetId}`),
   };
 }

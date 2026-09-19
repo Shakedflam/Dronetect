@@ -8,7 +8,7 @@ import math
 class PursuitConfig:
     stable_duration_s: float = 0.8
     observation_timeout_s: float = 1.5
-    max_speed_mps: float = 4.0
+    max_speed_mps: float = 5.0
     acceleration_mps2: float = 2.0
     smoothing_time_s: float = 0.35
     motion_deadzone: float = 0.015
@@ -46,6 +46,7 @@ class PursuitController:
         desired_area: float, area_deadzone: float, collision_growth: float,
         collision_side: float, lateral_gain: float, dt: float,
         collision_detected: bool = False,
+        vertical: float = 0.0, vertical_gain: float = 0.0, vertical_deadzone: float = 0.0,
     ) -> tuple[float, float, float]:
         if dt <= 0:
             return self.velocity
@@ -62,30 +63,38 @@ class PursuitController:
         self.motion = (forward_x * radial + right_x * lateral,
                        forward_y * radial + right_y * lateral, 0.0)
         error = desired_area - area
-        standoff = 0.0 if abs(error) <= area_deadzone else error / max(desired_area, 1e-6)
+        # Normalized error alone saturates near 1.0 regardless of top speed;
+        # scale by max_speed_mps so a far target is approached at cruise
+        # speed and the commanded speed tapers to zero at the standoff point.
+        standoff = 0.0 if abs(error) <= area_deadzone else (error / max(desired_area, 1e-6)) * cfg.max_speed_mps
         forward = standoff + radial
         collision = collision_detected or growth >= collision_growth
         if collision:
             forward = min(-0.5, forward)
             lateral = collision_side
             self.constraint = "collision"
+        # Image Y grows downward: a target above center (vertical < 0) means
+        # climb; below center (vertical > 0) means descend toward it.
+        desired_vertical = (
+            0.0 if abs(vertical) <= vertical_deadzone
+            else max(-cfg.max_speed_mps, min(cfg.max_speed_mps, -vertical * vertical_gain))
+        )
         desired = (forward_x * forward + right_x * lateral,
-                   forward_y * forward + right_y * lateral, 0.0)
+                   forward_y * forward + right_y * lateral, desired_vertical)
         speed = math.hypot(*desired[:2])
         limit = cfg.max_speed_mps
         # Height clearance bounds speed by braking distance, v²/(2a).
         clearance = max(0.0, position[2] - home[2] - cfg.minimum_height_m)
         limit = min(limit, math.sqrt(2 * cfg.acceleration_mps2 * clearance))
         if speed > limit:
-            desired = tuple(v * limit / speed for v in desired)
+            desired = (desired[0] * limit / speed, desired[1] * limit / speed, desired[2])
         alpha = 1 - math.exp(-dt / cfg.smoothing_time_s)
         delta = tuple((wanted - old) * alpha for wanted, old in zip(desired, self.velocity))
         magnitude = math.sqrt(sum(v * v for v in delta))
         scale = min(1.0, cfg.acceleration_mps2 * dt / max(magnitude, 1e-12))
         velocity = tuple(old + d * scale for old, d in zip(self.velocity, delta))
-        velocity = (velocity[0], velocity[1], 0.0)
-        if speed == 0 and math.hypot(*velocity[:2]) < 0.02:
-            velocity = (0.0, 0.0, 0.0)
+        if speed == 0 and desired_vertical == 0.0 and math.hypot(*velocity[:2]) < 0.02:
+            velocity = (0.0, 0.0, velocity[2])
         if collision:
             # Safety can brake immediately; smoothing must not retain approach.
             toward = velocity[0] * forward_x + velocity[1] * forward_y

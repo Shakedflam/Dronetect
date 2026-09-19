@@ -27,7 +27,8 @@ WAYPOINT = (100.0, 50.0, 15.0)
 
 def make_logic(**options):
     logic = FlightLogic(
-        FlightConfig(takeoff_altitude=15, target_standoff_box_area_ratio=0.01,
+        # Isolate pursuit dynamics from the acquisition gate tested separately.
+        FlightConfig(target_observation_s=0.0, takeoff_altitude=15, target_standoff_box_area_ratio=0.01,
                      target_standoff_deadband_ratio=0.001,
                      target_lost_search_timeout_s=2.0),
         pursuit_config=PursuitConfig(stable_duration_s=0.3, **options),
@@ -56,17 +57,17 @@ def enter(logic):
     assert logic.state is FlightState.TARGET_PURSUIT
 
 
-def test_entry_requires_stable_confirmed_centered_history():
+def test_entry_starts_immediately_once_confirmed_and_altitude_safe_even_off_center():
     logic = make_logic()
-    for _ in range(10):
-        observe(logic, cx=750)
-        logic.update(POSITION, 0.1)
-    assert logic.state is FlightState.TARGET_FOLLOW
-    assert logic.target == POSITION
-    observe(logic)
+    observe(logic, cx=750)
     logic.update(POSITION, 0.1)
-    assert logic.state is FlightState.TARGET_FOLLOW
-    enter(logic)
+    assert logic.state is FlightState.TARGET_ACQUISITION
+    observe(logic, cx=750)
+    logic.update(POSITION, 0.1)
+    # Two confirmed hits plus altitude safety are enough: approach begins
+    # immediately even though the target is still off-center -- yaw keeps
+    # correcting toward it in parallel rather than gating movement.
+    assert logic.state is FlightState.TARGET_PURSUIT
     assert logic.patrol_resume_checkpoint == POSITION
 
 
@@ -78,6 +79,20 @@ def test_away_and_approaching_target_motion(size, sign):
     logic.update(POSITION, 0.1)
     assert sign * logic.pursuit.velocity[0] > 0
     assert sign * logic.pursuit.motion[0] > 0
+
+
+def test_far_target_ramps_toward_cruise_speed_not_capped_near_one_mps():
+    logic = make_logic()
+    # A box much smaller than the standoff size means the target is still
+    # far away; held steady (no growth cue) so only the standoff term drives
+    # forward speed. Confirm, then let the acceleration-limited ramp settle.
+    for _ in range(10):
+        observe(logic, size=10)
+        logic.update(POSITION, 0.1)
+    assert logic.state is FlightState.TARGET_PURSUIT
+    # The commanded approach speed should ramp well past the ~1 m/s the
+    # unscaled normalized error used to saturate at, toward cruise speed.
+    assert logic.pursuit.velocity[0] > 1.0
 
 
 def test_lateral_motion_and_stationary_hover():
@@ -159,6 +174,98 @@ def test_raw_collision_cue_overrides_even_when_smoothed_growth_is_small():
     assert logic.pursuit.velocity[0] <= 0
 
 
+def test_fresh_detection_with_rapid_closing_triggers_avoidance_immediately():
+    logic = make_logic()
+    observe(logic, size=60)
+    logic.update(POSITION, 0.1)
+    assert logic.state is FlightState.TARGET_ACQUISITION
+    observe(logic, size=500)
+    logic.update(POSITION, 0.1)
+    # Collision avoidance is reachable within the first two ticks after a
+    # fresh detection -- it does not require an established pursuit history.
+    assert logic.state is FlightState.TARGET_PURSUIT
+    assert logic.pursuit.constraint == "collision"
+    assert logic.pursuit.velocity[0] <= 0
+
+
+def test_brief_target_loss_resumes_pursuit_immediately_without_reacquisition():
+    logic = make_logic()
+    enter(logic)
+    observe(logic, size=80, vx=200)
+    logic.update(POSITION, 0.1)
+    assert math.hypot(*logic.pursuit.velocity[:2]) > 0
+    # The target drops out of the tracker entirely for about half a second.
+    logic.observe_detections([], frame_width=1000, frame_height=1000, position=POSITION, yaw=0)
+    logic.update(POSITION, 0.5)
+    assert logic.pursuit.velocity == (0, 0, 0)
+    assert logic.diagnostic_state == "TARGET_LOST_SEARCH"
+    assert logic.state is FlightState.TARGET_PURSUIT
+    # It reappears well inside the lost-search timeout: pursuit resumes on
+    # this very tick, with no new confirmation hits or observation window.
+    observe(logic, size=80)
+    logic.update(POSITION, 0.1)
+    assert logic.state is FlightState.TARGET_PURSUIT
+    assert logic.pursuit.velocity[0] > 0
+
+
+def test_vertical_image_error_drives_altitude_correction_toward_target():
+    logic = make_logic()
+    enter(logic)
+    assert logic.pursuit.velocity == (0, 0, 0)
+    # Target appears well above image center (frame height 1000, box centered
+    # at y=300 -> normalized 0.3, past the centering deadzone) -> climb.
+    logic.observe_detections([{
+        "trackId": "one", "trackState": "confirmed", "confidence": 0.9,
+        "box": [450, 250, 550, 350], "velocityPxPerSec": {"x": 0, "y": 0},
+    }], frame_width=1000, frame_height=1000, position=POSITION, yaw=0.0)
+    logic.update(POSITION, 0.1)
+    full_command = 0.2 * logic.config.target_vertical_gain_m
+    assert 0.0 < logic.pursuit.velocity[2] < full_command
+    climb_velocity = logic.pursuit.velocity[2]
+
+    # Target appears well below image center -> descend toward it instead.
+    logic = make_logic()
+    enter(logic)
+    logic.observe_detections([{
+        "trackId": "one", "trackState": "confirmed", "confidence": 0.9,
+        "box": [450, 650, 550, 750], "velocityPxPerSec": {"x": 0, "y": 0},
+    }], frame_width=1000, frame_height=1000, position=POSITION, yaw=0.0)
+    logic.update(POSITION, 0.1)
+    assert logic.pursuit.velocity[2] < 0.0
+    assert logic.pursuit.velocity[2] == pytest.approx(-climb_velocity)
+
+
+def test_small_vertical_offset_still_triggers_altitude_correction():
+    logic = make_logic()
+    enter(logic)
+    # Offset (0.06) is inside the old, wider centering tolerance (0.12) but
+    # outside the tighter deadzone now used for vertical tracking (matching
+    # yaw's 0.04) -- altitude correction should still engage, so the drone
+    # can keep pace with a target passing close overhead.
+    logic.observe_detections([{
+        "trackId": "one", "trackState": "confirmed", "confidence": 0.9,
+        "box": [450, 390, 550, 490], "velocityPxPerSec": {"x": 0, "y": 0},
+    }], frame_width=1000, frame_height=1000, position=POSITION, yaw=0.0)
+    logic.update(POSITION, 0.1)
+    assert logic.pursuit.velocity[2] > 0.0
+
+
+def test_gimbal_tilt_sustains_climb_once_image_residual_is_corrected():
+    logic = make_logic()
+    enter(logic)
+    # The gimbal has already tilted up substantially to track the target
+    # (a large actual camera tilt fed back this tick), even though the
+    # image-frame residual is now ~0 (the gimbal has caught up to it).
+    # Relying on the residual alone would drop the climb command back to
+    # ~0 here; the sustained gimbal tilt must keep it climbing.
+    logic.observe_detections([{
+        "trackId": "one", "trackState": "confirmed", "confidence": 0.9,
+        "box": [450, 480, 550, 520], "velocityPxPerSec": {"x": 0, "y": 0},
+    }], frame_width=1000, frame_height=1000, position=POSITION, yaw=0.0)
+    logic.update(POSITION, 0.1, camera_pitch=-0.3)
+    assert logic.pursuit.velocity[2] > 0.0
+
+
 def test_geofence_and_height_override_translation():
     logic = make_logic(geofence_radius_m=30)
     enter(logic)
@@ -208,13 +315,14 @@ def test_permanent_loss_or_completion_returns_to_exact_checkpoint_then_waypoint(
     assert logic.target == WAYPOINT
 
 
-def test_new_tracker_requires_stability_again_and_rth_cancels_pursuit():
+def test_new_tracker_resumes_pursuit_immediately_and_rth_cancels_it():
     logic = make_logic()
     enter(logic)
     observe(logic, track_id="two")
     logic.update(POSITION, 0.1)
-    assert logic.state is FlightState.TARGET_FOLLOW
-    assert logic.pursuit.velocity == (0, 0, 0)
+    # A track-id handoff no longer requires re-achieving stability before
+    # resuming pursuit -- approach begins again as soon as it's usable/safe.
+    assert logic.state is FlightState.TARGET_PURSUIT
     assert logic.request_return_home()
     assert logic.state is FlightState.RETURNING_HOME
     assert logic.patrol_resume_checkpoint is None
@@ -462,3 +570,66 @@ def test_target_return_from_no_fly_egresses_then_restores_enforcement(simulator)
             left[:2], right[:2], simulator.patrol_regions.regions
         )
     assert simulator._mission_interruption is context
+
+
+@pytest.mark.parametrize("roi", [False, True])
+def test_manual_reject_command_restores_controller_mission_context(simulator, roi):
+    simulator.realtime_client = Mock()
+    simulator.camera_gimbal = Mock(pitch=0.5)
+    simulator.logic.request_patrol(POSITION)
+    simulator._target_patrol_region_id = "NE-2"
+    simulator._patrol_route_waypoints = deque([(110, 55, 15), (120, 60, 15)])
+    if roi:
+        simulator.logic.request_roi(POSITION, (10, 20), 25)
+        simulator.logic.state = FlightState.ROI_PATROL
+        simulator.logic.roi_patrol_planner.reset((10, 20), 25, 15, POSITION)
+        simulator.logic.target = simulator.logic.roi_patrol_planner.next_waypoint()
+        simulator._active_roi_id = "roi:keep"
+    simulator._capture_mission_interruption(POSITION)
+    context = simulator._mission_interruption
+    observe(simulator.logic)
+    simulator.realtime_client.drain_commands.return_value = [{
+        "command": "reject_target", "params": {"trackId": "one"},
+    }]
+    simulator._handle_realtime_commands(POSITION)
+    simulator._coordinate_mission_resume(POSITION, simulator.logic.state)
+    assert simulator._mission_interruption is None
+    assert simulator.logic.state.value == context.source_state
+    assert simulator.logic.target == context.active_waypoint
+    if roi:
+        assert simulator._active_roi_id == "roi:keep"
+        assert simulator.logic.roi_patrol_planner.snapshot().remaining_path == context.remaining_path
+    else:
+        assert simulator._target_patrol_region_id == "NE-2"
+        assert tuple(simulator._patrol_route_waypoints) == context.remaining_path
+
+
+def test_ignored_location_cannot_capture_controller_checkpoint(simulator):
+    simulator.camera_gimbal = Mock(pitch=0.5)
+    simulator.realtime_client = Mock()
+    simulator.logic.request_patrol(POSITION)
+    item = {"trackId": "one", "trackState": "confirmed", "confidence": 0.9,
+            "box": [450, 450, 550, 550], "lastSeenTimestamp": 0}
+    message = {"frameWidth": 1000, "frameHeight": 1000, "detections": [item]}
+    simulator.realtime_client.drain_detections.return_value = [message]
+    simulator._handle_vision_detections(POSITION, 0)
+    simulator.logic.reject_target("one")
+    simulator._coordinate_mission_resume(POSITION, FlightState.TARGET_ACQUISITION)
+    item["trackId"] = "replacement"
+    simulator._handle_vision_detections(POSITION, 0)
+    assert simulator._mission_interruption is None
+    assert simulator.logic.state is FlightState.PATROLLING
+
+
+@pytest.mark.parametrize("command", ["approve_target", "reject_target"])
+def test_controller_safety_return_blocks_target_commands(simulator, command):
+    simulator.logic.request_patrol(POSITION)
+    observe(simulator.logic)
+    simulator._safety_rth_active = True
+    simulator.realtime_client = Mock()
+    simulator.realtime_client.drain_commands.return_value = [{
+        "command": command, "params": {"trackId": "one"},
+    }]
+    simulator._handle_realtime_commands(POSITION)
+    assert simulator.logic.state is FlightState.TARGET_ACQUISITION
+    assert not simulator.logic.target_decisions.ignored

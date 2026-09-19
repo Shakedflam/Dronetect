@@ -28,6 +28,13 @@ export interface TelemetryData {
 }
 
 export interface TargetFollowDiagnostics {
+  targetDecision?: {
+    trackId: string | null;
+    canApprove: boolean;
+    canReject: boolean;
+    rejectableTrackIds: string[];
+    lastRejectionReason: string | null;
+  };
   pursuit?: {
     state: string;
     /** Local-world velocity command in m/s. */
@@ -88,4 +95,4 @@ export interface DetectedTarget {
 }
 
 /** Commands the operator can issue for a specific detected target. */
-export type TargetCommand = 'follow' | 'ignore' | 'engage';
+export type TargetCommand = 'approve' | 'reject' | 'engage';

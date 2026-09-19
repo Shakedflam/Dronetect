@@ -138,6 +138,18 @@ class AutonomousDrone(Supervisor):
                 target_confirmation_hits=int(
                     os.getenv("DRONTECT_TARGET_CONFIRMATION_HITS", "2")
                 ),
+                target_observation_s=float(os.getenv("DRONTECT_TARGET_OBSERVATION_S", "1.7")),
+                target_observation_min_samples=int(os.getenv("DRONTECT_TARGET_OBSERVATION_MIN_SAMPLES", "3")),
+                target_stationary_center_ratio=float(os.getenv("DRONTECT_TARGET_STATIONARY_CENTER_RATIO", "0.02")),
+                target_stationary_observer_m=float(os.getenv("DRONTECT_TARGET_STATIONARY_OBSERVER_M", "0.25")),
+                target_stationary_angle_rad=math.radians(float(os.getenv("DRONTECT_TARGET_STATIONARY_ANGLE_DEG", "2"))),
+                target_low_confidence=float(os.getenv("DRONTECT_TARGET_LOW_CONFIDENCE", "0.60")),
+                target_confidence_range=float(os.getenv("DRONTECT_TARGET_CONFIDENCE_RANGE", "0.20")),
+                target_ignore_radius_m=float(os.getenv("DRONTECT_TARGET_IGNORE_RADIUS_M", "5")),
+                target_ignore_timeout_s=float(os.getenv("DRONTECT_TARGET_IGNORE_TIMEOUT_S", "6")),
+                target_reject_grace_s=float(os.getenv("DRONTECT_TARGET_REJECT_GRACE_S", "1.5")),
+                target_projection_min_angle_rad=math.radians(float(os.getenv("DRONTECT_TARGET_PROJECTION_MIN_ANGLE_DEG", "5"))),
+                target_projection_max_range_m=float(os.getenv("DRONTECT_TARGET_PROJECTION_MAX_RANGE_M", "250")),
                 target_acquisition_timeout_s=float(
                     os.getenv("DRONTECT_TARGET_ACQUISITION_TIMEOUT_S", "2.5")
                 ),
@@ -191,7 +203,7 @@ class AutonomousDrone(Supervisor):
             pursuit_config=PursuitConfig(
                 stable_duration_s=float(os.getenv("DRONTECT_PURSUIT_STABLE_SECONDS", "0.8")),
                 observation_timeout_s=float(os.getenv("DRONTECT_PURSUIT_OBSERVATION_TIMEOUT_SECONDS", "1.5")),
-                max_speed_mps=float(os.getenv("DRONTECT_PURSUIT_MAX_SPEED_MPS", "4.0")),
+                max_speed_mps=float(os.getenv("DRONTECT_PURSUIT_MAX_SPEED_MPS", "5.0")),
                 acceleration_mps2=float(os.getenv("DRONTECT_PURSUIT_ACCELERATION_MPS2", "2.0")),
                 geofence_radius_m=max(region.outer_radius_m for region in self.patrol_regions.regions),
             ),
@@ -295,7 +307,7 @@ class AutonomousDrone(Supervisor):
             self._handle_realtime_commands(position)
             state_before_detection = self.logic.state
             self._handle_vision_detections(position, yaw)
-            self.logic.update(position, dt)
+            self.logic.update(position, dt, yaw=yaw, camera_pitch=self.camera_gimbal.pitch)
             self._coordinate_mission_resume(position, state_before_detection)
             position, yaw, speed_mps, vertical_speed_mps = self._apply_kinematic_flight(
                 position,
@@ -360,6 +372,8 @@ class AutonomousDrone(Supervisor):
                 CommandName.SET_ROI,
                 CommandName.CLEAR_ROI,
                 CommandName.NEW_MISSION,
+                CommandName.APPROVE_TARGET,
+                CommandName.REJECT_TARGET,
             }:
                 print(
                     f"Realtime command {command.value} ignored during "
@@ -456,6 +470,10 @@ class AutonomousDrone(Supervisor):
                 pitch = self.camera_gimbal.tilt_up()
                 self.camera_pitch_motor.setPosition(pitch)
                 print(f"Realtime command camera_tilt_up: {pitch:.2f}")
+            elif command == CommandName.APPROVE_TARGET:
+                self.logic.approve_target(message["params"]["trackId"], position)
+            elif command == CommandName.REJECT_TARGET:
+                self.logic.reject_target(message["params"]["trackId"], position)
             elif command == CommandName.CAMERA_TILT_DOWN:
                 pitch = self.camera_gimbal.tilt_down()
                 self.camera_pitch_motor.setPosition(pitch)
@@ -471,6 +489,8 @@ class AutonomousDrone(Supervisor):
             if self.logic.would_intercept(
                 detections,
                 allow_landing_intercept=allow_landing_intercept,
+                frame_width=message["frameWidth"], frame_height=message["frameHeight"],
+                position=position, yaw=yaw, camera_pitch=self.camera_gimbal.pitch,
             ):
                 self._capture_mission_interruption(position)
             self.logic.observe_detections(

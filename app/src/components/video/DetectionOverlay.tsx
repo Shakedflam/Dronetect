@@ -50,7 +50,7 @@ function formatTrackNumber(trackId: string): string {
  * (contain/cover) and digital zoom, so they stay aligned as the element is
  * resized or the operator zooms in. Tapping a box selects it
  * — with multiple targets in frame, the operator has to pick one before
- * Follow/Ignore/Engage become available.
+ * Approve/Reject/Engage become available.
  */
 export function DetectionOverlay({ targets, selectedTargetId, onSelectTarget, transform }: DetectionOverlayProps) {
   const smoothedTargets = useSmoothedTargets(targets);

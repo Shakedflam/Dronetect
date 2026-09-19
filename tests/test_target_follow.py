@@ -15,6 +15,9 @@ FRAME_HEIGHT = 1000
 
 def make_patrolling_logic(**overrides) -> FlightLogic:
     config_values = {
+        # These tests isolate follow behavior; the default observation window
+        # and fresh-match evidence are exercised in test_target_decisions.py.
+        "target_observation_s": 0.0,
         "takeoff_altitude": 15.0,
         "target_min_confidence": 0.50,
         "target_confirmation_hits": 2,
@@ -85,6 +88,7 @@ def test_single_frame_detection_hovers_immediately_then_resumes_patrol():
 def test_takeoff_detection_holds_horizontal_position_and_keeps_climbing():
     logic = FlightLogic(
         config=FlightConfig(
+            target_observation_s=0.0,
             takeoff_altitude=15.0,
             target_min_confidence=0.50,
             target_confirmation_hits=2,
@@ -117,6 +121,7 @@ def test_takeoff_detection_holds_horizontal_position_and_keeps_climbing():
 def test_takeoff_starts_horizontal_pursuit_before_normal_cruise_height():
     logic = FlightLogic(
         config=FlightConfig(
+            target_observation_s=0.0,
             takeoff_altitude=15.0,
             target_min_confidence=0.50,
             target_confirmation_hits=2,
@@ -145,22 +150,12 @@ def test_takeoff_starts_horizontal_pursuit_before_normal_cruise_height():
         yaw=0.0,
     )
 
+    # Two confirmed hits start follow immediately; pursuit-altitude safety is
+    # already satisfied mid-climb, so pursuit begins on the very next tick --
+    # no additional stability wait, even though the target is off-center.
     assert logic.state is FlightState.TARGET_FOLLOW
 
     logic.update(climbing, 0.1)
-
-    assert logic.state is FlightState.TARGET_FOLLOW
-    assert logic.target == climbing
-
-    logic.observe_detections(
-        [detection(state="confirmed", box=centered_box)],
-        frame_width=FRAME_WIDTH,
-        frame_height=FRAME_HEIGHT,
-        position=climbing,
-        yaw=0.0,
-    )
-
-    logic.update(climbing, logic.pursuit.config.stable_duration_s)
 
     assert logic.state is FlightState.TARGET_PURSUIT
     assert logic.pursuit.velocity[0] > 0.0
@@ -170,6 +165,7 @@ def test_takeoff_starts_horizontal_pursuit_before_normal_cruise_height():
 def test_takeoff_pursuit_climbs_and_speed_is_limited_near_height_floor():
     logic = FlightLogic(
         config=FlightConfig(
+            target_observation_s=0.0,
             takeoff_altitude=15.0,
             target_min_confidence=0.50,
             target_confirmation_hits=2,
@@ -371,7 +367,9 @@ def test_target_loss_hovers_and_reacquisition_continues_following():
     observe(logic, detection(state="confirmed"))
     logic.update(POSITION, 0.1)
 
-    assert logic.state is FlightState.TARGET_FOLLOW
+    # Reappearing resumes immediately -- usable/safe conditions are already
+    # met, so pursuit may already be promoted on this very tick.
+    assert logic.state in {FlightState.TARGET_FOLLOW, FlightState.TARGET_PURSUIT}
     assert logic.target == POSITION
 
 
@@ -439,7 +437,9 @@ def test_patrol_checkpoint_remains_unchanged_throughout_follow_mode():
     observe(logic, detection(state="confirmed"), yaw=0.4)
     logic.update((14.0, 24.0, 15.0), 0.2)
 
-    assert logic.state is FlightState.TARGET_FOLLOW
+    # Approach may already have been promoted to pursuit; the checkpoint is
+    # what this test actually cares about.
+    assert logic.state in {FlightState.TARGET_FOLLOW, FlightState.TARGET_PURSUIT}
     assert checkpoint == POSITION
     assert logic.patrol_resume_checkpoint == checkpoint
 

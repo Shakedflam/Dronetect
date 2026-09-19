@@ -380,6 +380,21 @@ def _validate_target_follow_diagnostics(value: Any) -> dict[str, Any]:
             )
     pursuit = value.get("pursuit")
     extra = {}
+    decision = value.get("targetDecision")
+    if decision is not None:
+        decision = _required_object(value, "targetDecision")
+        for key in ("canApprove", "canReject"):
+            if not isinstance(decision.get(key), bool):
+                raise ProtocolError("validation_error", f"targetDecision.{key} must be a boolean.")
+        ids = decision.get("rejectableTrackIds")
+        if not isinstance(ids, list) or not all(isinstance(item, str) and item for item in ids):
+            raise ProtocolError("validation_error", "rejectableTrackIds must be a list of nonempty strings.")
+        extra["targetDecision"] = {
+            "trackId": _optional_string(decision, "trackId"),
+            "canApprove": decision["canApprove"], "canReject": decision["canReject"],
+            "rejectableTrackIds": ids,
+            "lastRejectionReason": _optional_string(decision, "lastRejectionReason"),
+        }
     if pursuit is not None:
         pursuit = _required_object(value, "pursuit")
         vectors = {}
@@ -488,6 +503,11 @@ def _validate_command_params(
     params: dict[str, Any],
     command_id: str,
 ) -> dict[str, Any]:
+    if command in {CommandName.APPROVE_TARGET, CommandName.REJECT_TARGET}:
+        track_id = params.get("trackId")
+        if not isinstance(track_id, str) or not track_id.strip():
+            raise ProtocolError("invalid_params", "trackId must be a nonempty string.", command_id=command_id)
+        return {"trackId": track_id}
     if command == CommandName.SET_PATROL_PRIORITIES:
         raw_priorities = params.get("priorities")
         if not isinstance(raw_priorities, list):

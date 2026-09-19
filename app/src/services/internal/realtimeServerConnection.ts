@@ -79,6 +79,8 @@ export type RealtimeServerCommandName =
   | 'return_home'
   | 'new_mission'
   | 'camera_tilt_up'
+  | 'approve_target'
+  | 'reject_target'
   | 'camera_tilt_down';
 
 export interface RealtimeServerConnection {
@@ -152,12 +154,18 @@ function isTargetFollowDiagnostics(value: unknown): value is TargetFollowDiagnos
   const confirmation = diagnostics.confirmation as Record<string, unknown> | undefined;
   const velocity = diagnostics.estimatedImageVelocity as Record<string, unknown> | undefined;
   const pursuit = diagnostics.pursuit as Record<string, unknown> | undefined;
+  const decision = diagnostics.targetDecision as Record<string, unknown> | undefined;
   const validVector = (value: unknown) => {
     if (typeof value !== 'object' || value === null) return false;
     const vector = value as Record<string, unknown>;
     return ['x', 'y', 'z'].every((axis) => typeof vector[axis] === 'number' && Number.isFinite(vector[axis]));
   };
   return (
+    (decision === undefined || (typeof decision === 'object' && decision !== null &&
+      (decision.trackId === null || typeof decision.trackId === 'string') &&
+      typeof decision.canApprove === 'boolean' && typeof decision.canReject === 'boolean' &&
+      Array.isArray(decision.rejectableTrackIds) && decision.rejectableTrackIds.every((id) => typeof id === 'string') &&
+      (decision.lastRejectionReason === null || typeof decision.lastRejectionReason === 'string'))) &&
     (pursuit === undefined || (typeof pursuit === 'object' && pursuit !== null &&
       typeof pursuit.state === 'string' &&
       (pursuit.constraint === null || typeof pursuit.constraint === 'string') &&

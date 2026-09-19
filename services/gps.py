@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
+from config.shared_config import shared_config
+
 
 METERS_PER_DEG_LAT = 111_320.0
 
@@ -22,7 +24,10 @@ class LocalPosition:
     z: float
 
 
-DEFAULT_HOME = Wgs84Point(lat=32.085300, lng=34.781800)
+# Sourced from config/shared.json, the single value both the backend and the
+# frontend (app/src/config/mapConfig.ts) build their home-relative geometry
+# from -- see config/shared_config.py for why this must not be a local literal.
+DEFAULT_HOME = Wgs84Point(lat=shared_config.home.lat, lng=shared_config.home.lng)
 
 
 def local_meters_to_wgs84(

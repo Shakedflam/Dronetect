@@ -1,5 +1,6 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { droneCommandService } from '../../services/droneCommandService';
+import { realtimeServerConnection } from '../../services/internal/realtimeServerConnection';
 import { useMissionState } from '../../hooks/useMissionState';
 import { useMissionStatus } from '../../hooks/useMissionStatus';
 import { useRoi } from '../../hooks/useRoi';
@@ -8,6 +9,8 @@ import styles from './ActionBar.module.css';
 
 interface ActionBarProps {
   selectedTargetId: string | null;
+  canApprove: boolean;
+  canReject: boolean;
   onClearSelection: () => void;
 }
 
@@ -22,11 +25,14 @@ function roiKey(roi: Roi | null): string | null {
  * safety-triggered RTH is active.
  * Patrol/ROI/RTH are backend commands, and mission state messages show
  * the authoritative transition in the map/HUD.
- * Follow/Ignore/Engage only appear once the
- * operator has selected a detected target (App owns that selection state);
- * they have no realtime server equivalent yet and remain mocked.
+ * Approve/Reject use candidate-specific backend commands. Selection survives
+ * box disappearance briefly so the operator can still reject a flicker.
  */
-export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps) {
+export function ActionBar({ selectedTargetId, canApprove, canReject, onClearSelection }: ActionBarProps) {
+  const [targetCommandPending, setTargetCommandPending] = useState(false);
+  const [targetCommandError, setTargetCommandError] = useState<string | null>(null);
+  const [commandLinkOpen, setCommandLinkOpen] = useState(false);
+  useEffect(() => realtimeServerConnection.subscribeStatus((status) => setCommandLinkOpen(status === 'open')), []);
   const hasSelection = selectedTargetId !== null;
   const missionState = useMissionState();
   const missionStatus = useMissionStatus();
@@ -82,15 +88,20 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
     });
   }
 
-  function handleFollow() {
-    if (!selectedTargetId) return;
-    void droneCommandService.followTarget(selectedTargetId);
-  }
-
-  function handleIgnore() {
-    if (!selectedTargetId) return;
-    void droneCommandService.ignoreTarget(selectedTargetId);
-    onClearSelection();
+  async function handleTargetDecision(approve: boolean) {
+    if (!selectedTargetId || targetCommandPending) return;
+    setTargetCommandPending(true);
+    setTargetCommandError(null);
+    try {
+      if (approve) await droneCommandService.approveTarget(selectedTargetId);
+      else await droneCommandService.rejectTarget(selectedTargetId);
+      // Acknowledgements mean command delivery; telemetry remains authoritative.
+      if (!approve) onClearSelection();
+    } catch (error) {
+      setTargetCommandError(error instanceof Error ? error.message : 'Target command failed');
+    } finally {
+      setTargetCommandPending(false);
+    }
   }
 
   function handleEngage() {
@@ -171,17 +182,18 @@ export function ActionBar({ selectedTargetId, onClearSelection }: ActionBarProps
 
       {hasSelection && (
         <div className={styles.contextualGroup}>
-          <button type="button" className={`${styles.button} ${styles.follow}`} onClick={handleFollow}>
-            FOLLOW
+          <button type="button" className={`${styles.button} ${styles.follow}`} onClick={() => void handleTargetDecision(true)} disabled={missionOverrideDisabled || !commandLinkOpen || targetCommandPending || !canApprove}>
+            APPROVE
           </button>
-          <button type="button" className={`${styles.button} ${styles.ignore}`} onClick={handleIgnore}>
-            IGNORE
+          <button type="button" className={`${styles.button} ${styles.ignore}`} onClick={() => void handleTargetDecision(false)} disabled={missionOverrideDisabled || !commandLinkOpen || targetCommandPending || !canReject}>
+            REJECT
           </button>
           <button type="button" className={`${styles.button} ${styles.engage}`} onClick={handleEngage}>
             ENGAGE
           </button>
         </div>
       )}
+      {targetCommandError && <span role="alert">{targetCommandError}</span>}
     </div>
   );
 }

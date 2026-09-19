@@ -386,7 +386,7 @@ class RealtimeServer:
         command_name = CommandName(command["command"])
         if (
             self.mission.safety_rth_active
-            and command_name is CommandName.NEW_MISSION
+            and command_name in {CommandName.NEW_MISSION, CommandName.APPROVE_TARGET, CommandName.REJECT_TARGET}
         ):
             await tablet.send(
                 encode_message(

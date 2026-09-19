@@ -480,6 +480,25 @@ def test_kinematic_flight_holds_yaw_for_tiny_horizontal_error():
     assert step.horizontal_speed_mps == pytest.approx(0.0)
 
 
+def test_kinematic_flight_holds_yaw_within_a_few_centimeters_even_without_position_deadzone():
+    # TARGET_RETURN uses yaw_hold_horizontal_distance_m=0.0 so position can
+    # converge exactly. At sub-centimeter range atan2(dy, dx) is dominated by
+    # floating-point noise and can swing by ~180 degrees between ticks; yaw
+    # must still hold steady there instead of oscillating indefinitely.
+    config = KinematicFlightConfig(yaw_hold_horizontal_distance_m=0.0, max_yaw_rate_rad_s=math.radians(150.0))
+
+    step = advance_kinematic_flight(
+        position=(0.0, 0.0, 10.0),
+        target=(-1e-4, 1e-5, 10.0),
+        yaw=0.0,
+        horizontal_speed_mps=0.0,
+        dt=0.03,
+        config=config,
+    )
+
+    assert abs(step.yaw) < math.radians(1.0)
+
+
 def test_kinematic_flight_turns_with_configured_yaw_rate():
     config = KinematicFlightConfig(max_yaw_rate_rad_s=1.0)
 

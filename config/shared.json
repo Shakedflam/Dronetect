@@ -1,0 +1,5 @@
+{
+  "home": { "lat": 32.0853, "lng": 34.7818 },
+  "homeRadiusM": 300,
+  "patrolBandCount": 4
+}
