@@ -12,7 +12,12 @@ import {
 } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-import type { Coordinates, DronePosition } from '../../types/drone';
+import type {
+  Coordinates,
+  DetectedTarget,
+  DronePosition,
+  TargetFollowDiagnostics,
+} from '../../types/drone';
 import type { RoiCenter } from '../../types/roi';
 import { useLocation } from '../../hooks/useLocation';
 import { useRoi } from '../../hooks/useRoi';
@@ -28,7 +33,7 @@ import {
   MAX_ROI_RADIUS_METERS,
   MIN_ROI_RADIUS_METERS,
 } from '../../config/mapConfig';
-import { bearingDeg, euclideanDistanceMeters } from '../../utils/geo';
+import { bearingDeg, destinationPoint, euclideanDistanceMeters } from '../../utils/geo';
 import { clipRoiToHomeRange } from '../../utils/roiClipping';
 import { PatrolLayer } from './PatrolLayer';
 import styles from './MapView.module.css';
@@ -49,6 +54,89 @@ const homeIcon = L.divIcon({
 
 /** Fraction along the drone->home line where the direction arrowhead sits. */
 const HOME_ARROW_T = 0.5;
+const TARGET_CAMERA_HORIZONTAL_FOV_RAD = 1.0;
+const TARGET_MAX_DISTANCE_M = 100;
+const TARGET_REFERENCE_DISTANCE_M = 2;
+const TARGET_REFERENCE_BOX_AREA_RATIO = 0.025;
+const TARGET_DOT_SIZE_PX = 10;
+
+interface TargetMapEstimate {
+  center: Coordinates;
+}
+
+interface MapViewProps {
+  targets: DetectedTarget[];
+  diagnostics: TargetFollowDiagnostics | null;
+  ignoredTargetId: string | null;
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+function estimateRangeFromBox(target: DetectedTarget): number | null {
+  const boxWidth = Math.max(0, target.boundingBox.x2 - target.boundingBox.x1);
+  const boxHeight = Math.max(0, target.boundingBox.y2 - target.boundingBox.y1);
+  const areaRatio = boxWidth * boxHeight;
+  if (!Number.isFinite(areaRatio) || areaRatio <= 0) return null;
+
+  const rangeM = TARGET_REFERENCE_DISTANCE_M * Math.sqrt(
+    TARGET_REFERENCE_BOX_AREA_RATIO / areaRatio,
+  );
+  return Number.isFinite(rangeM) && rangeM > 0
+    ? clamp(rangeM, TARGET_REFERENCE_DISTANCE_M, TARGET_MAX_DISTANCE_M)
+    : null;
+}
+
+const targetDotIcon = L.divIcon({
+  className: styles.targetIcon,
+  html: `<span class="${styles.targetDot}"></span>`,
+  iconSize: [TARGET_DOT_SIZE_PX, TARGET_DOT_SIZE_PX],
+  iconAnchor: [TARGET_DOT_SIZE_PX / 2, TARGET_DOT_SIZE_PX / 2],
+});
+
+/** Approximate map position from the followed box and camera-only range cue. */
+function estimateTargetMapPosition(
+  position: DronePosition,
+  targets: DetectedTarget[],
+  diagnostics: TargetFollowDiagnostics | null,
+  ignoredTargetId: string | null,
+): TargetMapEstimate | null {
+  const trackerId = diagnostics?.trackerId;
+  if (
+    !trackerId ||
+    trackerId === ignoredTargetId ||
+    diagnostics.targetLostDurationS > 0
+  ) {
+    return null;
+  }
+
+  const target = targets.find(
+    (candidate) => candidate.id === trackerId && candidate.trackState !== 'lost',
+  );
+  if (!target) return null;
+
+  const diagnosticRangeM = diagnostics.estimatedTargetDistanceM;
+  const slantRangeM = diagnosticRangeM !== null && Number.isFinite(diagnosticRangeM)
+    && diagnosticRangeM > 0
+    ? clamp(diagnosticRangeM, TARGET_REFERENCE_DISTANCE_M, TARGET_MAX_DISTANCE_M)
+    : estimateRangeFromBox(target);
+  if (slantRangeM === null) return null;
+
+  const centerX = clamp((target.boundingBox.x1 + target.boundingBox.x2) / 2, 0, 1);
+  const imageRight = (2 * centerX - 1) * Math.tan(TARGET_CAMERA_HORIZONTAL_FOV_RAD / 2);
+  const horizontalOffsetDeg = Math.atan(imageRight) * 180 / Math.PI;
+  const targetBearingDeg = (position.headingDeg + horizontalOffsetDeg + 360) % 360;
+
+  const heightDifferenceM = diagnostics.estimatedTargetHeightDifferenceM;
+  const horizontalDistanceM = heightDifferenceM !== null && Number.isFinite(heightDifferenceM)
+    ? Math.sqrt(Math.max(0, slantRangeM ** 2 - heightDifferenceM ** 2))
+    : slantRangeM;
+
+  return {
+    center: destinationPoint(position, horizontalDistanceM, targetBearingDeg),
+  };
+}
 
 function createHomeArrowIcon(bearing: number): L.DivIcon {
   return L.divIcon({
@@ -83,7 +171,15 @@ const FOLLOW_REFLY_MIN_INTERVAL_MS = FOLLOW_FLY_DURATION_S * 1000 - 100;
  * once the operator manually drags the map; a "Recenter" button hands
  * control back.
  */
-function LiveTrackingControl({ position, home }: { position: DronePosition; home: Coordinates }) {
+function LiveTrackingControl({
+  position,
+  home,
+  target,
+}: {
+  position: DronePosition;
+  home: Coordinates;
+  target: Coordinates | null;
+}) {
   const map = useMap();
   const [autoFollow, setAutoFollow] = useState(true);
   const autoFollowRef = useRef(true);
@@ -120,6 +216,7 @@ function LiveTrackingControl({ position, home }: { position: DronePosition; home
 
   useEffect(() => {
     const bounds = L.latLngBounds([position.lat, position.lng], [home.lat, home.lng]);
+    if (target) bounds.extend([target.lat, target.lng]);
     if (!hasCenteredOnce.current) {
       map.fitBounds(bounds, { padding: FOLLOW_PADDING, maxZoom: MAX_FOLLOW_ZOOM, animate: false });
       hasCenteredOnce.current = true;
@@ -131,7 +228,7 @@ function LiveTrackingControl({ position, home }: { position: DronePosition; home
     if (now - lastFlyAt.current < FOLLOW_REFLY_MIN_INTERVAL_MS) return;
     lastFlyAt.current = now;
     map.flyToBounds(bounds, { padding: FOLLOW_PADDING, maxZoom: MAX_FOLLOW_ZOOM, duration: FOLLOW_FLY_DURATION_S });
-  }, [position, home, autoFollow, map]);
+  }, [position, home, target, autoFollow, map]);
 
   if (autoFollow) return null;
 
@@ -421,7 +518,7 @@ function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: numbe
  * directly. The home marker is a static display anchor (HOME_REFERENCE),
  * not live telemetry — see config/mapConfig.ts.
  */
-export function MapView() {
+export function MapView({ targets, diagnostics, ignoredTargetId }: MapViewProps) {
   const position = useLocation();
 
   if (!position) {
@@ -434,6 +531,12 @@ export function MapView() {
 
   const homeBearing = bearingDeg(position, HOME_REFERENCE);
   const homeDistanceM = euclideanDistanceMeters(position, HOME_REFERENCE);
+  const targetEstimate = estimateTargetMapPosition(
+    position,
+    targets,
+    diagnostics,
+    ignoredTargetId,
+  );
   const arrowPosition: [number, number] = [
     position.lat + (HOME_REFERENCE.lat - position.lat) * HOME_ARROW_T,
     position.lng + (HOME_REFERENCE.lng - position.lng) * HOME_ARROW_T,
@@ -473,7 +576,19 @@ export function MapView() {
         </Marker>
         <Marker position={[HOME_REFERENCE.lat, HOME_REFERENCE.lng]} icon={homeIcon} />
         <Marker position={[position.lat, position.lng]} icon={droneIcon} />
-        <LiveTrackingControl position={position} home={HOME_REFERENCE} />
+        {targetEstimate && (
+          <Marker
+            position={[targetEstimate.center.lat, targetEstimate.center.lng]}
+            icon={targetDotIcon}
+            interactive={false}
+            zIndexOffset={1000}
+          />
+        )}
+        <LiveTrackingControl
+          position={position}
+          home={HOME_REFERENCE}
+          target={targetEstimate?.center ?? null}
+        />
         <RoiLayer home={HOME_REFERENCE} homeRadiusM={HOME_RADIUS_METERS} />
         <PatrolLayer home={HOME_REFERENCE} homeRadiusM={HOME_RADIUS_METERS} />
       </MapContainer>

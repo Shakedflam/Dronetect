@@ -160,6 +160,8 @@ function isTargetFollowDiagnostics(value: unknown): value is TargetFollowDiagnos
     const vector = value as Record<string, unknown>;
     return ['x', 'y', 'z'].every((axis) => typeof vector[axis] === 'number' && Number.isFinite(vector[axis]));
   };
+  const nullableFiniteNumber = (value: unknown) =>
+    value === null || (typeof value === 'number' && Number.isFinite(value));
   return (
     (decision === undefined || (typeof decision === 'object' && decision !== null &&
       (decision.trackId === null || typeof decision.trackId === 'string') &&
@@ -186,6 +188,10 @@ function isTargetFollowDiagnostics(value: unknown): value is TargetFollowDiagnos
     typeof diagnostics.boundingBoxScale === 'number' &&
     typeof diagnostics.boundingBoxAreaRatio === 'number' &&
     typeof diagnostics.standoffError === 'number' &&
+    nullableFiniteNumber(diagnostics.estimatedTargetDistanceM) &&
+    nullableFiniteNumber(diagnostics.estimatedTargetElevationDeg) &&
+    nullableFiniteNumber(diagnostics.estimatedTargetHeightDifferenceM) &&
+    typeof diagnostics.altitudeMatchingActive === 'boolean' &&
     typeof diagnostics.targetLostDurationS === 'number' &&
     typeof diagnostics.patrolInterrupted === 'boolean' &&
     (diagnostics.patrolResumeState === null || typeof diagnostics.patrolResumeState === 'string') &&

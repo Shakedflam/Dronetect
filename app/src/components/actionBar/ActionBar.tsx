@@ -12,6 +12,8 @@ interface ActionBarProps {
   canApprove: boolean;
   canReject: boolean;
   onClearSelection: () => void;
+  onTargetIgnoreStart: (targetId: string) => void;
+  onTargetIgnoreFailed: (targetId: string) => void;
 }
 
 function roiKey(roi: Roi | null): string | null {
@@ -28,7 +30,14 @@ function roiKey(roi: Roi | null): string | null {
  * Approve/Reject use candidate-specific backend commands. Selection survives
  * box disappearance briefly so the operator can still reject a flicker.
  */
-export function ActionBar({ selectedTargetId, canApprove, canReject, onClearSelection }: ActionBarProps) {
+export function ActionBar({
+  selectedTargetId,
+  canApprove,
+  canReject,
+  onClearSelection,
+  onTargetIgnoreStart,
+  onTargetIgnoreFailed,
+}: ActionBarProps) {
   const [targetCommandPending, setTargetCommandPending] = useState(false);
   const [targetCommandError, setTargetCommandError] = useState<string | null>(null);
   const [commandLinkOpen, setCommandLinkOpen] = useState(false);
@@ -90,14 +99,17 @@ export function ActionBar({ selectedTargetId, canApprove, canReject, onClearSele
 
   async function handleTargetDecision(approve: boolean) {
     if (!selectedTargetId || targetCommandPending) return;
+    const targetId = selectedTargetId;
     setTargetCommandPending(true);
     setTargetCommandError(null);
+    if (!approve) onTargetIgnoreStart(targetId);
     try {
-      if (approve) await droneCommandService.approveTarget(selectedTargetId);
-      else await droneCommandService.rejectTarget(selectedTargetId);
+      if (approve) await droneCommandService.approveTarget(targetId);
+      else await droneCommandService.rejectTarget(targetId);
       // Acknowledgements mean command delivery; telemetry remains authoritative.
       if (!approve) onClearSelection();
     } catch (error) {
+      if (!approve) onTargetIgnoreFailed(targetId);
       setTargetCommandError(error instanceof Error ? error.message : 'Target command failed');
     } finally {
       setTargetCommandPending(false);

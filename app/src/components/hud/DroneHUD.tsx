@@ -117,6 +117,18 @@ export function DroneHUD() {
                 value={`${diagnostics.boundingBoxScale.toFixed(3)} / ${formatSigned(diagnostics.standoffError, 4)}`}
               />
               <HudRow
+                label="ALT MATCH"
+                value={diagnostics.estimatedTargetHeightDifferenceM === null
+                  ? 'UNAVAILABLE'
+                  : `${diagnostics.altitudeMatchingActive ? 'ACTIVE' : 'HOLD'} · ${formatSigned(diagnostics.estimatedTargetHeightDifferenceM, 2)} m`}
+              />
+              <HudRow
+                label="RANGE / ELEV"
+                value={diagnostics.estimatedTargetDistanceM === null || diagnostics.estimatedTargetElevationDeg === null
+                  ? '—'
+                  : `${diagnostics.estimatedTargetDistanceM.toFixed(1)} m / ${formatSigned(diagnostics.estimatedTargetElevationDeg, 1)}°`}
+              />
+              <HudRow
                 label="TARGET LOST"
                 value={`${diagnostics.targetLostDurationS.toFixed(2)} s`}
               />

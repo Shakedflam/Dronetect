@@ -57,6 +57,11 @@ export interface TargetFollowDiagnostics {
   boundingBoxScale: number;
   boundingBoxAreaRatio: number;
   standoffError: number;
+  /** Camera-only estimate; target-size calibration means this is not guaranteed metric truth. */
+  estimatedTargetDistanceM: number | null;
+  estimatedTargetElevationDeg: number | null;
+  estimatedTargetHeightDifferenceM: number | null;
+  altitudeMatchingActive: boolean;
   targetLostDurationS: number;
   patrolInterrupted: boolean;
   patrolResumeState: string | null;
