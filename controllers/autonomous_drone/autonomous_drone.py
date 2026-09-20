@@ -13,6 +13,7 @@
 
 from collections import deque
 from dataclasses import replace
+import json
 import math
 import os
 from pathlib import Path
@@ -189,6 +190,21 @@ class AutonomousDrone(Supervisor):
                 target_standoff_box_area_ratio=float(
                     os.getenv("DRONTECT_TARGET_STANDOFF_BOX_AREA_RATIO", "0.025")
                 ),
+                target_standoff_distance_m=float(
+                    os.getenv("DRONTECT_TARGET_STANDOFF_DISTANCE_M", "2.0")
+                ),
+                target_altitude_target_band_m=float(
+                    os.getenv("DRONTECT_TARGET_ALTITUDE_TARGET_BAND_M", "0.5")
+                ),
+                target_altitude_gain_per_s=float(
+                    os.getenv("DRONTECT_TARGET_ALTITUDE_GAIN_PER_S", "1.0")
+                ),
+                target_max_vertical_speed_mps=float(
+                    os.getenv("DRONTECT_TARGET_MAX_VERTICAL_SPEED_MPS", "2.0")
+                ),
+                target_range_estimate_max_m=float(
+                    os.getenv("DRONTECT_TARGET_RANGE_ESTIMATE_MAX_M", "100.0")
+                ),
                 target_collision_avoidance_step_m=float(
                     os.getenv("DRONTECT_TARGET_COLLISION_AVOIDANCE_STEP_M", "3.0")
                 ),
@@ -243,6 +259,18 @@ class AutonomousDrone(Supervisor):
         self.camera_pitch_motor = cast(Motor, self.getDevice("camera pitch"))
         self.camera_pitch_motor.setPosition(self.camera_gimbal.pitch)
         self._camera_flight_state: FlightState | None = None
+        self._altitude_smoke_enabled = (
+            os.getenv("DRONTECT_WEBOTS_ALTITUDE_SMOKE", "0") == "1"
+        )
+        self._altitude_smoke_target = (
+            self.getFromDef("TRAFFIC_DRONE_1") if self._altitude_smoke_enabled else None
+        )
+        self._altitude_smoke_started_at: float | None = None
+        self._altitude_smoke_pursuit_seen = False
+        self._altitude_smoke_direction_seen = False
+        self._altitude_smoke_within_since: float | None = None
+        self._altitude_smoke_converged_at: float | None = None
+        self._altitude_smoke_lost_since: float | None = None
 
         self.motors: tuple[Motor, Motor, Motor, Motor] = (
             cast(Motor, self.getDevice("front left propeller")),
@@ -314,6 +342,7 @@ class AutonomousDrone(Supervisor):
                 yaw,
                 dt,
             )
+            self._update_altitude_smoke(position)
             self._update_camera_for_flight_state()
             self._update_markers()
             self._announce_changes()
@@ -401,23 +430,14 @@ class AutonomousDrone(Supervisor):
                 self.patrol_regions.replace_priorities(
                     [(entry["regionId"], entry["rank"]) for entry in priorities]
                 )
+                self._replan_active_patrol(position)
                 print("Realtime patrol priorities updated.")
             elif command == CommandName.SET_PATROL_AREA_TYPES:
                 area_types = message["params"]["areaTypes"]
                 self.patrol_regions.replace_area_types(
                     [(entry["regionId"], entry["areaType"]) for entry in area_types]
                 )
-                if (
-                    self.logic.state is FlightState.PATROLLING
-                    or self._paused_patrol_coverage is not None
-                ):
-                    was_patrolling = self.logic.state is FlightState.PATROLLING
-                    self._clear_patrol_progress()
-                    if was_patrolling:
-                        self.logic.target = self._next_patrol_waypoint(
-                            position,
-                            completed=False,
-                        )
+                self._replan_active_patrol(position)
                 print("Realtime patrol area types updated.")
             elif command == CommandName.SET_ROI:
                 self._discard_mission_interruption()
@@ -733,6 +753,109 @@ class AutonomousDrone(Supervisor):
             print(f"Random waypoint: {self._format_position(self.logic.target)}")
             self._announced_random_target = self.logic.target
 
+    def _update_altitude_smoke(self, position: Position) -> None:
+        """Validate altitude matching against Webots truth in smoke mode only."""
+        if not self._altitude_smoke_enabled:
+            return
+        now = self.getTime()
+        if self._altitude_smoke_target is None:
+            self._finish_altitude_smoke(False, "TRAFFIC_DRONE_1 was not found")
+            return
+        if self._altitude_smoke_started_at is None:
+            if self.logic.state is FlightState.IDLE:
+                return
+            self._altitude_smoke_started_at = now
+        if now - self._altitude_smoke_started_at > 120.0:
+            self._finish_altitude_smoke(False, "120 simulated second timeout")
+            return
+
+        if self.logic.state is FlightState.TARGET_PURSUIT:
+            self._altitude_smoke_pursuit_seen = True
+        tracking_interrupted = (
+            self.logic.diagnostic_state == "TARGET_LOST_SEARCH"
+            or (
+                self._altitude_smoke_pursuit_seen
+                and self.logic.state is FlightState.TARGET_ACQUISITION
+            )
+        )
+        if self._altitude_smoke_pursuit_seen and tracking_interrupted:
+            self._altitude_smoke_within_since = None
+            if self._altitude_smoke_lost_since is None:
+                self._altitude_smoke_lost_since = now
+            elif now - self._altitude_smoke_lost_since >= 1.5:
+                self._finish_altitude_smoke(False, "target lost for 1.5 simulated seconds")
+            return
+        self._altitude_smoke_lost_since = None
+        if (
+            self._altitude_smoke_pursuit_seen
+            and self.logic.state not in {
+                FlightState.TARGET_ACQUISITION,
+                FlightState.TARGET_FOLLOW,
+                FlightState.TARGET_PURSUIT,
+            }
+        ):
+            self._finish_altitude_smoke(False, "pursuit ended before altitude convergence")
+            return
+        if self.logic.state is not FlightState.TARGET_PURSUIT:
+            return
+
+        assert self.logic.home is not None
+        floor = self.logic.home[2] + self.logic.pursuit.config.minimum_height_m
+        ceiling = self.logic.home[2] + self.logic.pursuit.config.maximum_height_m
+        if position[2] < floor - 0.05 or position[2] > ceiling + 0.05:
+            self._finish_altitude_smoke(False, "pursuit height safety limit violated")
+            return
+
+        target_position = self._altitude_smoke_target.getPosition()
+        true_error_m = float(target_position[2]) - position[2]
+        vertical_command_mps = self.logic.pursuit.velocity[2]
+        if abs(true_error_m) > self.logic.config.target_altitude_target_band_m:
+            if vertical_command_mps * true_error_m > 0.0:
+                self._altitude_smoke_direction_seen = True
+            self._altitude_smoke_within_since = None
+            return
+
+        if self._altitude_smoke_within_since is None:
+            self._altitude_smoke_within_since = now
+            self._altitude_smoke_converged_at = now
+        if now - self._altitude_smoke_within_since >= 3.0:
+            if not self._altitude_smoke_direction_seen:
+                self._finish_altitude_smoke(False, "no corrective command toward true altitude")
+                return
+            self._finish_altitude_smoke(
+                True,
+                "altitude target held for 3 simulated seconds",
+                true_error_m=true_error_m,
+            )
+
+    def _finish_altitude_smoke(
+        self,
+        passed: bool,
+        reason: str,
+        *,
+        true_error_m: float | None = None,
+    ) -> None:
+        result = {
+            "passed": passed,
+            "reason": reason,
+            "simulationTimeS": self.getTime(),
+            "convergenceTimeS": (
+                None if self._altitude_smoke_converged_at is None
+                else self._altitude_smoke_converged_at - self._altitude_smoke_started_at
+            ),
+            "finalTrueHeightDifferenceM": true_error_m,
+            "directionObserved": self._altitude_smoke_direction_seen,
+        }
+        print(f"DRONTECT_ALTITUDE_SMOKE_RESULT {json.dumps(result, sort_keys=True)}")
+        result_path = os.getenv("DRONTECT_ALTITUDE_SMOKE_RESULT_PATH")
+        if result_path:
+            Path(result_path).write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        self._altitude_smoke_enabled = False
+        self.simulationQuit(0 if passed else 1)
+
     def _stop_motors(self) -> None:
         self._set_motor_velocities(0.0, 0.0, 0.0, 0.0)
 
@@ -927,6 +1050,35 @@ class AutonomousDrone(Supervisor):
             return self._patrol_route_waypoints.popleft()
         if completed and self._target_patrol_region_id is not None:
             self.patrol_planner.record_observation(self._target_patrol_region_id)
+
+        # If a NO_FLY cell currently contains the aircraft (e.g. an ROI that
+        # overlapped one was just cleared), fly clear of it first and work
+        # out which region to patrol -- and the full route to it -- only once
+        # already outside. That scoring loop below calls route() once per
+        # candidate region (there can be dozens), and every one of those
+        # calls would otherwise need its own no-fly egress leg computed from
+        # this same start point; deferring it here means the aircraft starts
+        # moving immediately on a cheap, destination-agnostic lookup instead
+        # of sitting still while the full plan is worked out. The deferred
+        # planning happens on the next call, once _has_reached() the exit
+        # point makes this method run again with completed=True.
+        try:
+            exit_point = self.no_fly_router.nearest_exit(
+                (position[0], position[1]), self.patrol_regions.regions
+            )
+        except NoFlyRouteUnavailable as exc:
+            self._target_patrol_region_id = None
+            self._patrol_route_waypoints.clear()
+            print(f"No safe patrol coverage is currently available; holding position: {exc}")
+            return (
+                position[0],
+                position[1],
+                self.logic.config.takeoff_altitude,
+            )
+        if exit_point is not None:
+            print(f"Leaving NO_FLY area toward {exit_point} before planning patrol coverage.")
+            return (exit_point[0], exit_point[1], self.logic.config.takeoff_altitude)
+
         current = local_meters_to_wgs84(
             LocalPosition(x=position[0], y=position[1], z=position[2]),
             DEFAULT_HOME,
@@ -964,6 +1116,22 @@ class AutonomousDrone(Supervisor):
                 position[1],
                 self.logic.config.takeoff_altitude,
             )
+
+        paused = self._paused_patrol_coverage
+        # Scoring picked the same region a previous interruption paused
+        # mid-sweep: continue its exact remaining waypoints instead of
+        # planning a brand-new coverage pass, so already-flown ground isn't
+        # re-covered and the pass can still finish and be marked observed.
+        # Falls through to a fresh plan below if no safe route back to the
+        # interruption point exists any more (e.g. a new NO_FLY region).
+        if (
+            paused is not None
+            and paused.region_id == decision.region.id
+            and self._resume_paused_patrol(position)
+        ):
+            print(f"Resuming paused patrol region: {decision.region.id}")
+            return self._patrol_route_waypoints.popleft()
+
         self._target_patrol_region_id = decision.region.id
         ordered = candidate_waypoints[decision.region.id]
         self._patrol_route_waypoints = deque(ordered[1:])
@@ -993,6 +1161,9 @@ class AutonomousDrone(Supervisor):
             for waypoint in coverage
         ]
         first_coverage = local_coverage[0]
+        # _next_patrol_waypoint() only reaches this scoring loop once the
+        # aircraft is already outside every NO_FLY cell (it flies clear of
+        # any containing one first), so a plain route() is always valid here.
         route = self.no_fly_router.route(
             (position[0], position[1]),
             (first_coverage.x, first_coverage.y),
@@ -1046,8 +1217,13 @@ class AutonomousDrone(Supervisor):
         if paused is None:
             return False
         try:
+            # Same reasoning as _coverage_route_waypoints: the resume point
+            # may itself be inside a NO_FLY cell, so egress first.
+            exit_point = self.no_fly_router.nearest_exit(
+                (position[0], position[1]), self.patrol_regions.regions
+            )
             route = self.no_fly_router.route(
-                (position[0], position[1]),
+                exit_point or (position[0], position[1]),
                 (
                     paused.interruption_position[0],
                     paused.interruption_position[1],
@@ -1056,6 +1232,8 @@ class AutonomousDrone(Supervisor):
             )
         except NoFlyRouteUnavailable:
             return False
+        if exit_point is not None:
+            route = [exit_point, *route]
         return_route: list[Position] = [
             (x, y, self.logic.config.takeoff_altitude)
             for x, y in route
@@ -1072,6 +1250,39 @@ class AutonomousDrone(Supervisor):
         self._patrol_route_waypoints.clear()
         self._target_patrol_region_id = None
         self._paused_patrol_coverage = None
+
+    def _replan_active_patrol(self, position: Position) -> None:
+        """Re-score patrol regions immediately, preserving in-progress coverage.
+
+        Without this, an operator's mid-patrol priority or area-type edit only
+        takes effect once the aircraft happens to finish covering whichever
+        region it already committed to -- which, for a low-priority region
+        picked before the edit, can be arbitrarily far in the future. Region
+        selection itself already accounts for the operator's current
+        priorities/area types (`PatrolRegionStore` is mutated before this
+        runs), so forcing an immediate re-plan is enough to make both kinds of
+        edit responsive.
+
+        Simply discarding the in-progress coverage first (as this used to do)
+        would also throw away real, already-flown ground and its eventual
+        `record_observation()` credit every time an operator nudges a
+        priority. So the active region's exact remaining waypoints are saved
+        as a resumable checkpoint first -- the same `PausedPatrolCoverage`
+        mechanism an ROI diversion already uses -- and `_next_patrol_waypoint`
+        resumes that checkpoint instead of re-planning it from scratch if
+        scoring picks the same region again, now or on a later edit. If a
+        different region now scores higher, the checkpoint is simply left in
+        place for whenever scoring returns to it.
+
+        A checkpoint already paused for some other, currently-inactive reason
+        (e.g. mid-ROI) is left untouched: there is nothing to fly differently
+        right now, and its route is re-validated against current
+        restrictions at the point it actually gets resumed.
+        """
+        if self.logic.state is not FlightState.PATROLLING:
+            return
+        self._pause_patrol_coverage(position)
+        self.logic.target = self._next_patrol_waypoint(position, completed=False)
 
     @staticmethod
     def _deduplicate_waypoints(waypoints: list[Position]) -> list[Position]:

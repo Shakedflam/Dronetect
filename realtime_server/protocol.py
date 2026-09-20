@@ -371,7 +371,21 @@ def _validate_target_follow_diagnostics(value: Any) -> dict[str, Any]:
         confidence = _required_number(value, "detectionConfidence")
     if direction is not None:
         direction = _required_number(velocity, "directionDeg")
-    for key in ("patrolInterrupted",):
+    altitude_numbers = {}
+    for key in (
+        "estimatedTargetDistanceM",
+        "estimatedTargetElevationDeg",
+        "estimatedTargetHeightDifferenceM",
+    ):
+        number = value.get(key)
+        if number is not None:
+            number = _required_number(value, key)
+            if not math.isfinite(number):
+                raise ProtocolError(
+                    "validation_error", f"{key} must be finite or null."
+                )
+        altitude_numbers[key] = number
+    for key in ("patrolInterrupted", "altitudeMatchingActive"):
         if not isinstance(value.get(key), bool):
             raise ProtocolError(
                 "validation_error",
@@ -431,6 +445,8 @@ def _validate_target_follow_diagnostics(value: Any) -> dict[str, Any]:
         "boundingBoxScale": _required_number(value, "boundingBoxScale"),
         "boundingBoxAreaRatio": _required_number(value, "boundingBoxAreaRatio"),
         "standoffError": _required_number(value, "standoffError"),
+        **altitude_numbers,
+        "altitudeMatchingActive": value["altitudeMatchingActive"],
         "targetLostDurationS": _required_number(value, "targetLostDurationS"),
         "patrolInterrupted": value["patrolInterrupted"],
         "patrolResumeState": _optional_string(value, "patrolResumeState"),

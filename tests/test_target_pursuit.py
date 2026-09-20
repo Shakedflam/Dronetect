@@ -11,7 +11,10 @@ import pytest
 from controllers.autonomous_drone.flight_logic import (
     FlightConfig, FlightLogic, FlightState, advance_kinematic_flight,
 )
-from controllers.autonomous_drone.pursuit import PursuitConfig
+from controllers.autonomous_drone.pursuit import (
+    PursuitConfig,
+    estimate_target_altitude,
+)
 from controllers.autonomous_drone import flight_logic
 from realtime_server.protocol import validate_telemetry_message
 from services.gps import LocalPosition
@@ -40,13 +43,15 @@ def make_logic(**options):
 
 
 def observe(logic, *, size=100, vx=0, state="confirmed", confidence=0.9,
-            track_id="one", cx=500, position=POSITION, yaw=0.0,
+            track_id="one", cx=500, cy=500, position=POSITION, yaw=0.0,
+            camera_pitch=0.0,
             allow_landing_intercept=False):
     logic.observe_detections([{
         "trackId": track_id, "trackState": state, "confidence": confidence,
-        "box": [cx-size/2, 500-size/2, cx+size/2, 500+size/2],
+        "box": [cx-size/2, cy-size/2, cx+size/2, cy+size/2],
         "velocityPxPerSec": {"x": vx, "y": 0},
     }], frame_width=1000, frame_height=1000, position=position, yaw=yaw,
+       camera_pitch=camera_pitch,
        allow_landing_intercept=allow_landing_intercept)
 
 
@@ -212,15 +217,16 @@ def test_vertical_image_error_drives_altitude_correction_toward_target():
     logic = make_logic()
     enter(logic)
     assert logic.pursuit.velocity == (0, 0, 0)
-    # Target appears well above image center (frame height 1000, box centered
-    # at y=300 -> normalized 0.3, past the centering deadzone) -> climb.
+    # Target appears far enough above image center for the estimated metric
+    # height error to exceed the configured 0.5 m target band.
     logic.observe_detections([{
         "trackId": "one", "trackState": "confirmed", "confidence": 0.9,
-        "box": [450, 250, 550, 350], "velocityPxPerSec": {"x": 0, "y": 0},
+        "box": [450, 50, 550, 150], "velocityPxPerSec": {"x": 0, "y": 0},
     }], frame_width=1000, frame_height=1000, position=POSITION, yaw=0.0)
     logic.update(POSITION, 0.1)
-    full_command = 0.2 * logic.config.target_vertical_gain_m
-    assert 0.0 < logic.pursuit.velocity[2] < full_command
+    assert logic._target_altitude_estimate is not None
+    assert logic._target_altitude_estimate.height_error_m > 0.5
+    assert 0.0 < logic.pursuit.velocity[2] < logic.config.target_max_vertical_speed_mps
     climb_velocity = logic.pursuit.velocity[2]
 
     # Target appears well below image center -> descend toward it instead.
@@ -228,26 +234,26 @@ def test_vertical_image_error_drives_altitude_correction_toward_target():
     enter(logic)
     logic.observe_detections([{
         "trackId": "one", "trackState": "confirmed", "confidence": 0.9,
-        "box": [450, 650, 550, 750], "velocityPxPerSec": {"x": 0, "y": 0},
+        "box": [450, 850, 550, 950], "velocityPxPerSec": {"x": 0, "y": 0},
     }], frame_width=1000, frame_height=1000, position=POSITION, yaw=0.0)
     logic.update(POSITION, 0.1)
     assert logic.pursuit.velocity[2] < 0.0
     assert logic.pursuit.velocity[2] == pytest.approx(-climb_velocity)
 
 
-def test_small_vertical_offset_still_triggers_altitude_correction():
+def test_small_estimated_height_offset_holds_inside_target_band():
     logic = make_logic()
     enter(logic)
-    # Offset (0.06) is inside the old, wider centering tolerance (0.12) but
-    # outside the tighter deadzone now used for vertical tracking (matching
-    # yaw's 0.04) -- altitude correction should still engage, so the drone
-    # can keep pace with a target passing close overhead.
+    # A small ray elevation at the calibrated range estimates less than 0.5 m
+    # of height difference and must not produce vertical hunting.
     logic.observe_detections([{
         "trackId": "one", "trackState": "confirmed", "confidence": 0.9,
         "box": [450, 390, 550, 490], "velocityPxPerSec": {"x": 0, "y": 0},
     }], frame_width=1000, frame_height=1000, position=POSITION, yaw=0.0)
     logic.update(POSITION, 0.1)
-    assert logic.pursuit.velocity[2] > 0.0
+    assert logic._target_altitude_estimate is not None
+    assert abs(logic._target_altitude_estimate.height_error_m) < 0.5
+    assert logic.pursuit.velocity[2] == 0.0
 
 
 def test_gimbal_tilt_sustains_climb_once_image_residual_is_corrected():
@@ -258,12 +264,57 @@ def test_gimbal_tilt_sustains_climb_once_image_residual_is_corrected():
     # image-frame residual is now ~0 (the gimbal has caught up to it).
     # Relying on the residual alone would drop the climb command back to
     # ~0 here; the sustained gimbal tilt must keep it climbing.
-    logic.observe_detections([{
-        "trackId": "one", "trackState": "confirmed", "confidence": 0.9,
-        "box": [450, 480, 550, 520], "velocityPxPerSec": {"x": 0, "y": 0},
-    }], frame_width=1000, frame_height=1000, position=POSITION, yaw=0.0)
+    observe(logic, camera_pitch=-0.3)
     logic.update(POSITION, 0.1, camera_pitch=-0.3)
     assert logic.pursuit.velocity[2] > 0.0
+
+
+def test_camera_geometry_and_inverse_area_range_estimate():
+    centered = estimate_target_altitude(
+        box=[450, 450, 550, 550], frame_width=1000, frame_height=1000,
+        camera_pitch=0.0, horizontal_fov_rad=1.0,
+        reference_distance_m=2.0, reference_area_ratio=0.01,
+        max_range_m=100.0,
+    )
+    quarter_area = estimate_target_altitude(
+        box=[475, 475, 525, 525], frame_width=1000, frame_height=1000,
+        camera_pitch=0.0, horizontal_fov_rad=1.0,
+        reference_distance_m=2.0, reference_area_ratio=0.01,
+        max_range_m=100.0,
+    )
+    above = estimate_target_altitude(
+        box=[450, 50, 550, 150], frame_width=1000, frame_height=1000,
+        camera_pitch=0.0, horizontal_fov_rad=1.0,
+        reference_distance_m=2.0, reference_area_ratio=0.01,
+        max_range_m=100.0,
+    )
+    assert centered is not None and centered.height_error_m == pytest.approx(0.0)
+    assert quarter_area is not None
+    assert quarter_area.slant_range_m == pytest.approx(2 * centered.slant_range_m)
+    assert above is not None and above.elevation_rad > 0 and above.height_error_m > 0
+
+
+def test_altitude_estimate_rejects_zero_area_and_excessive_range():
+    common = dict(
+        frame_width=1280, frame_height=720, camera_pitch=0.0,
+        horizontal_fov_rad=1.0, reference_distance_m=2.0,
+        reference_area_ratio=0.025, max_range_m=10.0,
+    )
+    assert estimate_target_altitude(box=[10, 10, 10, 20], **common) is None
+    assert estimate_target_altitude(box=[10, 10, 11, 11], **common) is None
+
+
+def test_widescreen_center_ray_uses_gimbal_pitch_as_elevation():
+    estimate = estimate_target_altitude(
+        box=[590, 310, 690, 410], frame_width=1280, frame_height=720,
+        camera_pitch=-0.2, horizontal_fov_rad=1.0,
+        reference_distance_m=2.0,
+        reference_area_ratio=10000 / (1280 * 720),
+        max_range_m=100.0,
+    )
+    assert estimate is not None
+    assert estimate.elevation_rad == pytest.approx(0.2)
+    assert estimate.height_error_m == pytest.approx(2.0 * math.sin(0.2))
 
 
 def test_geofence_and_height_override_translation():
@@ -451,6 +502,173 @@ def test_simulator_reaches_checkpoint_exactly_without_waypoint_deadzone(simulato
     assert position == POSITION
     assert simulator.logic.state is FlightState.PATROLLING
     assert simulator.logic.target == WAYPOINT
+
+
+def test_set_patrol_priorities_replans_active_patrol_immediately(simulator):
+    import time
+
+    from services.patrol_planner import PatrolPlanner
+    from services.polygon_coverage import PolygonCoveragePlanner
+
+    simulator.patrol_regions = PatrolRegionStore()
+    # Started well in the past, like a planner that's been running for a
+    # while -- otherwise every region's unobserved age is ~0 at this instant
+    # and the priority multiplier has nothing to multiply, letting sheer
+    # proximity decide regardless of rank.
+    simulator.patrol_planner = PatrolPlanner(
+        store=simulator.patrol_regions, started_at=time.time() - 900.0
+    )
+    simulator.polygon_coverage_planner = PolygonCoveragePlanner()
+    simulator.logic.state = FlightState.PATROLLING
+    simulator._target_patrol_region_id = "N-1"
+    # A long remaining coverage leg: without an immediate re-plan, the
+    # planner would not be consulted again -- and the new priority would not
+    # take effect -- until this whole queue drains naturally.
+    stale_leg = [(9999.0, 9999.0, 15.0)] * 5
+    simulator._patrol_route_waypoints = deque(stale_leg)
+    simulator.realtime_client = Mock()
+    simulator.realtime_client.drain_commands.return_value = [{
+        "command": "set_patrol_priorities",
+        "params": {"priorities": [{"regionId": "S-1", "rank": 1}]},
+    }]
+
+    simulator._handle_realtime_commands(POSITION)
+
+    assert simulator._target_patrol_region_id == "S-1"
+    assert list(simulator._patrol_route_waypoints) != stale_leg
+
+
+def test_set_patrol_priorities_resumes_same_region_instead_of_replanning_it(simulator):
+    import time
+
+    from services.patrol_planner import PatrolPlanner
+    from services.polygon_coverage import PolygonCoveragePlanner
+
+    simulator.patrol_regions = PatrolRegionStore()
+    simulator.patrol_planner = PatrolPlanner(
+        store=simulator.patrol_regions, started_at=time.time() - 900.0
+    )
+    simulator.polygon_coverage_planner = PolygonCoveragePlanner()
+    simulator.logic.state = FlightState.PATROLLING
+
+    # Seed real, in-progress coverage of whichever region naturally wins first.
+    first_waypoint = simulator._next_patrol_waypoint(POSITION, completed=False)
+    simulator.logic.target = first_waypoint
+    region_id = simulator._target_patrol_region_id
+    remaining_before = list(simulator._patrol_route_waypoints)
+    assert region_id is not None
+    assert remaining_before, "test needs a region with more than one coverage leg left"
+
+    # An edit that keeps this exact region on top (it's still the only ranked
+    # one) must resume its exact remaining coverage, not discard and
+    # re-plan a brand-new lawnmower pass over ground already covered.
+    simulator.realtime_client = Mock()
+    simulator.realtime_client.drain_commands.return_value = [{
+        "command": "set_patrol_priorities",
+        "params": {"priorities": [{"regionId": region_id, "rank": 1}]},
+    }]
+
+    simulator._handle_realtime_commands(POSITION)
+
+    assert simulator._target_patrol_region_id == region_id
+    assert simulator._paused_patrol_coverage is None
+    assert list(simulator._patrol_route_waypoints) == [first_waypoint, *remaining_before]
+
+
+def test_set_patrol_priorities_keeps_paused_region_when_another_wins(simulator):
+    import time
+
+    from services.patrol_planner import PatrolPlanner
+    from services.polygon_coverage import PolygonCoveragePlanner
+
+    simulator.patrol_regions = PatrolRegionStore()
+    simulator.patrol_planner = PatrolPlanner(
+        store=simulator.patrol_regions, started_at=time.time() - 900.0
+    )
+    simulator.polygon_coverage_planner = PolygonCoveragePlanner()
+    simulator.logic.state = FlightState.PATROLLING
+
+    first_waypoint = simulator._next_patrol_waypoint(POSITION, completed=False)
+    simulator.logic.target = first_waypoint
+    interrupted_region_id = simulator._target_patrol_region_id
+    remaining_before = list(simulator._patrol_route_waypoints)
+    assert remaining_before, "test needs a region with more than one coverage leg left"
+
+    # Promote a different region above the one currently being covered.
+    other_region_id = next(
+        region.id for region in simulator.patrol_regions.regions
+        if region.id != interrupted_region_id
+    )
+    simulator.realtime_client = Mock()
+    simulator.realtime_client.drain_commands.return_value = [{
+        "command": "set_patrol_priorities",
+        "params": {"priorities": [{"regionId": other_region_id, "rank": 1}]},
+    }]
+
+    simulator._handle_realtime_commands(POSITION)
+
+    assert simulator._target_patrol_region_id == other_region_id
+    # The interrupted region's progress must survive the switch instead of
+    # being silently discarded, so it can resume and still be marked
+    # observed whenever scoring returns to it.
+    paused = simulator._paused_patrol_coverage
+    assert paused is not None
+    assert paused.region_id == interrupted_region_id
+    assert paused.active_waypoint == first_waypoint
+    assert list(paused.remaining_waypoints) == remaining_before
+
+
+def test_patrol_start_from_inside_cleared_roi_no_fly_cell_does_not_stick(simulator):
+    """Reproduces: transiting to an ROI inside a NO_FLY cell, clearing the ROI,
+    then requesting patrol without setting any priority -- the aircraft is
+    left sitting inside that NO_FLY cell and must still route out to a
+    legal patrol region instead of holding in place indefinitely.
+
+    Region scoring across every candidate region is expensive (a full
+    lawnmower coverage plan plus a no-fly route per candidate), so the
+    aircraft flies clear of the NO_FLY cell first -- a cheap,
+    destination-agnostic lookup -- and only plans the rest once already
+    outside, on the next call once that leg is flown.
+    """
+    import time
+
+    from services.patrol_planner import PatrolPlanner
+    from services.polygon_coverage import PolygonCoveragePlanner
+
+    simulator.patrol_regions = PatrolRegionStore()
+    simulator.patrol_planner = PatrolPlanner(
+        store=simulator.patrol_regions, started_at=time.time() - 900.0
+    )
+    simulator.polygon_coverage_planner = PolygonCoveragePlanner()
+    simulator.logic.state = FlightState.PATROLLING
+
+    radius_m = math.hypot(POSITION[0], POSITION[1])
+    bearing_deg = math.degrees(math.atan2(POSITION[0], POSITION[1])) % 360.0
+    containing_region = next(
+        region for region in simulator.patrol_regions.regions
+        if region.inner_radius_m <= radius_m <= region.outer_radius_m
+        and (bearing_deg - region.start_bearing_deg) % 360.0
+            <= (region.end_bearing_deg - region.start_bearing_deg) % 360.0
+    )
+    simulator.patrol_regions.set_area_type(containing_region.id, "NO_FLY")
+
+    exit_waypoint = simulator._next_patrol_waypoint(POSITION, completed=False)
+
+    # First call just clears the NO_FLY cell -- no region committed yet -- and
+    # does so immediately rather than after scoring every candidate region.
+    assert exit_waypoint != POSITION
+    assert simulator._target_patrol_region_id is None
+
+    # Reaching that exit leg triggers a fresh call (completed=True, as
+    # FlightLogic does once _has_reached() the current target): now outside
+    # the NO_FLY cell, this is where the real region gets chosen.
+    waypoint = simulator._next_patrol_waypoint(exit_waypoint, completed=True)
+
+    # A real, routed region was chosen -- not the "no safe coverage, hold in
+    # place" fallback -- and it isn't the cell the aircraft started inside.
+    assert simulator._target_patrol_region_id is not None
+    assert simulator._target_patrol_region_id != containing_region.id
+    assert waypoint != exit_waypoint
 
 
 def test_simulator_blocks_safety_landing_intercept_but_allows_normal_landing(simulator):

@@ -11,11 +11,17 @@ from typing import Any, Callable, Protocol
 
 try:
     from .target_decisions import TargetDecisions, ground_projection
-    from .pursuit import PursuitConfig, PursuitController
+    from .pursuit import (
+        PursuitConfig, PursuitController, TargetAltitudeEstimate,
+        estimate_target_altitude,
+    )
     from .roi_patrol import LawnMowerRoiPatrolPlanner, RoiPatrolPlan
 except ImportError:  # Webots loads this directory as top-level modules.
     from target_decisions import TargetDecisions, ground_projection
-    from pursuit import PursuitConfig, PursuitController
+    from pursuit import (
+        PursuitConfig, PursuitController, TargetAltitudeEstimate,
+        estimate_target_altitude,
+    )
     from roi_patrol import LawnMowerRoiPatrolPlanner, RoiPatrolPlan
 
 
@@ -85,8 +91,12 @@ class FlightConfig:
     target_search_yaw_rate_rad_s: float = math.radians(10.0)
     target_follow_step_m: float = 6.0
     target_lateral_motion_gain_m: float = 4.0
-    target_vertical_gain_m: float = 6.0
     target_standoff_box_area_ratio: float = 0.025
+    target_standoff_distance_m: float = 2.0
+    target_altitude_target_band_m: float = 0.5
+    target_altitude_gain_per_s: float = 1.0
+    target_max_vertical_speed_mps: float = 2.0
+    target_range_estimate_max_m: float = 100.0
     target_standoff_deadband_ratio: float = 0.005
     target_approach_growth_ratio_per_s: float = 0.04
     target_collision_avoidance_step_m: float = 3.0
@@ -100,7 +110,10 @@ class FlightConfig:
                      "target_stationary_observer_m", "target_stationary_angle_rad",
                      "target_low_confidence", "target_confidence_range", "target_ignore_radius_m",
                      "target_ignore_timeout_s", "target_reject_grace_s",
-                     "target_projection_min_angle_rad", "target_projection_max_range_m"):
+                     "target_projection_min_angle_rad", "target_projection_max_range_m",
+                     "target_standoff_distance_m", "target_altitude_target_band_m",
+                     "target_altitude_gain_per_s", "target_max_vertical_speed_mps",
+                     "target_range_estimate_max_m"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
@@ -108,6 +121,14 @@ class FlightConfig:
             raise ValueError("target_observation_min_samples must be at least 3")
         if self.target_low_confidence > 1 or self.target_confidence_range > 1:
             raise ValueError("Confidence thresholds must be at most 1")
+        for name in (
+            "target_standoff_distance_m",
+            "target_altitude_gain_per_s",
+            "target_max_vertical_speed_mps",
+            "target_range_estimate_max_m",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +195,7 @@ class FlightLogic:
         self._target_yaw: float | None = None
         self._target_camera_pitch: float | None = None
         self._target_last_yaw = 0.0
+        self._target_altitude_estimate: TargetAltitudeEstimate | None = None
         self.pursuit = PursuitController(pursuit_config or PursuitConfig())
         self._stable_since: float | None = None
         self._pursuit_usable = False
@@ -286,20 +308,13 @@ class FlightLogic:
                         collision_side=(-1.0 if self._target_last_center[0] >= 0.5 else 1.0)
                             * self.config.target_collision_avoidance_step_m,
                         lateral_gain=self.config.target_lateral_motion_gain_m,
-                        # The gimbal itself continuously cancels the raw
-                        # image-frame residual, so that residual alone
-                        # self-cancels even while the target is still well
-                        # above/below us. Add the current actual gimbal tilt,
-                        # which persists for as long as the true elevation
-                        # difference does, so altitude keeps closing even
-                        # once the gimbal has caught up.
-                        vertical=self._target_last_center[1] - 0.5 + (camera_pitch or 0.0),
-                        vertical_gain=self.config.target_vertical_gain_m,
-                        # A tight deadband (matching yaw's) keeps altitude
-                        # actively closing on the target instead of waiting
-                        # for a large offset -- important for keeping up with
-                        # a target passing close overhead.
-                        vertical_deadzone=self.config.target_yaw_deadband_ratio,
+                        height_error_m=(
+                            self._target_altitude_estimate.height_error_m
+                            if self._target_altitude_estimate is not None else None
+                        ),
+                        altitude_deadband_m=self.config.target_altitude_target_band_m,
+                        altitude_gain_per_s=self.config.target_altitude_gain_per_s,
+                        max_vertical_speed_mps=self.config.target_max_vertical_speed_mps,
                         dt=dt,
                     )
                     self._continue_takeoff_during_pursuit(position, dt)
@@ -575,6 +590,7 @@ class FlightLogic:
             else resume_state.value if resume_state is not None else None
         )
         patrol_interrupted = resume_state is not None
+        altitude_estimate = self._target_altitude_estimate
         return {
             "targetDecision": self.target_decision_diagnostics(),
             "pursuit": {
@@ -604,6 +620,21 @@ class FlightLogic:
             "boundingBoxScale": box_scale,
             "boundingBoxAreaRatio": self._target_area_ratio,
             "standoffError": standoff_error,
+            "estimatedTargetDistanceM": (
+                altitude_estimate.slant_range_m if altitude_estimate is not None else None
+            ),
+            "estimatedTargetElevationDeg": (
+                math.degrees(altitude_estimate.elevation_rad)
+                if altitude_estimate is not None else None
+            ),
+            "estimatedTargetHeightDifferenceM": (
+                altitude_estimate.height_error_m if altitude_estimate is not None else None
+            ),
+            "altitudeMatchingActive": (
+                self.state is FlightState.TARGET_PURSUIT
+                and self._pursuit_usable
+                and altitude_estimate is not None
+            ),
             "targetLostDurationS": target_lost_duration_s,
             "patrolInterrupted": patrol_interrupted,
             "patrolResumeState": resume_state_name,
@@ -660,6 +691,7 @@ class FlightLogic:
         selected = self._select_target_detection(detections, project=project)
         if selected is None:
             self.pursuit.stop()
+            self._target_altitude_estimate = None
             self._stable_since = None
             self._pursuit_usable = False
             self._pursuit_sample = None
@@ -752,6 +784,7 @@ class FlightLogic:
             self._stable_since = self._elapsed_time
         if not self._pursuit_usable:
             self.pursuit.stop()
+            self._target_altitude_estimate = None
             self._pursuit_sample = None
             self._pursuit_growth = 0.0
             self._pursuit_image_motion = (0.0, 0.0)
@@ -759,6 +792,16 @@ class FlightLogic:
                 self.target = position
                 is_visible = False
         else:
+            self._target_altitude_estimate = estimate_target_altitude(
+                box=box,
+                frame_width=frame_width,
+                frame_height=frame_height,
+                camera_pitch=camera_pitch,
+                horizontal_fov_rad=self.pursuit.config.horizontal_fov_rad,
+                reference_distance_m=self.config.target_standoff_distance_m,
+                reference_area_ratio=self.config.target_standoff_box_area_ratio,
+                max_range_m=self.config.target_range_estimate_max_m,
+            )
             if self._pursuit_sample is not None:
                 sample_time, sample_area, sample_yaw = self._pursuit_sample
                 sample_dt = self._elapsed_time - sample_time
@@ -966,6 +1009,9 @@ class FlightLogic:
             self._takeoff_pursuit_vertical_velocity = 0.0
             return
         altitude_error = self._takeoff_pursuit_altitude() - position[2]
+        if altitude_error <= 0.0:
+            self._takeoff_pursuit_vertical_velocity = 0.0
+            return
         desired = min(
             self.config.target_takeoff_pursuit_ascent_mps,
             max(0.0, altitude_error / dt),
@@ -1055,6 +1101,7 @@ class FlightLogic:
         self.pursuit.stop()
         self._target_yaw = None
         self._target_camera_pitch = None
+        self._target_altitude_estimate = None
         if (
             self._pursuit_started and self._patrol_resume_checkpoint is not None
             and self._target_resume_state is not FlightState.TAKING_OFF
@@ -1131,6 +1178,7 @@ class FlightLogic:
         self._target_confirmed = False
         self._target_yaw = None
         self._target_camera_pitch = None
+        self._target_altitude_estimate = None
         self._target_previous_area_ratio = None
         self._target_area_growth_per_s = 0.0
         if not preserve_followed_ids:

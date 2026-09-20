@@ -155,6 +155,48 @@ class NoFlyRouter:
             raise NoFlyRouteUnavailable("No egress route out of the active NO_FLY area")
         return best[1]
 
+    def nearest_exit(
+        self,
+        start: Point2,
+        regions: tuple[PatrolRegion, ...] | list[PatrolRegion],
+    ) -> Point2 | None:
+        """Return the closest point clear of whichever NO_FLY cells contain start.
+
+        Returns None when start is not inside any NO_FLY cell (nothing to do).
+
+        Unlike egress_route(), this ignores where the aircraft is ultimately
+        headed: it only answers "how do I get outside whatever currently
+        contains me". egress_route() picks the exit that minimizes total path
+        length to one specific destination by fully re-routing to it from
+        every egress candidate -- appropriate for a single query, but far too
+        expensive to call once per candidate when a caller is scoring many
+        possible destinations (e.g. patrol region selection) from the same
+        start point. Callers with many destinations should call this once and
+        route() from the result for each destination instead.
+        """
+        no_fly = [region for region in regions if region.area_type is PatrolAreaType.NO_FLY]
+        if not no_fly:
+            return None
+        max_radius_m = max(region.outer_radius_m for region in regions)
+        obstacles = [self._expanded_obstacle(region, max_radius_m) for region in no_fly]
+        containing = [obstacle for obstacle in obstacles if self._inside(start, obstacle)]
+        if not containing:
+            return None
+
+        candidates = self._candidate_points(containing, max_radius_m)
+        best: tuple[float, Point2] | None = None
+        for candidate in self._deduplicate(candidates):
+            if self._inside_any(candidate, obstacles):
+                continue
+            if not self._valid_egress_segment(start, candidate, containing, obstacles):
+                continue
+            distance = math.dist(start, candidate)
+            if best is None or distance < best[0]:
+                best = (distance, candidate)
+        if best is None:
+            raise NoFlyRouteUnavailable("No egress route out of the active NO_FLY area")
+        return best[1]
+
     def segment_crosses_no_fly(
         self,
         start: Point2,
@@ -191,23 +233,38 @@ class NoFlyRouter:
         obstacles: list[_PolarObstacle],
         max_radius_m: float,
     ) -> list[Point2]:
+        # Sample every bearing around the full compass, not just each
+        # obstacle's own angular span. A NO_FLY area spanning a direction's
+        # full radial depth (every band restricted) blocks a bearing range
+        # from the hub all the way to the operational boundary, so the only
+        # way around is to change bearing first, out where the obstacle
+        # doesn't reach, then adjust radius -- and that detour needs
+        # waypoints at bearings the obstacle itself doesn't occupy. Sampling
+        # only the obstacle's own boundary (an earlier version of this
+        # method) leaves the rest of the compass without any nodes to route
+        # through, making an unrelated, reachable region look unroutable.
+        #
+        # Every distinct obstacle-boundary radius is offered at every
+        # bearing, not just the single radius nearest to that bearing's own
+        # obstacle: with only one "shell" available per bearing (e.g. only
+        # the far operational-boundary ring), a route that only needed to
+        # clear a nearby, much closer obstacle edge gets forced out to the
+        # far shell anyway, producing a needlessly wide detour. Offering
+        # every shell at every bearing lets the shortest-path search itself
+        # pick the tightest radius that is actually clear at each step,
+        # rather than the graph dictating a wide swing by omission.
+        # route()'s containment filter discards whichever of these land
+        # inside an obstacle, so offering more than are needed here is safe.
         points: list[Point2] = []
         offset = self._BOUNDARY_OFFSET_M
+        shell_radii = {max_radius_m - offset}
         for obstacle in obstacles:
-            bearings = self._arc_bearings(
-                obstacle.start_bearing_deg,
-                obstacle.sweep_deg,
-            )
             if obstacle.outer_radius_m < max_radius_m - offset:
-                points.extend(
-                    self._polar(obstacle.outer_radius_m + offset, bearing)
-                    for bearing in bearings
-                )
+                shell_radii.add(obstacle.outer_radius_m + offset)
             if obstacle.inner_radius_m > offset:
-                points.extend(
-                    self._polar(obstacle.inner_radius_m - offset, bearing)
-                    for bearing in bearings
-                )
+                shell_radii.add(obstacle.inner_radius_m - offset)
+        for bearing in self._arc_bearings(0.0, 360.0):
+            points.extend(self._polar(radius, bearing) for radius in shell_radii)
         return points
 
     def _arc_bearings(self, start: float, sweep: float) -> list[float]:

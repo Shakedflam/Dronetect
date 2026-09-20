@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -33,6 +34,20 @@ class SimTrafficDrone(Supervisor):
         super().__init__()
         self.time_step = int(self.getBasicTimeStep())
         self.actor_index, self.profile = _load_actor()
+        if (
+            self.actor_index == 0
+            and os.getenv("DRONTECT_WEBOTS_ALTITUDE_SMOKE", "0") == "1"
+        ):
+            self.profile = {
+                "behavior": "circle",
+                "start": [-2.0, 0.0, 14.0],
+                "yaw": 1.5708,
+                "center": [-2.0, 0.0, 14.0],
+                "radius_m": 0.0,
+                "altitude_amplitude_m": 0.25,
+                "period_s": 120.0,
+                "phase_rad": 0.0,
+            }
         self.self_node = self.getSelf()
         self.translation = self.self_node.getField("translation")
         self.rotation = self.self_node.getField("rotation")
