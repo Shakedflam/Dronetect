@@ -4,6 +4,7 @@ import { ResizableSplitView } from './components/layout/ResizableSplitView';
 import { DroneHUD } from './components/hud/DroneHUD';
 import { MapView } from './components/map/MapView';
 import { DroneVideo } from './components/video/DroneVideo';
+import { StartupSplash } from './components/startup/StartupSplash';
 import { useDetection } from './hooks/useDetection';
 import { useMissionStatus } from './hooks/useMissionStatus';
 import { useTelemetry } from './hooks/useTelemetry';
@@ -34,40 +35,43 @@ function App() {
   }
 
   return (
-    <div className={styles.app}>
-      <ResizableSplitView
-        top={
-          <div className={styles.mapPane}>
-            <MapView
+    <>
+      <div className={styles.app}>
+        <ResizableSplitView
+          top={
+            <div className={styles.mapPane}>
+              <MapView
+                targets={targets}
+                diagnostics={diagnostics}
+                ignoredTargetId={ignoredMapTargetId}
+                maxFlightRadiusM={operatingConfig.maxFlightRadiusM}
+                cruiseAltitudeM={operatingConfig.cruiseAltitudeM}
+                operatingConfigPending={missionStatus?.operatingConfigPending ?? false}
+              />
+              <DroneHUD />
+            </div>
+          }
+          bottom={
+            <DroneVideo
               targets={targets}
-              diagnostics={diagnostics}
-              ignoredTargetId={ignoredMapTargetId}
-              maxFlightRadiusM={operatingConfig.maxFlightRadiusM}
-              cruiseAltitudeM={operatingConfig.cruiseAltitudeM}
-              operatingConfigPending={missionStatus?.operatingConfigPending ?? false}
+              selectedTargetId={selectedTargetId}
+              onSelectTarget={setSelectedTargetId}
             />
-            <DroneHUD />
-          </div>
-        }
-        bottom={
-          <DroneVideo
-            targets={targets}
-            selectedTargetId={selectedTargetId}
-            onSelectTarget={setSelectedTargetId}
-          />
-        }
-      />
-      <ActionBar
-        selectedTargetId={selectedTargetId}
-        canApprove={Boolean(decision?.canApprove && decision.trackId === selectedTargetId && targets.some((target) => target.id === selectedTargetId))}
-        canReject={Boolean(selectedTargetId && decision?.rejectableTrackIds.includes(selectedTargetId))}
-        onClearSelection={() => setSelectedTargetId(null)}
-        onTargetIgnoreStart={setIgnoredMapTargetId}
-        onTargetIgnoreFailed={(targetId) => {
-          setIgnoredMapTargetId((ignoredId) => ignoredId === targetId ? null : ignoredId);
-        }}
-      />
-    </div>
+          }
+        />
+        <ActionBar
+          selectedTargetId={selectedTargetId}
+          canApprove={Boolean(decision?.canApprove && decision.trackId === selectedTargetId && targets.some((target) => target.id === selectedTargetId))}
+          canReject={Boolean(selectedTargetId && decision?.rejectableTrackIds.includes(selectedTargetId))}
+          onClearSelection={() => setSelectedTargetId(null)}
+          onTargetIgnoreStart={setIgnoredMapTargetId}
+          onTargetIgnoreFailed={(targetId) => {
+            setIgnoredMapTargetId((ignoredId) => ignoredId === targetId ? null : ignoredId);
+          }}
+        />
+      </div>
+      <StartupSplash ready={missionStatus !== null} />
+    </>
   );
 }
 

@@ -1,0 +1,102 @@
+.splash {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: clamp(18px, 3vh, 30px);
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 50% 43%, rgb(9 70 108 / 38%) 0%, transparent 43%),
+    linear-gradient(145deg, #020910 0%, #061523 52%, #02070c 100%);
+  color: #f4f8fb;
+}
+
+.fading {
+  pointer-events: none;
+  animation: splashFadeOut 650ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+.glow {
+  position: absolute;
+  width: min(76vw, 590px);
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: rgb(16 169 244 / 14%);
+  filter: blur(54px);
+  animation: glowPulse 1.8s ease-in-out infinite alternate;
+}
+
+.logo {
+  position: relative;
+  width: min(76vw, 560px);
+  height: auto;
+  filter: drop-shadow(0 0 24px rgb(22 159 240 / 42%));
+  user-select: none;
+  animation: logoBreathe 1.8s ease-in-out infinite alternate;
+}
+
+.connectionState {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 24px;
+  color: rgb(225 239 248 / 82%);
+  font-size: 0.78rem;
+  font-weight: 650;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.connectingDot,
+.readyDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #18aaf5;
+  box-shadow: 0 0 12px rgb(24 170 245 / 90%);
+}
+
+.connectingDot {
+  animation: connectionPulse 900ms ease-in-out infinite alternate;
+}
+
+.readyDot {
+  background: #49e69d;
+  box-shadow: 0 0 12px rgb(73 230 157 / 90%);
+}
+
+@keyframes connectionPulse {
+  from { opacity: 0.35; transform: scale(0.8); }
+  to { opacity: 1; transform: scale(1.15); }
+}
+
+@keyframes logoBreathe {
+  from { transform: scale(0.985); }
+  to { transform: scale(1); }
+}
+
+@keyframes glowPulse {
+  from { opacity: 0.55; transform: scale(0.94); }
+  to { opacity: 1; transform: scale(1.04); }
+}
+
+@keyframes splashFadeOut {
+  from { opacity: 1; visibility: visible; }
+  to { opacity: 0; visibility: hidden; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .logo,
+  .glow,
+  .connectingDot {
+    animation: none;
+  }
+
+  .fading {
+    animation-duration: 120ms;
+  }
+}
