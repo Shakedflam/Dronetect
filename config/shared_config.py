@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +35,37 @@ class HomeReference:
 class SharedConfig:
     home: HomeReference = HomeReference(lat=32.0853, lng=34.7818)
     home_radius_m: float = 300.0
+    cruise_altitude_m: float = 10.0
     patrol_band_count: int = 4
+    # Regulatory ceiling on operator-chosen values -- kept a small margin
+    # below the actual legal limits (4000 m / 50 m) rather than exactly at
+    # them.
+    legal_max_flight_radius_m: float = 3900.0
+    legal_max_cruise_altitude_m: float = 48.0
+
+
+@dataclass(frozen=True, slots=True)
+class OperatingConfig:
+    """The two operator-selected values that must change as one unit."""
+
+    max_flight_radius_m: float = 300.0
+    cruise_altitude_m: float = 10.0
+
+    def __post_init__(self) -> None:
+        for name in ("max_flight_radius_m", "cruise_altitude_m"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be a finite positive number")
+        if self.max_flight_radius_m > shared_config.legal_max_flight_radius_m:
+            raise ValueError(
+                "max_flight_radius_m exceeds the legal maximum of "
+                f"{shared_config.legal_max_flight_radius_m:.0f} m"
+            )
+        if self.cruise_altitude_m > shared_config.legal_max_cruise_altitude_m:
+            raise ValueError(
+                "cruise_altitude_m exceeds the legal maximum of "
+                f"{shared_config.legal_max_cruise_altitude_m:.0f} m"
+            )
 
 
 def load_shared_config(path: str | Path | None = None) -> SharedConfig:
@@ -54,7 +85,16 @@ def load_shared_config(path: str | Path | None = None) -> SharedConfig:
     return SharedConfig(
         home=_home_reference(raw.get("home"), defaults.home),
         home_radius_m=_positive_number(raw.get("homeRadiusM"), defaults.home_radius_m),
+        cruise_altitude_m=_positive_number(
+            raw.get("cruiseAltitudeM"), defaults.cruise_altitude_m
+        ),
         patrol_band_count=_positive_int(raw.get("patrolBandCount"), defaults.patrol_band_count),
+        legal_max_flight_radius_m=_positive_number(
+            raw.get("legalMaxFlightRadiusM"), defaults.legal_max_flight_radius_m
+        ),
+        legal_max_cruise_altitude_m=_positive_number(
+            raw.get("legalMaxCruiseAltitudeM"), defaults.legal_max_cruise_altitude_m
+        ),
     )
 
 
@@ -87,3 +127,7 @@ def _positive_int(value: Any, fallback: int) -> int:
 
 
 shared_config = load_shared_config()
+default_operating_config = OperatingConfig(
+    max_flight_radius_m=shared_config.home_radius_m,
+    cruise_altitude_m=shared_config.cruise_altitude_m,
+)

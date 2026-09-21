@@ -8,11 +8,13 @@ from realtime_server.protocol import (
     encode_message,
     mission_state_message,
     mission_status_message,
+    operating_config_result,
     parse_json_message,
     validate_detection_message,
     validate_command_message,
     validate_mission_state_message,
     validate_mission_status_message,
+    validate_operating_config_result_message,
     validate_role,
     validate_telemetry_message,
 )
@@ -28,7 +30,7 @@ def test_valid_telemetry_validates_and_serializes():
         position_local=LocalPosition(-12.3, 6.1, 14.8),
         heading_deg=91.4,
         speed_mps=4.2,
-        state="FLYING_RANDOMLY",
+        state="PATROLLING",
         timestamp=1720000000.123,
     )
 
@@ -171,6 +173,174 @@ def test_valid_command_validates_and_serializes():
         "command": "return_home",
         "params": {},
     }
+
+
+def test_operating_config_command_validates_both_positive_values():
+    command = validate_command_message(
+        {
+            "type": "command",
+            "commandId": "config-1",
+            "command": "set_operating_config",
+            "params": {"maxFlightRadiusM": 750, "cruiseAltitudeM": 15.25},
+        }
+    )
+
+    assert command["params"] == {
+        "maxFlightRadiusM": 750.0,
+        "cruiseAltitudeM": 15.25,
+    }
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"maxFlightRadiusM": 0, "cruiseAltitudeM": 15},
+        {"maxFlightRadiusM": 750, "cruiseAltitudeM": -1},
+        {"maxFlightRadiusM": float("inf"), "cruiseAltitudeM": 15},
+        {"maxFlightRadiusM": 750, "cruiseAltitudeM": "15"},
+    ],
+)
+def test_operating_config_command_rejects_entire_invalid_pair(params):
+    with pytest.raises(ProtocolError) as error:
+        validate_command_message(
+            {
+                "type": "command",
+                "commandId": "config-bad",
+                "command": "set_operating_config",
+                "params": params,
+            }
+        )
+
+    assert error.value.command_id == "config-bad"
+
+
+def test_operating_config_command_accepts_values_at_the_legal_boundary():
+    command = validate_command_message(
+        {
+            "type": "command",
+            "commandId": "config-boundary",
+            "command": "set_operating_config",
+            "params": {"maxFlightRadiusM": 3900, "cruiseAltitudeM": 48},
+        }
+    )
+
+    assert command["params"] == {"maxFlightRadiusM": 3900.0, "cruiseAltitudeM": 48.0}
+
+
+@pytest.mark.parametrize(
+    "params,expected_field",
+    [
+        ({"maxFlightRadiusM": 3900.01, "cruiseAltitudeM": 15}, "maxFlightRadiusM"),
+        ({"maxFlightRadiusM": 750, "cruiseAltitudeM": 48.01}, "cruiseAltitudeM"),
+    ],
+)
+def test_operating_config_command_rejects_values_above_legal_maximum(params, expected_field):
+    with pytest.raises(ProtocolError) as error:
+        validate_command_message(
+            {
+                "type": "command",
+                "commandId": "config-over-legal-max",
+                "command": "set_operating_config",
+                "params": params,
+            }
+        )
+
+    assert error.value.command_id == "config-over-legal-max"
+    assert error.value.details == {"field": expected_field}
+
+
+def test_operating_config_result_round_trips_controller_decision():
+    message = operating_config_result(
+        "config-1", accepted=False, message="grounded only"
+    )
+
+    assert validate_operating_config_result_message(message) == message
+    assert message["pending"] is False
+
+
+def test_operating_config_result_round_trips_pending_field():
+    message = operating_config_result("config-2", accepted=True, pending=True)
+
+    assert validate_operating_config_result_message(message) == message
+    assert message["pending"] is True
+
+
+def test_operating_config_result_defaults_pending_when_omitted():
+    message = operating_config_result("config-3", accepted=True)
+    del message["pending"]
+
+    validated = validate_operating_config_result_message(message)
+
+    assert validated["pending"] is False
+
+
+def test_mission_status_round_trips_operating_config_pending():
+    message = mission_status_message(
+        state=MissionState.PATROL,
+        active_roi=None,
+        patrol_priorities=[],
+        current_patrol_region_id=None,
+        target_patrol_region_id=None,
+        battery_percent=100.0,
+        low_battery=False,
+        safety_rth_active=False,
+        rth_reason=None,
+        operating_config_pending=True,
+    )
+
+    validated = validate_mission_status_message(
+        parse_json_message(encode_message(message))
+    )
+
+    assert validated == message
+    assert validated["operatingConfigPending"] is True
+
+
+def test_mission_status_missing_operating_config_pending_defaults_false():
+    message = mission_status_message(
+        state=MissionState.ON_GROUND,
+        active_roi=None,
+        patrol_priorities=[],
+        current_patrol_region_id=None,
+        target_patrol_region_id=None,
+        battery_percent=100.0,
+        low_battery=False,
+        safety_rth_active=False,
+        rth_reason=None,
+    )
+    del message["operatingConfigPending"]
+
+    validated = validate_mission_status_message(message)
+
+    assert validated["operatingConfigPending"] is False
+
+
+def test_telemetry_round_trips_operating_config_pending():
+    message = build_simulator_telemetry(
+        position_local=LocalPosition(0.0, 0.0, 15.0),
+        heading_deg=0.0,
+        speed_mps=0.0,
+        state="PATROLLING",
+        operating_config_pending=True,
+    )
+
+    validated = validate_telemetry_message(message)
+
+    assert validated["data"]["operatingConfigPending"] is True
+
+
+def test_telemetry_missing_operating_config_pending_defaults_false():
+    message = build_simulator_telemetry(
+        position_local=LocalPosition(0.0, 0.0, 15.0),
+        heading_deg=0.0,
+        speed_mps=0.0,
+        state="PATROLLING",
+    )
+    del message["data"]["operatingConfigPending"]
+
+    validated = validate_telemetry_message(message)
+
+    assert validated["data"]["operatingConfigPending"] is False
 
 
 @pytest.mark.parametrize("command", ["start_patrol", "clear_roi", "return_home"])

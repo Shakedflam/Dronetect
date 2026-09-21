@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import os
 import time
 import uuid
@@ -12,9 +13,11 @@ from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
 from config.video import VideoConfig, load_video_config
+from config.shared_config import OperatingConfig, default_operating_config
 from realtime_server.drone_sdk import DroneSdkConnection, WebSocketDroneSdkAdapter
 from realtime_server.protocol import (
     ROLE_DRONE,
+    MESSAGE_TYPE_OPERATING_CONFIG_RESULT,
     ROLE_TABLET,
     ProtocolError,
     command_ack,
@@ -40,7 +43,7 @@ from services.mission_commands import (
     MissionCommandService,
 )
 from services.mission_state import MissionState
-from services.gps import Wgs84Point
+from services.gps import DEFAULT_HOME, Wgs84Point, wgs84_distance_m
 from services.flight_safety import (
     DefaultSafetyRthPolicy,
     FlightSafetySnapshot,
@@ -76,15 +79,39 @@ class RealtimeServer:
             config=mission_config
             or MissionCommandConfig(
                 takeoff_altitude_m=float(
-                    os.getenv("DRONTECT_TAKEOFF_ALTITUDE_M", "15.0")
+                    os.getenv(
+                        "DRONTECT_TAKEOFF_ALTITUDE_M",
+                        str(default_operating_config.cruise_altitude_m),
+                    )
                 ),
                 roi_arrival_tolerance_m=float(
                     os.getenv("DRONTECT_ROI_ARRIVAL_TOLERANCE_M", "10.0")
                 ),
             )
         )
-        self.patrol_regions = PatrolRegionStore()
+        self.operating_config = OperatingConfig(
+            max_flight_radius_m=default_operating_config.max_flight_radius_m,
+            cruise_altitude_m=self.mission.config.takeoff_altitude_m,
+        )
+        self.patrol_regions = PatrolRegionStore(
+            home_radius_m=self.operating_config.max_flight_radius_m
+        )
         self.patrol_planner = PatrolPlanner(store=self.patrol_regions)
+        self._operating_config_revision = 0
+        self._drone_config_ready = False
+        self._pending_drone_config_results: dict[str, asyncio.Future[dict]] = {}
+        self._operating_config_pending = False
+        # Set only while the drone has accepted a config change but deferred
+        # actually applying it (mid pursuit/reposition); swapped into the
+        # active operating_config/patrol_regions/patrol_planner/mission.config
+        # once telemetry reports operatingConfigPending flipping back to
+        # False. Kept separate so the published config -- and anything
+        # derived from it, like the map's boundary circle and patrol grid --
+        # never claims a radius/altitude the drone is not actually enforcing
+        # yet.
+        self._pending_operating_config_target: tuple[
+            OperatingConfig, PatrolRegionStore, PatrolPlanner, MissionCommandConfig
+        ] | None = None
         self.safety_rth_policy = safety_rth_policy or DefaultSafetyRthPolicy(
             low_battery_threshold_percent=float(
                 os.getenv("DRONTECT_LOW_BATTERY_RTH_PERCENT", "20.0")
@@ -162,16 +189,54 @@ class RealtimeServer:
             return
 
         self.drone = drone
-        await self._send_patrol_priorities_to_drone(drone)
-        await self._send_patrol_area_types_to_drone(drone)
+        self._drone_config_ready = self._operating_config_revision == 0
+        sync_task: asyncio.Task | None = None
+        if self._drone_config_ready:
+            await self._send_patrol_priorities_to_drone(drone)
+            await self._send_patrol_area_types_to_drone(drone)
+        else:
+            sync_task = asyncio.create_task(self._synchronize_operating_config(drone))
         await self._send_to_tablet(encode_message(self._mission_status()))
         try:
-            async for telemetry in drone.iter_telemetry():
-                await self._route_drone_telemetry(telemetry)
+            async for message in drone.iter_telemetry():
+                if message.get("type") == MESSAGE_TYPE_OPERATING_CONFIG_RESULT:
+                    self._resolve_operating_config_result(message)
+                else:
+                    await self._route_drone_telemetry(message)
         finally:
+            if sync_task is not None:
+                sync_task.cancel()
             if self.drone is drone:
                 self.drone = None
+                self._drone_config_ready = False
+                self._operating_config_pending = False
+                # Discard rather than apply on reconnect: a fresh drone
+                # connection gets synced with the currently-active config
+                # (see _synchronize_operating_config), and this stashed
+                # target reflects a maneuver on the connection that just
+                # dropped, not necessarily anything the new one is doing.
+                self._pending_operating_config_target = None
+                self._reject_pending_drone_config_results(
+                    "Drone disconnected during operating configuration"
+                )
                 await self._send_to_tablet(encode_message(self._mission_status()))
+
+    async def _synchronize_operating_config(self, drone: DroneSdkConnection) -> None:
+        command = self._operating_config_command(
+            f"operating-config-sync-{uuid.uuid4()}"
+        )
+        try:
+            result = await self._request_drone_operating_config(drone, command)
+            if not result["accepted"] or self.drone is not drone:
+                return
+            self._drone_config_ready = True
+            self._operating_config_pending = bool(result.get("pending", False))
+            await self._send_patrol_priorities_to_drone(drone)
+            await self._send_patrol_area_types_to_drone(drone)
+            await self._send_to_tablet(encode_message(self._mission_status()))
+        except (ConnectionClosed, ConnectionError, TimeoutError):
+            if self.drone is drone:
+                self._drone_config_ready = False
 
     async def _handle_video_ingest(self, websocket: ServerConnection, query: str) -> None:
         try:
@@ -251,6 +316,21 @@ class RealtimeServer:
         )
         self._battery_percent = float(data["batteryPercent"])
         self._target_patrol_region_id = data["targetPatrolRegionId"]
+        was_pending = self._operating_config_pending
+        self._operating_config_pending = bool(data.get("operatingConfigPending", False))
+        if (
+            was_pending
+            and not self._operating_config_pending
+            and self._pending_operating_config_target is not None
+        ):
+            (
+                self.operating_config,
+                self.patrol_regions,
+                self.patrol_planner,
+                self.mission.config,
+            ) = self._pending_operating_config_target
+            self._pending_operating_config_target = None
+            self._operating_config_revision += 1
         self._low_battery = safety_signal.reason == "low_battery"
         self.mission.observe_safety(safety_signal)
         safety_rth_started = (
@@ -384,9 +464,12 @@ class RealtimeServer:
             return
 
         command_name = CommandName(command["command"])
+        if command_name is CommandName.SET_OPERATING_CONFIG:
+            await self._route_operating_config_command(tablet, command)
+            return
         if (
             self.mission.safety_rth_active
-            and command_name in {CommandName.NEW_MISSION, CommandName.APPROVE_TARGET, CommandName.REJECT_TARGET}
+            and command_name in {CommandName.APPROVE_TARGET, CommandName.REJECT_TARGET}
         ):
             await tablet.send(
                 encode_message(
@@ -467,12 +550,191 @@ class RealtimeServer:
 
         await tablet.send(encode_message(command_ack(command["commandId"])))
 
+    async def _route_operating_config_command(
+        self,
+        tablet: ServerConnection,
+        command: dict,
+    ) -> None:
+        # Whether this can apply right now (grounded), must reposition first
+        # (patrol/ROI), or must defer (mid pursuit/follow) is entirely the
+        # drone's call, based on its own FlightState -- the server's
+        # MissionState has no equivalent granularity to reproduce that here.
+        params = command["params"]
+        try:
+            candidate = OperatingConfig(
+                max_flight_radius_m=params["maxFlightRadiusM"],
+                cruise_altitude_m=params["cruiseAltitudeM"],
+            )
+        except ValueError as exc:
+            # _validate_command_params already enforces the same bounds, so
+            # this should be unreachable through any validated tablet
+            # command -- kept as a defense-in-depth backstop.
+            await tablet.send(
+                encode_message(
+                    ProtocolError(
+                        "invalid_params",
+                        str(exc),
+                        command_id=command["commandId"],
+                    ).to_message()
+                )
+            )
+            return
+        candidate_store, candidate_planner, candidate_mission_config = (
+            self._prepare_operating_config(candidate)
+        )
+
+        drone = self.drone
+        if drone is not None:
+            try:
+                result = await self._request_drone_operating_config(drone, command)
+            except (ConnectionClosed, ConnectionError, TimeoutError):
+                await tablet.send(
+                    encode_message(
+                        ProtocolError(
+                            "drone_unavailable",
+                            "Drone did not confirm the operating configuration.",
+                            command_id=command["commandId"],
+                        ).to_message()
+                    )
+                )
+                return
+            if not result["accepted"]:
+                await tablet.send(
+                    encode_message(
+                        ProtocolError(
+                            "invalid_mission_transition",
+                            result.get("message", "Drone rejected the operating configuration."),
+                            command_id=command["commandId"],
+                        ).to_message()
+                    )
+                )
+                return
+
+        pending = bool(result.get("pending", False)) if drone is not None else False
+
+        # Every fallible check and object construction has completed. If the
+        # drone deferred actually applying this (mid pursuit/reposition),
+        # stash it instead of publishing it now -- otherwise the map's
+        # boundary circle and patrol grid would jump to the new radius while
+        # the drone keeps enforcing the old one, until whatever it's mid-way
+        # through settles (see _route_drone_telemetry, which swaps this in
+        # once telemetry reports operatingConfigPending clearing). Publish
+        # the complete pair and all derived backend state without an await in
+        # between, so readers can never observe a half-applied configuration.
+        if pending:
+            self._pending_operating_config_target = (
+                candidate, candidate_store, candidate_planner, candidate_mission_config,
+            )
+        else:
+            self._pending_operating_config_target = None
+            (
+                self.operating_config,
+                self.patrol_regions,
+                self.patrol_planner,
+                self.mission.config,
+            ) = (
+                candidate,
+                candidate_store,
+                candidate_planner,
+                candidate_mission_config,
+            )
+            self._operating_config_revision += 1
+        self._drone_config_ready = drone is not None
+        self._operating_config_pending = pending
+        await tablet.send(encode_message(command_ack(command["commandId"])))
+        await tablet.send(encode_message(self._mission_status()))
+
+    def _prepare_operating_config(
+        self,
+        candidate: OperatingConfig,
+    ) -> tuple[PatrolRegionStore, PatrolPlanner, MissionCommandConfig]:
+        priorities = [
+            (region.id, region.priority)
+            for region in self.patrol_regions.regions
+            if region.priority is not None
+        ]
+        area_types = [
+            (region.id, region.area_type)
+            for region in self.patrol_regions.regions
+            if region.area_type is not PatrolAreaType.PATROL
+        ]
+        store = PatrolRegionStore(home_radius_m=candidate.max_flight_radius_m)
+        store.replace_area_types(area_types)
+        store.replace_priorities(priorities)
+        planner = PatrolPlanner(
+            store=store,
+            scorer=self.patrol_planner.scorer,
+            started_at=self.patrol_planner.started_at,
+        )
+        mission_config = replace(
+            self.mission.config,
+            takeoff_altitude_m=candidate.cruise_altitude_m,
+        )
+        return store, planner, mission_config
+
+    def _operating_config_command(self, command_id: str) -> dict:
+        return {
+            "type": "command",
+            "commandId": command_id,
+            "command": CommandName.SET_OPERATING_CONFIG.value,
+            "params": {
+                "maxFlightRadiusM": self.operating_config.max_flight_radius_m,
+                "cruiseAltitudeM": self.operating_config.cruise_altitude_m,
+            },
+        }
+
+    async def _request_drone_operating_config(
+        self,
+        drone: DroneSdkConnection,
+        command: dict,
+    ) -> dict:
+        command_id = command["commandId"]
+        future = asyncio.get_running_loop().create_future()
+        self._pending_drone_config_results[command_id] = future
+        try:
+            await drone.send_command(command)
+            return await asyncio.wait_for(future, timeout=5.0)
+        finally:
+            self._pending_drone_config_results.pop(command_id, None)
+
+    def _resolve_operating_config_result(self, result: dict) -> None:
+        future = self._pending_drone_config_results.get(result["commandId"])
+        if future is not None and not future.done():
+            future.set_result(result)
+
+    def _reject_pending_drone_config_results(self, message: str) -> None:
+        for future in self._pending_drone_config_results.values():
+            if not future.done():
+                future.set_exception(ConnectionError(message))
+
     async def _route_mission_command(
         self,
         tablet: ServerConnection,
         command: dict,
         command_name: CommandName,
     ) -> None:
+        if command_name is CommandName.SET_ROI:
+            params = command["params"]
+            center = params["center"]
+            distance_from_home_m = wgs84_distance_m(
+                Wgs84Point(lat=center["lat"], lng=center["lon"]),
+                DEFAULT_HOME,
+            )
+            if (
+                distance_from_home_m
+                >= self.operating_config.max_flight_radius_m + params["radiusM"]
+            ):
+                await tablet.send(
+                    encode_message(
+                        ProtocolError(
+                            "invalid_params",
+                            "ROI does not overlap the maximum flight radius.",
+                            command_id=command["commandId"],
+                            details={"field": "center"},
+                        ).to_message()
+                    )
+                )
+                return
         try:
             self.mission.validate(command_name)
         except InvalidMissionCommand as exc:
@@ -555,8 +817,13 @@ class RealtimeServer:
             low_battery=self._low_battery,
             safety_rth_active=self.mission.safety_rth_active,
             rth_reason=self.mission.safety_rth_reason,
-            drone_connected=self.drone is not None,
+            drone_connected=self.drone is not None and self._drone_config_ready,
             patrol_area_types=area_types,
+            operating_config={
+                "maxFlightRadiusM": self.operating_config.max_flight_radius_m,
+                "cruiseAltitudeM": self.operating_config.cruise_altitude_m,
+            },
+            operating_config_pending=self._operating_config_pending,
         )
 
     async def _send_to_tablet(self, message: str) -> None:

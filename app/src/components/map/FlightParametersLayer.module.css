@@ -1,0 +1,103 @@
+.panel {
+  position: absolute;
+  left: var(--space-md);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  font-family: var(--font-mono);
+}
+
+.toggleButton {
+  padding: var(--space-xs) var(--space-sm);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-panel-border);
+  background: var(--color-panel);
+  backdrop-filter: blur(6px);
+  color: var(--color-text);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  align-self: flex-start;
+}
+
+.toggleButton:hover {
+  background: var(--color-divider-hover);
+}
+
+.toggleButtonActive {
+  border-color: var(--color-accent-blue);
+  color: var(--color-accent-blue);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-panel-border);
+  background: var(--color-panel);
+  backdrop-filter: blur(6px);
+  width: max-content;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  font-size: 12px;
+  color: var(--color-text);
+}
+
+.field input {
+  padding: var(--space-xs) var(--space-sm);
+  border: 1px solid var(--color-panel-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font: inherit;
+  width: 120px;
+}
+
+.field input:focus {
+  outline: 2px solid var(--color-accent-blue);
+  outline-offset: 1px;
+}
+
+.applyButton {
+  padding: var(--space-xs) var(--space-sm);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--color-accent-blue);
+  color: #001426;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.applyButton:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.pendingNote {
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
+.cappedNote {
+  font-size: 11px;
+  color: var(--color-accent-blue);
+}
+
+.confirmationNote {
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
+.error {
+  font-size: 12px;
+  color: var(--color-accent-red);
+}

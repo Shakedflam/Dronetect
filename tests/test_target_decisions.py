@@ -273,7 +273,7 @@ def test_configurable_ignore_radius_and_exact_expiry():
     assert not logic.target_decisions.is_ignored("one", None, 1.2)
 
 
-@pytest.mark.parametrize("command", ["request_patrol", "request_new_target", "request_return_home"])
+@pytest.mark.parametrize("command", ["request_patrol", "request_mission_takeoff", "request_return_home"])
 def test_explicit_mission_change_clears_grace(command):
     logic = make_logic()
     observe(logic)
@@ -299,13 +299,35 @@ def test_ignore_radius_filters_interruption_and_selection_identically():
     assert logic.tracked_target_id == "far"
 
 
-def test_no_ground_intersection_uses_track_only():
+def test_no_ground_intersection_falls_back_to_the_range_estimate():
+    """An airborne target never yields a ground fix -- the camera ray only
+    reaches the ground for something below us. Rejection used to survive as a
+    bare track id there, so the tracker re-identifying the same object put the
+    aircraft straight back onto it and the operator's reject looked ignored."""
     logic = make_logic()
     observe(logic, pitch=-0.1)
     logic.reject_target("one")
-    assert logic.target_decisions.ignored[0].point is None
+
+    assert logic.target_decisions.ignored[0].point is not None
     observe(logic, [box(logic, key="new-id")], pitch=-0.1)
-    assert logic.tracked_target_id == "new-id"
+    assert logic.tracked_target_id != "new-id"
+
+
+def test_rejecting_an_unlocatable_target_pauses_new_lock_ons_for_the_window():
+    """Last-resort backstop: a target that yields neither a ground fix nor a
+    usable range estimate leaves nowhere to pin the rejection, so nothing new
+    is picked up until the ignore window expires."""
+    logic = make_logic(target_ignore_timeout_s=6.0)
+    empty_box = dict(box(logic), box=[500, 500, 500, 500])
+    observe(logic, [empty_box])
+    logic._tracked_target_id = "one"
+    logic.target_decisions.memories["one"].point = None
+
+    assert logic.reject_target("one") is True
+    assert logic.target_decisions.is_ignored("anything-else", None, logic._elapsed_time)
+
+    logic.target_decisions.prune(logic._elapsed_time + 6.0)
+    assert not logic.target_decisions.is_ignored("anything-else", None, logic._elapsed_time + 6.0)
 
 
 @pytest.mark.parametrize("state", [FlightState.ROI_PATROL, FlightState.TRANSITING_TO_ROI])

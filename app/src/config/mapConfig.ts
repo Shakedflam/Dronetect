@@ -1,6 +1,7 @@
 import type { PointTuple } from 'leaflet';
 import type { Coordinates } from '../types/drone';
 import sharedConfig from '../../../config/shared.json';
+import type { OperatingConfig } from '../types/operatingConfig';
 
 /**
  * Static reference point shown on the map as "HOME". This is not live
@@ -29,6 +30,24 @@ export const HOME_REFERENCE: Coordinates = { lat: sharedConfig.home.lat, lng: sh
  * region ID as being.
  */
 export const HOME_RADIUS_METERS = sharedConfig.homeRadiusM;
+
+/** Fallback used only until the first live mission_status arrives; the
+ * server's reported operatingConfig (via useMissionStatus()) takes over
+ * from there. */
+export const DEFAULT_OPERATING_CONFIG: OperatingConfig = {
+  maxFlightRadiusM: sharedConfig.homeRadiusM,
+  cruiseAltitudeM: sharedConfig.cruiseAltitudeM,
+};
+
+/**
+ * Regulatory ceiling on operator-chosen radius/altitude — kept a small
+ * margin below the actual legal limits (4000 m / 50 m) rather than exactly
+ * at them. Same config/shared.json value the backend enforces in
+ * realtime_server/protocol.py and config/shared_config.py's OperatingConfig,
+ * so the UI cap and the backend's hard rejection never disagree.
+ */
+export const LEGAL_MAX_FLIGHT_RADIUS_M = sharedConfig.legalMaxFlightRadiusM;
+export const LEGAL_MAX_CRUISE_ALTITUDE_M = sharedConfig.legalMaxCruiseAltitudeM;
 
 /** Initial map zoom level on first render, before any auto-follow occurs. */
 export const DEFAULT_ZOOM = 15;

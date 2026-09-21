@@ -4,8 +4,8 @@ import { generatePatrolRegions } from '../utils/patrolGeometry';
 import { HOME_RADIUS_METERS, HOME_REFERENCE } from '../config/mapConfig';
 import { realtimeServerConnection } from './internal/realtimeServerConnection';
 
-/** Static geometry, generated once from the Home reference/radius. Never mutated. */
-const PATROL_REGIONS: readonly PatrolRegion[] = generatePatrolRegions(HOME_REFERENCE, HOME_RADIUS_METERS);
+/** Geometry is rebuilt atomically after an accepted operating-config update. */
+let patrolRegions: readonly PatrolRegion[] = generatePatrolRegions(HOME_REFERENCE, HOME_RADIUS_METERS);
 
 /**
  * Abstraction over "how are patrol regions currently prioritized".
@@ -20,6 +20,7 @@ export interface PatrolService {
   setPriority(regionId: string): void;
   setAreaType(regionId: string, areaType: PatrolAreaType): void;
   clearPriorities(): void;
+  setMaxFlightRadius(radiusM: number): void;
 }
 
 function createInMemoryPatrolService(): PatrolService {
@@ -33,7 +34,7 @@ function createInMemoryPatrolService(): PatrolService {
   let authoritativeAreaTypes: Record<string, PatrolAreaType> = {};
 
   function buildConfig(): PatrolConfig {
-    const regions = PATROL_REGIONS.map((region) => {
+    const regions = patrolRegions.map((region) => {
       const idx = priorityOrder.indexOf(region.id);
       return {
         ...region,
@@ -132,6 +133,14 @@ function createInMemoryPatrolService(): PatrolService {
       priorityOrder = [];
       notify();
       publishPriorities();
+    },
+    setMaxFlightRadius(radiusM) {
+      if (!Number.isFinite(radiusM) || radiusM <= 0) {
+        throw new Error('Maximum flight radius must be a positive number');
+      }
+      const replacement = generatePatrolRegions(HOME_REFERENCE, radiusM);
+      patrolRegions = replacement;
+      notify();
     },
   };
 }

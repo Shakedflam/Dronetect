@@ -69,12 +69,6 @@
   color: #241a00;
 }
 
-.mission {
-  background: transparent;
-  border-color: var(--color-accent-green);
-  color: var(--color-accent-green);
-}
-
 .tilt {
   background: transparent;
   border-color: var(--color-text-muted);

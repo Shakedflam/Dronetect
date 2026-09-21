@@ -45,6 +45,8 @@ from hud import (
     signed_angle_to_target_degrees,
 )
 from services.commands import CommandName
+from config.shared_config import OperatingConfig, default_operating_config
+from realtime_server.protocol import operating_config_result
 from services.gps import (
     DEFAULT_HOME,
     LocalPosition,
@@ -63,6 +65,7 @@ from services.polygon_coverage import (
     PolygonCoverageConfig,
     PolygonCoveragePlanner,
 )
+from services.operating_config_apply import plan_operating_config_transition
 from services.patrol_planner import PatrolPlanner
 from services.patrol_progress import PausedPatrolCoverage
 from services.patrol_regions import (
@@ -119,10 +122,14 @@ class AutonomousDrone(Supervisor):
         self._active_roi_id: str | None = None
         self._mission_interruption: MissionInterruptionContext | None = None
         self._mission_return_prepared = False
+        self._pending_operating_config: OperatingConfig | None = None
         self.logic = FlightLogic(
             FlightConfig(
                 takeoff_altitude=float(
-                    os.getenv("DRONTECT_TAKEOFF_ALTITUDE_M", "15.0")
+                    os.getenv(
+                        "DRONTECT_TAKEOFF_ALTITUDE_M",
+                        str(default_operating_config.cruise_altitude_m),
+                    )
                 ),
                 x_bounds=(-60.0, -30.0),
                 y_bounds=(5.0, 20.0),
@@ -219,8 +226,8 @@ class AutonomousDrone(Supervisor):
             pursuit_config=PursuitConfig(
                 stable_duration_s=float(os.getenv("DRONTECT_PURSUIT_STABLE_SECONDS", "0.8")),
                 observation_timeout_s=float(os.getenv("DRONTECT_PURSUIT_OBSERVATION_TIMEOUT_SECONDS", "1.5")),
-                max_speed_mps=float(os.getenv("DRONTECT_PURSUIT_MAX_SPEED_MPS", "5.0")),
-                acceleration_mps2=float(os.getenv("DRONTECT_PURSUIT_ACCELERATION_MPS2", "2.0")),
+                max_speed_mps=float(os.getenv("DRONTECT_PURSUIT_MAX_SPEED_MPS", "6.0")),
+                acceleration_mps2=float(os.getenv("DRONTECT_PURSUIT_ACCELERATION_MPS2", "2.6")),
                 geofence_radius_m=max(region.outer_radius_m for region in self.patrol_regions.regions),
             ),
         )
@@ -284,7 +291,6 @@ class AutonomousDrone(Supervisor):
 
         self._announced_state = None
         self._announced_diagnostic_state: str | None = None
-        self._announced_random_target = None
         self._elapsed_time = 0.0
         self._last_hud_update_time = -1.0
         self._horizontal_speed_mps = 0.0
@@ -331,12 +337,13 @@ class AutonomousDrone(Supervisor):
                 print(f"Home captured at {self._format_position(position)}")
 
             self._enforce_connection_loss_rth()
-            self._handle_keyboard(position)
+            self._handle_keyboard()
             self._handle_realtime_commands(position)
             state_before_detection = self.logic.state
             self._handle_vision_detections(position, yaw)
             self.logic.update(position, dt, yaw=yaw, camera_pitch=self.camera_gimbal.pitch)
             self._coordinate_mission_resume(position, state_before_detection)
+            self._consume_pending_operating_config(position)
             position, yaw, speed_mps, vertical_speed_mps = self._apply_kinematic_flight(
                 position,
                 yaw,
@@ -365,24 +372,16 @@ class AutonomousDrone(Supervisor):
             else:
                 self._set_visual_motor_velocities()
 
-    def _handle_keyboard(self, position: Position) -> None:
+    def _handle_keyboard(self) -> None:
         key = self.keyboard.getKey()
         while key != -1:
             normalized_key = key & 0xFFFF
             if normalized_key in (ord("H"), ord("h")):
                 if self.logic.request_return_home():
                     self._clear_patrol_progress()
-                    print("Return Home requested: random flight cancelled.")
+                    print("Return Home requested.")
                 else:
                     print(f"Return Home ignored while {self.logic.state.value}.")
-            elif normalized_key in (ord("N"), ord("n")):
-                if self._safety_rth_active:
-                    print("New mission ignored during safety RTH.")
-                    key = self.keyboard.getKey()
-                    continue
-                self._clear_patrol_progress()
-                waypoint = self.logic.request_new_target(position)
-                print(f"New mission target: {self._format_position(waypoint)}")
             elif normalized_key in (ord("U"), ord("u")):
                 pitch = self.camera_gimbal.tilt_up()
                 self.camera_pitch_motor.setPosition(pitch)
@@ -396,11 +395,13 @@ class AutonomousDrone(Supervisor):
     def _handle_realtime_commands(self, position: Position) -> None:
         for message in self.realtime_client.drain_commands():
             command = CommandName(message["command"])
+            if command is CommandName.SET_OPERATING_CONFIG:
+                self._handle_operating_config_command(message, position)
+                continue
             if self._safety_rth_active and command in {
                 CommandName.START_PATROL,
                 CommandName.SET_ROI,
                 CommandName.CLEAR_ROI,
-                CommandName.NEW_MISSION,
                 CommandName.APPROVE_TARGET,
                 CommandName.REJECT_TARGET,
             }:
@@ -481,23 +482,192 @@ class AutonomousDrone(Supervisor):
                         self._clear_patrol_progress()
                         self.logic.request_patrol(position)
                 print("Realtime command clear_roi accepted.")
-            elif command == CommandName.NEW_MISSION:
-                self._clear_patrol_progress()
-                self._active_roi_id = None
-                waypoint = self.logic.request_new_target(position)
-                print(f"Realtime command new_mission: {self._format_position(waypoint)}")
             elif command == CommandName.CAMERA_TILT_UP:
                 pitch = self.camera_gimbal.tilt_up()
                 self.camera_pitch_motor.setPosition(pitch)
                 print(f"Realtime command camera_tilt_up: {pitch:.2f}")
             elif command == CommandName.APPROVE_TARGET:
-                self.logic.approve_target(message["params"]["trackId"], position)
+                track_id = message["params"]["trackId"]
+                if not self.logic.approve_target(track_id, position):
+                    print(
+                        f"Realtime command approve_target ignored: {track_id} is not "
+                        f"the tracked candidate while {self.logic.state.value}."
+                    )
             elif command == CommandName.REJECT_TARGET:
-                self.logic.reject_target(message["params"]["trackId"], position)
+                track_id = message["params"]["trackId"]
+                if not self.logic.reject_target(track_id, position):
+                    # Silence here is what makes an operator think the button
+                    # is broken: the usual cause is that the tracker has
+                    # already re-identified the object under a different id.
+                    print(
+                        f"Realtime command reject_target ignored: {track_id} is no "
+                        f"longer a known candidate (known: "
+                        f"{self.logic.target_decision_diagnostics()['rejectableTrackIds']})."
+                    )
             elif command == CommandName.CAMERA_TILT_DOWN:
                 pitch = self.camera_gimbal.tilt_down()
                 self.camera_pitch_motor.setPosition(pitch)
                 print(f"Realtime command camera_tilt_down: {pitch:.2f}")
+
+    def _handle_operating_config_command(self, message: dict, position: Position) -> None:
+        command_id = message["commandId"]
+        # Takeoff is deliberately not blocked here: _apply_operating_config
+        # already has dedicated handling for it (mark_queued_mission_config_stale
+        # below, consumed in FlightLogic.update() once the climb completes --
+        # see test_queued_roi_mission_refreshes_stale_geometry_when_marked_stale).
+        # Landing and RTH have no such support -- plan_operating_config_transition
+        # has no resume state for them -- so a mid-maneuver change there is
+        # rejected rather than left half-applied.
+        if self.logic.state in {FlightState.LANDING, FlightState.RETURNING_HOME}:
+            self.realtime_client.publish_control_message(
+                operating_config_result(
+                    command_id,
+                    accepted=False,
+                    message="Operating configuration cannot change during landing or return-to-home.",
+                )
+            )
+            return
+
+        try:
+            params = message["params"]
+            candidate = OperatingConfig(
+                max_flight_radius_m=params["maxFlightRadiusM"],
+                cruise_altitude_m=params["cruiseAltitudeM"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            self.realtime_client.publish_control_message(
+                operating_config_result(command_id, accepted=False, message=str(exc))
+            )
+            return
+
+        if self.logic.is_target_tracking or self.logic.state is FlightState.TARGET_RETURN:
+            # Don't interrupt pursuit/follow, nor a return-to-checkpoint:
+            # TARGET_RETURN is not a resume state
+            # plan_operating_config_transition recognizes, so applying here
+            # would only partially land -- a radius change would patch
+            # altitude but silently drop the radius until whatever this
+            # settles into next. Apply once settled instead (see
+            # _consume_pending_operating_config, called every tick from
+            # run()). REPOSITIONING is deliberately *not* deferred: it is a
+            # reposition leg, and the planner retargets it in place.
+            self._pending_operating_config = candidate
+            self.realtime_client.publish_control_message(
+                operating_config_result(command_id, accepted=True, pending=True)
+            )
+            return
+
+        self._apply_operating_config(candidate, position)
+        self.realtime_client.publish_control_message(
+            operating_config_result(command_id, accepted=True, pending=False)
+        )
+
+    def _apply_operating_config(
+        self,
+        candidate: OperatingConfig,
+        position: Position,
+    ) -> None:
+        old_max_flight_radius_m = self.logic.pursuit.config.geofence_radius_m
+        current_state = self.logic.state
+        transition = plan_operating_config_transition(
+            candidate=candidate,
+            old_max_flight_radius_m=old_max_flight_radius_m,
+            current_flight_state=current_state.value,
+            position=position,
+            patrol_regions=self.patrol_regions,
+            patrol_planner=self.patrol_planner,
+            pursuit_config=self.logic.pursuit.config,
+            roi_config=self.logic.roi_patrol_planner.config,
+            no_fly_router=self.no_fly_router,
+            reposition_destination=self.logic.reposition_destination,
+            reposition_resume_state=(
+                self.logic.reposition_resume_state.value
+                if self.logic.reposition_resume_state is not None
+                else None
+            ),
+        )
+        altitude_changed = not math.isclose(
+            self.logic.config.takeoff_altitude, candidate.cruise_altitude_m, rel_tol=1e-9,
+        )
+        radius_changed = not math.isclose(
+            old_max_flight_radius_m, candidate.max_flight_radius_m, rel_tol=1e-9,
+        )
+
+        # All decisions/construction happened above (plan_operating_config_transition
+        # is pure -- it mutated nothing). Swap the complete operating pair and its
+        # derived objects together before acknowledging.
+        (
+            self.patrol_regions,
+            self.patrol_planner,
+            self.logic.config,
+            self.logic.target_decisions.config,
+            self.logic.pursuit.config,
+            self.logic.roi_patrol_planner.config,
+        ) = (
+            transition.store,
+            transition.planner,
+            replace(
+                self.logic.config,
+                takeoff_altitude=candidate.cruise_altitude_m,
+                z_bounds=(candidate.cruise_altitude_m, candidate.cruise_altitude_m),
+            ),
+            replace(
+                self.logic.config,
+                takeoff_altitude=candidate.cruise_altitude_m,
+                z_bounds=(candidate.cruise_altitude_m, candidate.cruise_altitude_m),
+            ),
+            transition.pursuit_config,
+            transition.roi_config,
+        )
+
+        if transition.discard_patrol_progress:
+            self._clear_patrol_progress()
+
+        if transition.resume_state is not None:
+            self.logic.start_reposition(
+                list(transition.reposition_waypoints),
+                FlightState(transition.resume_state),
+            )
+        elif altitude_changed:
+            # No reposition leg is happening (radius unchanged, or this state
+            # has no coverage mission to resume proportionally) -- patch every
+            # waypoint already computed/stored under the old altitude so the
+            # change actually reaches flight, not just future computations.
+            if self.logic.target is not None:
+                target_x, target_y, _ = self.logic.target
+                self.logic.target = (target_x, target_y, candidate.cruise_altitude_m)
+            if current_state is FlightState.PATROLLING:
+                self._patrol_route_waypoints = deque(
+                    (x, y, candidate.cruise_altitude_m)
+                    for x, y, _ in self._patrol_route_waypoints
+                )
+            if current_state in {FlightState.TRANSITING_TO_ROI, FlightState.ROI_PATROL}:
+                self.logic.roi_patrol_planner.retarget_altitude(candidate.cruise_altitude_m)
+
+        if current_state is FlightState.TAKING_OFF and (radius_changed or altitude_changed):
+            # A mission is queued behind this climb (request_roi()/
+            # request_patrol() already computed its entry waypoint, and for
+            # ROI its clipped geometry, under the config now being replaced)
+            # -- recompute it fresh once takeoff completes instead of flying
+            # to a stale target.
+            self.logic.mark_queued_mission_config_stale()
+
+        print(
+            "Realtime operating configuration updated: "
+            f"radius={candidate.max_flight_radius_m:.2f} m "
+            f"cruise={candidate.cruise_altitude_m:.2f} m"
+            + (" (repositioning before resuming)" if transition.resume_state is not None else "")
+            + "."
+        )
+
+    def _consume_pending_operating_config(self, position: Position) -> None:
+        if (
+            self._pending_operating_config is not None
+            and not self.logic.is_target_tracking
+            and self.logic.state is not FlightState.TARGET_RETURN
+        ):
+            candidate = self._pending_operating_config
+            self._pending_operating_config = None
+            self._apply_operating_config(candidate, position)
 
     def _handle_vision_detections(self, position: Position, yaw: float) -> None:
         allow_landing_intercept = (
@@ -691,11 +861,11 @@ class AutonomousDrone(Supervisor):
                 FlightState.TRANSITING_TO_ROI,
                 FlightState.ROI_PATROL,
                 FlightState.PATROLLING,
+                FlightState.REPOSITIONING,
                 FlightState.TARGET_ACQUISITION,
                 FlightState.TARGET_FOLLOW,
                 FlightState.TARGET_PURSUIT,
                 FlightState.TARGET_RETURN,
-                FlightState.FLYING_RANDOMLY,
                 FlightState.RETURNING_HOME,
             }:
                 if state not in {
@@ -745,13 +915,6 @@ class AutonomousDrone(Supervisor):
         if self.logic.state is not self._announced_state:
             print(f"State: {self.logic.state.value}")
             self._announced_state = self.logic.state
-
-        if (
-            self.logic.state is FlightState.FLYING_RANDOMLY
-            and self.logic.target != self._announced_random_target
-        ):
-            print(f"Random waypoint: {self._format_position(self.logic.target)}")
-            self._announced_random_target = self.logic.target
 
     def _update_altitude_smoke(self, position: Position) -> None:
         """Validate altitude matching against Webots truth in smoke mode only."""
@@ -911,9 +1074,9 @@ class AutonomousDrone(Supervisor):
         }:
             return self._target_tracking_flight_config
         if self.logic.state in {
-            FlightState.FLYING_RANDOMLY,
             FlightState.ROI_PATROL,
             FlightState.PATROLLING,
+            FlightState.REPOSITIONING,
         }:
             return self.SEARCH_KINEMATIC_FLIGHT_CONFIG
         return self.KINEMATIC_FLIGHT_CONFIG
@@ -999,6 +1162,7 @@ class AutonomousDrone(Supervisor):
             aircraft_safety_rth_active=self._safety_rth_active,
             aircraft_safety_rth_reason=self._safety_rth_reason,
             target_follow_diagnostics=self.logic.target_follow_diagnostics(),
+            operating_config_pending=self._pending_operating_config is not None,
         )
         self.realtime_client.publish_telemetry(telemetry)
 
@@ -1020,11 +1184,11 @@ class AutonomousDrone(Supervisor):
             FlightState.TRANSITING_TO_ROI,
             FlightState.ROI_PATROL,
             FlightState.PATROLLING,
+            FlightState.REPOSITIONING,
             FlightState.TARGET_ACQUISITION,
             FlightState.TARGET_FOLLOW,
             FlightState.TARGET_PURSUIT,
             FlightState.TARGET_RETURN,
-            FlightState.FLYING_RANDOMLY,
             FlightState.RETURNING_HOME,
             FlightState.LANDING,
         }

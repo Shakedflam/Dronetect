@@ -18,7 +18,7 @@ export interface TelemetryData {
   altitudeM: number;
   /** Battery charge, 0-100. */
   batteryPercent: number;
-  /** Flight-state machine value from the realtime server, e.g. IDLE, FLYING_RANDOMLY, RETURNING_HOME. */
+  /** Flight-state machine value from the realtime server, e.g. IDLE, PATROLLING, RETURNING_HOME. */
   state: string;
   targetFollowDiagnostics: TargetFollowDiagnostics | null;
   /** Mock-only field with no realtime server equivalent; absent on live telemetry. */

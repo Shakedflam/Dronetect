@@ -26,7 +26,7 @@ def make_logic(**config_overrides):
 
 
 def finish_takeoff(logic):
-    logic.request_new_target(HOME)
+    logic.request_mission_takeoff(HOME)
     logic.update((HOME[0], HOME[1], logic.config.takeoff_altitude), 0.1)
 
 
@@ -56,21 +56,21 @@ def test_startup_updates_never_cause_takeoff_or_horizontal_movement():
     assert logic.target == HOME
 
 
-def test_new_mission_instruction_starts_takeoff_from_idle():
+def test_mission_takeoff_instruction_starts_takeoff_from_idle():
     logic = make_logic()
 
-    logic.request_new_target(HOME)
+    logic.request_mission_takeoff(HOME)
 
     assert logic.state is FlightState.TAKING_OFF
     assert logic.target == (HOME[0], HOME[1], logic.config.takeoff_altitude)
 
 
-def test_reaching_takeoff_altitude_starts_random_flight():
+def test_reaching_takeoff_altitude_holds():
     logic = make_logic()
 
     finish_takeoff(logic)
 
-    assert logic.state is FlightState.FLYING_RANDOMLY
+    assert logic.state is FlightState.HOLDING
     assert logic.target is not None
 
 
@@ -114,6 +114,230 @@ def test_normal_patrol_takes_off_and_continuously_requests_waypoints():
     assert logic.state is FlightState.PATROLLING
     assert logic.target == (0.0, 20.0, 12.0)
     assert calls == [(HOME, False), (first, True)]
+
+
+def test_takeoff_completion_accepts_altitude_above_cruise_target():
+    logic = make_logic(takeoff_altitude=12.0, vertical_tolerance=0.25)
+    logic.request_mission_takeoff(HOME)
+
+    logic.update((HOME[0], HOME[1], 15.0), 0.1)
+
+    assert logic.state is FlightState.HOLDING
+
+
+def test_queued_roi_mission_refreshes_stale_geometry_when_marked_stale():
+    logic = make_logic(takeoff_altitude=12.0)
+    logic.request_roi(HOME, center=(100.0, 0.0), radius_m=20.0)
+    assert logic.state is FlightState.TAKING_OFF
+    assert logic._queued_waypoint == (100.0, 0.0, 12.0)  # computed under the old altitude
+
+    # Simulate an operating-config change arriving mid-climb: the config
+    # itself is swapped by the caller (autonomous_drone.py), which then
+    # flags the queued mission stale.
+    logic.config = FlightConfig(takeoff_altitude=18.0)
+    logic.mark_queued_mission_config_stale()
+
+    logic.update((HOME[0], HOME[1], 18.0), 0.1)
+
+    assert logic.state is FlightState.TRANSITING_TO_ROI
+    assert logic.target == (100.0, 0.0, 18.0)  # fresh, not the stale 12.0 waypoint
+
+
+def test_queued_patrol_mission_is_not_recomputed_when_not_marked_stale():
+    calls = []
+
+    def next_waypoint(position, completed):
+        calls.append((position, completed))
+        return (20.0, 0.0, 12.0)
+
+    logic = FlightLogic(
+        config=FlightConfig(takeoff_altitude=12.0),
+        patrol_waypoint_provider=next_waypoint,
+    )
+    logic.initialize_home(HOME)
+    first = logic.request_patrol(HOME)
+    assert calls == [(HOME, False)]
+
+    logic.update((HOME[0], HOME[1], 12.0), 0.1)
+
+    assert logic.state is FlightState.PATROLLING
+    assert logic.target == first
+    # No config change happened during the climb -- the provider must not
+    # be called a second time just because takeoff completed.
+    assert calls == [(HOME, False)]
+
+
+def test_reposition_flies_to_target_then_resumes_patrolling():
+    calls = []
+
+    def next_waypoint(position, completed):
+        calls.append((position, completed))
+        return (5.0, 0.0, 12.0)
+
+    logic = FlightLogic(
+        config=FlightConfig(takeoff_altitude=12.0),
+        patrol_waypoint_provider=next_waypoint,
+    )
+    logic.initialize_home(HOME)
+    reposition_target = (50.0, 0.0, 12.0)
+
+    logic.start_reposition([reposition_target], FlightState.PATROLLING)
+
+    assert logic.state is FlightState.REPOSITIONING
+    assert logic.target == reposition_target
+
+    logic.update(reposition_target, 0.1)
+
+    assert logic.state is FlightState.PATROLLING
+    assert logic.target == (5.0, 0.0, 12.0)
+    assert calls == [(reposition_target, False)]
+
+
+def test_reposition_with_multiple_legs_visits_each_in_order():
+    logic = FlightLogic(
+        config=FlightConfig(takeoff_altitude=12.0),
+        patrol_waypoint_provider=lambda position, completed: (0.0, 0.0, 12.0),
+    )
+    logic.initialize_home(HOME)
+    legs = [(10.0, 0.0, 12.0), (10.0, 10.0, 12.0), (0.0, 10.0, 12.0)]
+
+    logic.start_reposition(legs, FlightState.PATROLLING)
+    assert logic.target == legs[0]
+
+    logic.update(legs[0], 0.1)
+    assert logic.state is FlightState.REPOSITIONING
+    assert logic.target == legs[1]
+
+    logic.update(legs[1], 0.1)
+    assert logic.state is FlightState.REPOSITIONING
+    assert logic.target == legs[2]
+
+    logic.update(legs[2], 0.1)
+    assert logic.state is FlightState.PATROLLING
+
+
+class _SpyRoiPatrolPlanner:
+    """Minimal RoiPatrolPlan double that records reset() calls."""
+
+    def __init__(self, first_waypoint):
+        self._first_waypoint = first_waypoint
+        self.reset_calls = []
+
+    def reset(self, center, radius_m, altitude_m, current_position):
+        self.reset_calls.append((center, radius_m, altitude_m, current_position))
+        return self._first_waypoint
+
+    def next_waypoint(self):
+        return self._first_waypoint
+
+    def entry_target(self, center, altitude_m):
+        return self._first_waypoint
+
+    def contains(self, position):
+        return True
+
+    def closest_waypoint(self, position):
+        return self._first_waypoint
+
+    def retarget_altitude(self, new_altitude_m):
+        pass
+
+    def clear(self):
+        pass
+
+    def snapshot(self):
+        raise NotImplementedError
+
+    def restore(self, progress):
+        raise NotImplementedError
+
+
+def test_reposition_resumes_roi_patrol_with_fresh_clip():
+    spy = _SpyRoiPatrolPlanner(first_waypoint=(12.0, 0.0, 12.0))
+    logic = FlightLogic(
+        config=FlightConfig(takeoff_altitude=12.0),
+        roi_patrol_planner=spy,
+    )
+    logic.initialize_home(HOME)
+    logic.request_roi(HOME, center=(10.0, 0.0), radius_m=20.0)
+    spy.reset_calls.clear()
+    reposition_target = (5.0, 0.0, 12.0)
+
+    logic.start_reposition([reposition_target], FlightState.ROI_PATROL)
+    logic.update(reposition_target, 0.1)
+
+    assert logic.state is FlightState.ROI_PATROL
+    assert logic.target == (12.0, 0.0, 12.0)
+    assert spy.reset_calls == [((10.0, 0.0), 20.0, 12.0, reposition_target)]
+
+
+def test_reposition_resume_falls_back_to_patrolling_when_roi_no_longer_overlaps():
+    calls = []
+
+    def next_waypoint(position, completed):
+        calls.append((position, completed))
+        return (5.0, 0.0, 12.0)
+
+    logic = FlightLogic(
+        config=FlightConfig(takeoff_altitude=12.0),
+        patrol_waypoint_provider=next_waypoint,
+    )
+    logic.initialize_home(HOME)
+    logic.request_roi(HOME, center=(280.0, 0.0), radius_m=10.0)
+    # Simulate a radius shrink applied while the ROI was set aside for the
+    # reposition leg: once the drone arrives, resuming ROI patrol under this
+    # much smaller flight radius would find zero overlap.
+    logic.roi_patrol_planner.config = type(logic.roi_patrol_planner.config)(
+        max_flight_radius_m=50.0
+    )
+    reposition_target = (15.0, 0.0, 12.0)
+
+    logic.start_reposition([reposition_target], FlightState.ROI_PATROL)
+    logic.update(reposition_target, 0.1)
+
+    assert logic.state is FlightState.PATROLLING
+    assert logic.target == (5.0, 0.0, 12.0)
+    assert calls == [(reposition_target, False)]
+
+
+def test_clear_roi_cancels_an_in_progress_roi_reposition():
+    logic = make_logic(takeoff_altitude=12.0)
+    logic.request_roi(HOME, center=(10.0, 0.0), radius_m=20.0)
+    reposition_target = (5.0, 0.0, 12.0)
+    logic.start_reposition([reposition_target], FlightState.ROI_PATROL)
+    current = (2.0, 0.0, 12.0)
+
+    logic.clear_roi(current)
+
+    assert logic.state is FlightState.HOLDING
+    assert logic.target == current
+
+
+def test_start_reposition_rejects_empty_waypoints_and_bad_resume_state():
+    logic = make_logic(takeoff_altitude=12.0)
+
+    with pytest.raises(ValueError, match="at least one waypoint"):
+        logic.start_reposition([], FlightState.PATROLLING)
+    with pytest.raises(ValueError, match="PATROLLING or ROI_PATROL"):
+        logic.start_reposition([(1.0, 0.0, 12.0)], FlightState.HOLDING)
+
+
+@pytest.mark.parametrize(
+    "state,expected",
+    [
+        (FlightState.TARGET_ACQUISITION, True),
+        (FlightState.TARGET_FOLLOW, True),
+        (FlightState.TARGET_PURSUIT, True),
+        (FlightState.PATROLLING, False),
+        (FlightState.REPOSITIONING, False),
+        (FlightState.HOLDING, False),
+    ],
+)
+def test_is_target_tracking_property(state, expected):
+    logic = make_logic()
+    logic.state = state
+
+    assert logic.is_target_tracking is expected
 
 
 def test_manual_return_home_can_be_replaced_by_patrol_while_airborne():
@@ -321,7 +545,6 @@ def test_clear_roi_during_takeoff_keeps_climb_but_cancels_transit():
 
 def test_random_waypoints_stay_inside_all_configured_bounds():
     logic = make_logic()
-    finish_takeoff(logic)
 
     for _ in range(50):
         x, y, z = logic.choose_random_waypoint()
@@ -330,23 +553,12 @@ def test_random_waypoints_stay_inside_all_configured_bounds():
         assert logic.config.z_bounds[0] <= z <= logic.config.z_bounds[1]
 
 
-def test_reaching_mission_waypoint_returns_to_home_automatically():
-    logic = make_logic()
-    finish_takeoff(logic)
-    mission_target = logic.target
-
-    logic.update(mission_target, 0.1)
-
-    assert logic.state is FlightState.RETURNING_HOME
-    assert logic.target == (HOME[0], HOME[1], logic.config.takeoff_altitude)
-
-
 @pytest.mark.parametrize(
     "starting_state",
     [
         FlightState.TAKING_OFF,
         FlightState.PATROLLING,
-        FlightState.FLYING_RANDOMLY,
+        FlightState.REPOSITIONING,
     ],
 )
 def test_return_home_replaces_active_target(starting_state):
@@ -361,7 +573,7 @@ def test_return_home_replaces_active_target(starting_state):
     assert logic.target == (HOME[0], HOME[1], logic.config.takeoff_altitude)
 
 
-def test_returning_home_never_resumes_random_flight():
+def test_returning_home_never_resumes_the_previous_mission():
     logic = make_logic()
     finish_takeoff(logic)
     logic.request_return_home()
@@ -557,72 +769,3 @@ def test_navigation_stops_forward_motion_inside_target_tolerance():
     assert pitch_command == 0.0
 
 
-def test_new_target_from_landed_preserves_home_and_starts_takeoff():
-    logic = make_logic()
-    logic.state = FlightState.LANDED
-
-    waypoint = logic.request_new_target(HOME)
-
-    assert logic.home == HOME
-    assert logic.state is FlightState.TAKING_OFF
-    assert logic.target == (HOME[0], HOME[1], logic.config.takeoff_altitude)
-    assert waypoint != logic.target
-
-
-def test_new_target_during_flight_replaces_target_immediately():
-    logic = make_logic()
-    finish_takeoff(logic)
-    previous_target = logic.target
-    airborne = (0.0, 0.0, logic.config.takeoff_altitude)
-
-    waypoint = logic.request_new_target(airborne)
-
-    assert logic.home == HOME
-    assert logic.state is FlightState.FLYING_RANDOMLY
-    assert logic.target == waypoint
-    assert logic.target != previous_target
-
-
-def test_new_target_cancels_return_home_when_altitude_is_safe():
-    logic = make_logic()
-    finish_takeoff(logic)
-    logic.request_return_home()
-    airborne = (2.0, 1.0, logic.config.takeoff_altitude)
-
-    waypoint = logic.request_new_target(airborne)
-
-    assert logic.state is FlightState.FLYING_RANDOMLY
-    assert logic.target == waypoint
-    assert logic.home == HOME
-
-
-def test_new_target_cancels_low_landing_and_climbs_before_departing():
-    logic = make_logic()
-    logic.state = FlightState.LANDING
-    low_position = (0.2, -0.1, 0.5)
-
-    waypoint = logic.request_new_target(low_position)
-
-    assert logic.state is FlightState.TAKING_OFF
-    assert logic.target == (
-        low_position[0],
-        low_position[1],
-        logic.config.takeoff_altitude,
-    )
-
-    logic.update(logic.target, 0.1)
-
-    assert logic.state is FlightState.FLYING_RANDOMLY
-    assert logic.target == waypoint
-    assert logic.home == HOME
-
-
-def test_new_target_while_taking_off_replaces_the_queued_waypoint():
-    logic = make_logic()
-    first = logic.request_new_target(HOME)
-
-    second = logic.request_new_target((0.0, 0.0, 1.0))
-    logic.update((0.0, 0.0, logic.config.takeoff_altitude), 0.1)
-
-    assert second != first
-    assert logic.target == second

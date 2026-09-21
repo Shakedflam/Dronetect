@@ -34,6 +34,7 @@ def build_simulator_telemetry(
     aircraft_safety_rth_active: bool = False,
     aircraft_safety_rth_reason: str | None = None,
     target_follow_diagnostics: dict[str, Any] | None = None,
+    operating_config_pending: bool = False,
     timestamp: float | None = None,
 ) -> dict:
     """Build the JSON-compatible simulator telemetry message."""
@@ -57,5 +58,6 @@ def build_simulator_telemetry(
             "aircraftSafetyRthActive": aircraft_safety_rth_active,
             "aircraftSafetyRthReason": aircraft_safety_rth_reason,
             "targetFollowDiagnostics": target_follow_diagnostics,
+            "operatingConfigPending": operating_config_pending,
         },
     }

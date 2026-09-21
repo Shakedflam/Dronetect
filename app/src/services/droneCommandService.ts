@@ -1,18 +1,19 @@
 import { realtimeServerConnection } from './internal/realtimeServerConnection';
 import type { Roi } from '../types/roi';
+import type { OperatingConfig } from '../types/operatingConfig';
 
 /**
  * Abstraction over the high-level commands the operator can issue.
- * returnToHome/newMission/cameraTiltUp/cameraTiltDown are real realtime
+ * returnToHome/cameraTiltUp/cameraTiltDown are real realtime
  * server commands, sent over the shared `realtimeServerConnection`.
  * Approve/Reject act on a specific acquisition candidate. Engage remains mocked.
  */
 export interface DroneCommandService {
+  setOperatingConfig(config: OperatingConfig): Promise<void>;
   startPatrol(): Promise<void>;
   setRoi(roi: Roi): Promise<void>;
   clearRoi(): Promise<void>;
   returnToHome(): Promise<void>;
-  newMission(): Promise<void>;
   cameraTiltUp(): Promise<void>;
   cameraTiltDown(): Promise<void>;
   approveTarget(targetId: string): Promise<void>;
@@ -29,6 +30,11 @@ function mockCommand(label: string): Promise<void> {
 
 function createDroneCommandService(): DroneCommandService {
   return {
+    setOperatingConfig: (config) =>
+      realtimeServerConnection.sendCommand('set_operating_config', {
+        maxFlightRadiusM: config.maxFlightRadiusM,
+        cruiseAltitudeM: config.cruiseAltitudeM,
+      }),
     startPatrol: () => realtimeServerConnection.sendCommand('start_patrol'),
     setRoi: (roi) =>
       realtimeServerConnection.sendCommand('set_roi', {
@@ -37,7 +43,6 @@ function createDroneCommandService(): DroneCommandService {
       }),
     clearRoi: () => realtimeServerConnection.sendCommand('clear_roi'),
     returnToHome: () => realtimeServerConnection.sendCommand('return_home'),
-    newMission: () => realtimeServerConnection.sendCommand('new_mission'),
     cameraTiltUp: () => realtimeServerConnection.sendCommand('camera_tilt_up'),
     cameraTiltDown: () => realtimeServerConnection.sendCommand('camera_tilt_down'),
     approveTarget: (trackId) => realtimeServerConnection.sendCommand('approve_target', { trackId }),

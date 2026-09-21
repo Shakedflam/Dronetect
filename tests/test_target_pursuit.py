@@ -1,6 +1,7 @@
 import math
 import importlib.util
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -21,6 +22,7 @@ from services.gps import LocalPosition
 from services.mission_interruption import InterruptedMissionType
 from services.no_fly_router import NoFlyRouter
 from services.patrol_regions import PatrolAreaType, PatrolRegionStore
+from services.patrol_planner import PatrolPlanner
 from services.telemetry import build_simulator_telemetry
 
 
@@ -458,6 +460,7 @@ def simulator(monkeypatch):
     drone._patrol_route_waypoints = deque()
     drone._target_patrol_region_id = None
     drone._paused_patrol_coverage = None
+    drone._pending_operating_config = None
     drone.patrol_regions = PatrolRegionStore()
     drone.no_fly_router = NoFlyRouter()
     drone.patrol_planner = Mock()
@@ -488,6 +491,227 @@ def test_simulator_pursuit_crosses_no_fly_but_collision_still_overrides(simulato
     simulator.no_fly_router.route.assert_not_called()
 
 
+def test_controller_applies_operating_config_pair_atomically_while_grounded(simulator):
+    simulator.patrol_planner = PatrolPlanner(store=simulator.patrol_regions)
+    simulator.realtime_client = Mock()
+    simulator.logic.state = FlightState.IDLE
+
+    simulator._handle_operating_config_command(
+        {
+            "commandId": "config-1",
+            "params": {"maxFlightRadiusM": 750.0, "cruiseAltitudeM": 15.25},
+        },
+        POSITION,
+    )
+
+    assert simulator.logic.config.takeoff_altitude == 15.25
+    assert simulator.logic.config.z_bounds == (15.25, 15.25)
+    assert simulator.logic.pursuit.config.geofence_radius_m == 750.0
+    assert simulator.logic.roi_patrol_planner.config.max_flight_radius_m == 750.0
+    assert max(region.outer_radius_m for region in simulator.patrol_regions.regions) == 750.0
+    assert simulator.logic.state is FlightState.IDLE
+    result = simulator.realtime_client.publish_control_message.call_args.args[0]
+    assert result == {
+        "type": "operating_config_result",
+        "commandId": "config-1",
+        "accepted": True,
+        "pending": False,
+    }
+
+
+def test_radius_change_mid_reposition_applies_now_instead_of_queueing(simulator):
+    """Queueing it let the aircraft finish flying to a destination chosen for
+    the previous radius -- outward across the new boundary when shrinking --
+    and only replan on arrival, re-scoring every region from scratch rather
+    than continuing toward the one it was heading for."""
+    simulator.patrol_planner = PatrolPlanner(store=simulator.patrol_regions)
+    simulator.realtime_client = Mock()
+    simulator.logic.pursuit.config = replace(
+        simulator.logic.pursuit.config, geofence_radius_m=270.0,
+    )
+    simulator.logic.start_reposition([(240.0, 0.0, 15.0)], FlightState.PATROLLING)
+
+    simulator._handle_operating_config_command(
+        {
+            "commandId": "config-mid-leg",
+            "params": {"maxFlightRadiusM": 200.0, "cruiseAltitudeM": 15.0},
+        },
+        (250.0, 0.0, 15.0),
+    )
+
+    result = simulator.realtime_client.publish_control_message.call_args.args[0]
+    assert result["accepted"] is True
+    assert result["pending"] is False
+    assert simulator.logic.state is FlightState.REPOSITIONING
+    assert simulator.logic.pursuit.config.geofence_radius_m == 200.0
+    # The leg now ends at the old destination rescaled by 200/270, pulling the
+    # aircraft back inside the new boundary instead of continuing out to 240.
+    assert simulator.logic.reposition_destination[0] == pytest.approx(
+        240.0 * 200.0 / 270.0
+    )
+
+
+def test_radius_change_during_takeoff_drops_patrol_route_planned_for_the_old_radius(simulator):
+    """request_patrol() plans its entire first coverage route immediately, so
+    a patrol ordered seconds before a radius change is already holding
+    old-radius waypoints while the aircraft is still climbing. Keeping them
+    sent the aircraft around the old perimeter -- outside the new boundary
+    after a shrink -- before any new-radius planning happened."""
+    simulator.patrol_planner = PatrolPlanner(store=simulator.patrol_regions)
+    simulator.realtime_client = Mock()
+    simulator.logic.state = FlightState.TAKING_OFF
+    stale_route = [(9999.0, 9999.0, 15.0)] * 4
+    simulator._patrol_route_waypoints = deque(stale_route)
+    simulator._target_patrol_region_id = "N-1"
+
+    simulator._handle_operating_config_command(
+        {
+            "commandId": "config-shrink",
+            "params": {"maxFlightRadiusM": 120.0, "cruiseAltitudeM": 15.0},
+        },
+        POSITION,
+    )
+
+    assert simulator.realtime_client.publish_control_message.call_args.args[0]["accepted"] is True
+    assert not simulator._patrol_route_waypoints
+    assert simulator._target_patrol_region_id is None
+
+
+def test_altitude_only_change_during_takeoff_keeps_the_planned_patrol_route(simulator):
+    simulator.patrol_planner = PatrolPlanner(store=simulator.patrol_regions)
+    simulator.realtime_client = Mock()
+    simulator.logic.state = FlightState.TAKING_OFF
+    radius = simulator.logic.pursuit.config.geofence_radius_m
+    simulator._patrol_route_waypoints = deque([(30.0, 40.0, 15.0)])
+    simulator._target_patrol_region_id = "N-1"
+
+    simulator._handle_operating_config_command(
+        {
+            "commandId": "config-altitude",
+            "params": {"maxFlightRadiusM": radius, "cruiseAltitudeM": 21.0},
+        },
+        POSITION,
+    )
+
+    assert simulator._target_patrol_region_id == "N-1"
+    assert len(simulator._patrol_route_waypoints) == 1
+
+
+def test_controller_rejects_operating_config_change_while_landing(simulator):
+    simulator.patrol_planner = PatrolPlanner(store=simulator.patrol_regions)
+    simulator.realtime_client = Mock()
+    simulator.logic.state = FlightState.LANDING
+    previous_config = simulator.logic.config
+    previous_store = simulator.patrol_regions
+
+    simulator._handle_operating_config_command(
+        {
+            "commandId": "config-2",
+            "params": {"maxFlightRadiusM": 750.0, "cruiseAltitudeM": 15.25},
+        },
+        POSITION,
+    )
+
+    assert simulator.logic.config is previous_config
+    assert simulator.patrol_regions is previous_store
+    result = simulator.realtime_client.publish_control_message.call_args.args[0]
+    assert result["accepted"] is False
+
+
+def test_controller_operating_config_radius_change_mid_patrol_triggers_reposition(simulator):
+    simulator.patrol_planner = PatrolPlanner(store=simulator.patrol_regions)
+    simulator.realtime_client = Mock()
+    old_radius = simulator.logic.pursuit.config.geofence_radius_m
+    simulator.logic.state = FlightState.PATROLLING
+    simulator.logic.target = WAYPOINT
+    simulator._patrol_route_waypoints = deque([WAYPOINT])
+    simulator._target_patrol_region_id = "N-1"
+
+    simulator._handle_operating_config_command(
+        {
+            "commandId": "config-3",
+            "params": {"maxFlightRadiusM": old_radius / 2.0, "cruiseAltitudeM": 15.25},
+        },
+        POSITION,
+    )
+
+    assert simulator.logic.state is FlightState.REPOSITIONING
+    ratio = (old_radius / 2.0) / old_radius
+    assert simulator.logic.target == pytest.approx(
+        (POSITION[0] * ratio, POSITION[1] * ratio, 15.25)
+    )
+    # Stale waypoints/region tracking from the old radius must not survive.
+    assert simulator._target_patrol_region_id is None
+    assert not simulator._patrol_route_waypoints
+    assert simulator.logic.pursuit.config.geofence_radius_m == old_radius / 2.0
+    result = simulator.realtime_client.publish_control_message.call_args.args[0]
+    assert result == {
+        "type": "operating_config_result",
+        "commandId": "config-3",
+        "accepted": True,
+        "pending": False,
+    }
+
+
+def test_controller_operating_config_change_mid_pursuit_is_deferred(simulator):
+    simulator.patrol_planner = PatrolPlanner(store=simulator.patrol_regions)
+    simulator.realtime_client = Mock()
+    enter(simulator.logic)
+    previous_config = simulator.logic.config
+
+    simulator._handle_operating_config_command(
+        {
+            "commandId": "config-4",
+            "params": {"maxFlightRadiusM": 750.0, "cruiseAltitudeM": 15.25},
+        },
+        POSITION,
+    )
+
+    assert simulator.logic.state is FlightState.TARGET_PURSUIT
+    assert simulator.logic.config is previous_config
+    assert simulator._pending_operating_config is not None
+    result = simulator.realtime_client.publish_control_message.call_args.args[0]
+    assert result == {
+        "type": "operating_config_result",
+        "commandId": "config-4",
+        "accepted": True,
+        "pending": True,
+    }
+
+    simulator.logic.complete_target_follow(POSITION)
+    simulator.logic.update(POSITION, 0.1)  # drains TARGET_RETURN back to PATROLLING
+    simulator._consume_pending_operating_config(POSITION)
+
+    assert simulator._pending_operating_config is None
+    assert simulator.logic.pursuit.config.geofence_radius_m == 750.0
+
+
+def test_operating_config_change_while_repositioning_lands_radius_and_altitude(simulator):
+    """Both halves of the pair must land on a leg that is already flying --
+    an earlier version deferred the whole change here, and a version before
+    that applied only the altitude and silently dropped the radius."""
+    simulator.patrol_planner = PatrolPlanner(store=simulator.patrol_regions)
+    simulator.realtime_client = Mock()
+    simulator.logic.start_reposition([(200.0, 0.0, 15.0)], FlightState.PATROLLING)
+
+    simulator._handle_operating_config_command(
+        {
+            "commandId": "config-5",
+            "params": {"maxFlightRadiusM": 750.0, "cruiseAltitudeM": 15.25},
+        },
+        POSITION,
+    )
+
+    assert simulator.logic.state is FlightState.REPOSITIONING
+    assert simulator.logic.config.takeoff_altitude == 15.25
+    assert simulator.logic.pursuit.config.geofence_radius_m == 750.0
+    assert max(region.outer_radius_m for region in simulator.patrol_regions.regions) == 750.0
+    assert simulator._pending_operating_config is None
+    result = simulator.realtime_client.publish_control_message.call_args.args[0]
+    assert result["accepted"] is True
+    assert result["pending"] is False
+
+
 def test_simulator_reaches_checkpoint_exactly_without_waypoint_deadzone(simulator):
     enter(simulator.logic)
     simulator.logic.complete_target_follow()
@@ -499,9 +723,32 @@ def test_simulator_reaches_checkpoint_exactly_without_waypoint_deadzone(simulato
         simulator.logic.update(position, 0.1)
         if simulator.logic.state is FlightState.PATROLLING:
             break
-    assert position == POSITION
+    # Back at the checkpoint, far inside the half-metre dead zone an ordinary
+    # waypoint would have settled for -- but not bit-exact, which no real
+    # position readback ever is. See FlightConfig.checkpoint_tolerance.
+    assert math.dist(position, POSITION) <= simulator.logic.config.checkpoint_tolerance
     assert simulator.logic.state is FlightState.PATROLLING
     assert simulator.logic.target == WAYPOINT
+
+
+def test_target_return_completes_when_readback_trails_the_commanded_pose(simulator):
+    """The controller commands a pose, then reads the next one back off a
+    physics body that has been stepped in between, so the two never match
+    bit-exactly. An arrival gate demanding equality never opened: the aircraft
+    hovered at the checkpoint in TARGET_RETURN forever at zero speed instead
+    of resuming its patrol."""
+    enter(simulator.logic)
+    simulator.logic.complete_target_follow()
+    position = (POSITION[0] + 0.1, POSITION[1], POSITION[2])
+    simulator.logic.update(position, 0.1)
+    assert simulator.logic.state is FlightState.TARGET_RETURN
+    for _ in range(50):
+        commanded, _, _, _ = simulator._apply_kinematic_flight(position, 0, 0.1)
+        position = (commanded[0], commanded[1], commanded[2] - 1e-3)
+        simulator.logic.update(position, 0.1)
+        if simulator.logic.state is FlightState.PATROLLING:
+            break
+    assert simulator.logic.state is FlightState.PATROLLING
 
 
 def test_set_patrol_priorities_replans_active_patrol_immediately(simulator):

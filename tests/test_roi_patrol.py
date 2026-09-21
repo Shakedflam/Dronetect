@@ -54,6 +54,51 @@ def test_tiny_roi_degrades_safely_to_center_hold():
     assert planner.next_waypoint() == first
 
 
+def test_partial_roi_is_clipped_to_maximum_flight_radius():
+    planner = LawnMowerRoiPatrolPlanner(
+        RoiPatrolConfig(
+            lane_count=5,
+            boundary_margin_m=0.5,
+            max_flight_radius_m=30.0,
+        )
+    )
+
+    planner.reset((28.0, 0.0), 10.0, 15.0, (0.0, 0.0, 15.0))
+
+    assert planner.waypoints
+    for x, y, altitude in planner.waypoints:
+        assert math.hypot(x, y) <= 30.0 + 1e-6
+        assert math.hypot(x - 28.0, y) <= 10.0 + 1e-6
+        assert altitude == 15.0
+
+
+def test_non_overlapping_roi_is_rejected_without_waypoints():
+    planner = LawnMowerRoiPatrolPlanner(
+        RoiPatrolConfig(max_flight_radius_m=30.0)
+    )
+
+    with pytest.raises(ValueError, match="does not overlap"):
+        planner.reset((50.0, 0.0), 5.0, 15.0, (0.0, 0.0, 15.0))
+
+    assert planner.waypoints == ()
+
+
+def test_retarget_altitude_rewrites_z_without_changing_order_or_next_index():
+    planner = LawnMowerRoiPatrolPlanner(RoiPatrolConfig(lane_count=3))
+    planner.reset((0.0, 0.0), 20.0, 10.0, (-20.0, 0.0, 10.0))
+    planner.next_waypoint()
+    xy_before = [(x, y) for x, y, _ in planner.waypoints]
+    next_index_before = planner._next_index
+
+    planner.retarget_altitude(20.0)
+
+    assert [(x, y) for x, y, _ in planner.waypoints] == xy_before
+    assert all(z == 20.0 for _, _, z in planner.waypoints)
+    assert planner._next_index == next_index_before
+    next_x, next_y, next_z = planner.next_waypoint()
+    assert next_z == 20.0
+
+
 @pytest.mark.parametrize(
     "config",
     [

@@ -60,12 +60,61 @@ def ground_projection(box, width, height, position, yaw, camera_pitch, fov,
             position[1] + scale * (forward * math.sin(yaw) - right * math.cos(yaw)))
 
 
+def range_estimated_projection(box, width, height, position, yaw, camera_pitch, fov,
+                               reference_distance_m, reference_area_ratio,
+                               max_range) -> Point2 | None:
+    """Locate a target by calibrated box area instead of a ground intersection.
+
+    A ground fix needs the camera ray to actually reach the ground, which it
+    never does for a target at or above the aircraft's own height -- the usual
+    case for another drone. Box area still gives a usable range there. It
+    assumes the target size that calibrated ``reference_area_ratio``, so this
+    is an approximation: good enough to tell "the thing just rejected" from
+    "something else", not a survey measurement.
+    """
+    if (not all(math.isfinite(v) for v in (*box, width, height, *position, yaw, camera_pitch, fov))
+            or width <= 0 or height <= 0 or not 0 < fov < math.pi
+            or reference_distance_m <= 0 or reference_area_ratio <= 0 or max_range <= 0):
+        return None
+    area_ratio = (
+        max(0.0, float(box[2]) - float(box[0]))
+        * max(0.0, float(box[3]) - float(box[1]))
+        / (width * height)
+    )
+    if area_ratio <= 1e-9:
+        return None
+    slant_range = reference_distance_m * math.sqrt(reference_area_ratio / area_ratio)
+    if not math.isfinite(slant_range) or slant_range > max_range:
+        return None
+    cx = (float(box[0]) + float(box[2])) / (2 * width)
+    cy = (float(box[1]) + float(box[3])) / (2 * height)
+    right = (2 * cx - 1) * math.tan(fov / 2)
+    down = (2 * cy - 1) * math.tan(fov / 2) * height / width
+    forward = math.cos(camera_pitch) - down * math.sin(camera_pitch)
+    vertical = -math.sin(camera_pitch) - down * math.cos(camera_pitch)
+    ray = math.sqrt(forward * forward + right * right + vertical * vertical)
+    horizontal = math.hypot(forward, right)
+    if ray <= 1e-9 or not math.isfinite(ray):
+        return None
+    if horizontal <= 1e-9:
+        return (position[0], position[1])
+    horizontal_range = horizontal / ray * slant_range
+    unit_forward, unit_right = forward / horizontal, right / horizontal
+    return (position[0] + horizontal_range * (unit_forward * math.cos(yaw) + unit_right * math.sin(yaw)),
+            position[1] + horizontal_range * (unit_forward * math.sin(yaw) - unit_right * math.cos(yaw)))
+
+
 class TargetDecisions:
     def __init__(self, config: FlightConfig):
         self.config = config
         self.memories: dict[str, CandidateMemory] = {}
         self.ignored: list[IgnoredTarget] = []
         self.last_rejection_reason: str | None = None
+        # Set only when an operator rejects a target that could not be located
+        # at all. Without a place to remember, the rejection would survive
+        # only as a track id, and the tracker re-identifying the same object
+        # seconds later would put the aircraft straight back onto it.
+        self.suppress_until: float | None = None
         self.reset_observation()
 
     def reset_observation(self) -> None:
@@ -98,6 +147,8 @@ class TargetDecisions:
 
     def prune(self, now: float) -> None:
         self.ignored[:] = [item for item in self.ignored if now < item.expires_at]
+        if self.suppress_until is not None and now >= self.suppress_until:
+            self.suppress_until = None
         for key, memory in list(self.memories.items()):
             # A stalled stream must not keep operator actions alive indefinitely.
             if memory.missing_at is None and now - memory.last_frame_at > self.config.target_acquisition_timeout_s:
@@ -163,18 +214,29 @@ class TargetDecisions:
 
     def is_ignored(self, track_id: str, point: Point2 | None, now: float) -> bool:
         self.prune(now)
+        if self.suppress_until is not None:
+            return True
         return any(item.track_id == track_id or (
             point is not None and item.point is not None
             and math.dist(point, item.point) <= self.config.target_ignore_radius_m
         ) for item in self.ignored)
 
-    def reject(self, track_id: str, now: float) -> bool:
+    def reject(
+        self,
+        track_id: str,
+        now: float,
+        *,
+        suppress_all_if_unlocatable: bool = False,
+    ) -> bool:
         self.prune(now)
         if any(item.track_id == track_id for item in self.ignored):
             return False
         memory = self.memories.get(track_id)
         if memory is None:
             return False
-        self.ignored.append(IgnoredTarget(track_id, memory.point, now + self.config.target_ignore_timeout_s))
+        expires_at = now + self.config.target_ignore_timeout_s
+        self.ignored.append(IgnoredTarget(track_id, memory.point, expires_at))
+        if suppress_all_if_unlocatable and memory.point is None:
+            self.suppress_until = expires_at
         self.memories.pop(track_id)
         return True

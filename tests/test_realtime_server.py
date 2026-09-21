@@ -4,7 +4,7 @@ import json
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
-from realtime_server.protocol import encode_message
+from realtime_server.protocol import encode_message, operating_config_result
 from realtime_server.server import RealtimeServer
 from services.gps import LocalPosition
 from services.gps import DEFAULT_HOME, destination_point
@@ -99,7 +99,7 @@ def test_tablet_command_errors_when_no_drone_is_connected():
                         {
                             "type": "command",
                             "commandId": "cmd-2",
-                            "command": "new_mission",
+                            "command": "return_home",
                             "params": {},
                         }
                     )
@@ -240,7 +240,10 @@ def test_set_and_clear_roi_are_forwarded_before_backend_state_changes():
                             "commandId": "roi-1",
                             "command": "set_roi",
                             "params": {
-                                "center": {"lat": 0, "lon": 0},
+                                "center": {
+                                    "lat": DEFAULT_HOME.lat,
+                                    "lon": DEFAULT_HOME.lng,
+                                },
                                 "radiusM": 0,
                             },
                         }
@@ -253,7 +256,10 @@ def test_set_and_clear_roi_are_forwarded_before_backend_state_changes():
                 assert state["state"] == "TAKING_OFF"
                 assert forwarded["command"] == "set_roi"
                 assert state["activeRoi"] == {
-                    "center": {"lat": 0.0, "lon": 0.0},
+                    "center": {
+                        "lat": DEFAULT_HOME.lat,
+                        "lon": DEFAULT_HOME.lng,
+                    },
                     "radiusM": 0.0,
                 }
                 assert realtime_server.mission.roi is not None
@@ -833,7 +839,7 @@ def test_aircraft_connection_loss_rth_is_latched_by_backend():
     asyncio.run(scenario())
 
 
-def test_new_mission_command_cannot_override_active_safety_rth():
+def test_approve_target_command_cannot_override_active_safety_rth():
     async def scenario():
         realtime_server = RealtimeServer()
         realtime_server.mission.apply(CommandName.START_PATROL, {})
@@ -851,9 +857,9 @@ def test_new_mission_command_cannot_override_active_safety_rth():
                     encode_message(
                         {
                             "type": "command",
-                            "commandId": "blocked-new-mission",
-                            "command": "new_mission",
-                            "params": {},
+                            "commandId": "blocked-approve-target",
+                            "command": "approve_target",
+                            "params": {"trackId": "one"},
                         }
                     )
                 )
@@ -864,6 +870,319 @@ def test_new_mission_command_cannot_override_active_safety_rth():
                 assert error["code"] == "invalid_mission_transition"
                 assert error["details"]["state"] == "RTH"
                 assert realtime_server.mission.state is MissionState.RTH
+
+    asyncio.run(scenario())
+
+
+def test_operating_config_commits_both_values_after_controller_accepts():
+    async def scenario():
+        realtime_server = RealtimeServer()
+        previous = realtime_server.operating_config
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            base_url = f"ws://127.0.0.1:{port}/ws"
+            async with (
+                connect(f"{base_url}?role=drone") as simulator,
+                connect(f"{base_url}?role=tablet") as tablet,
+            ):
+                await _receive_initial_mission_state(tablet)
+                await tablet.send(
+                    encode_message(
+                        {
+                            "type": "command",
+                            "commandId": "config-accepted",
+                            "command": "set_operating_config",
+                            "params": {
+                                "maxFlightRadiusM": 750,
+                                "cruiseAltitudeM": 15,
+                            },
+                        }
+                    )
+                )
+
+                forwarded = json.loads(await asyncio.wait_for(simulator.recv(), 1.0))
+                assert realtime_server.operating_config == previous
+                await simulator.send(
+                    encode_message(
+                        operating_config_result(
+                            forwarded["commandId"], accepted=True
+                        )
+                    )
+                )
+
+                ack = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                status = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                assert ack["status"] == "accepted"
+                assert status["operatingConfig"] == {
+                    "maxFlightRadiusM": 750.0,
+                    "cruiseAltitudeM": 15.0,
+                }
+                assert realtime_server.mission.config.takeoff_altitude_m == 15.0
+                assert max(
+                    region.outer_radius_m
+                    for region in realtime_server.patrol_regions.regions
+                ) == 750.0
+
+    asyncio.run(scenario())
+
+
+def test_operating_config_controller_rejection_keeps_previous_pair():
+    async def scenario():
+        realtime_server = RealtimeServer()
+        previous = realtime_server.operating_config
+        previous_store = realtime_server.patrol_regions
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            base_url = f"ws://127.0.0.1:{port}/ws"
+            async with (
+                connect(f"{base_url}?role=drone") as simulator,
+                connect(f"{base_url}?role=tablet") as tablet,
+            ):
+                await _receive_initial_mission_state(tablet)
+                await tablet.send(
+                    encode_message(
+                        {
+                            "type": "command",
+                            "commandId": "config-rejected",
+                            "command": "set_operating_config",
+                            "params": {
+                                "maxFlightRadiusM": 750,
+                                "cruiseAltitudeM": 15,
+                            },
+                        }
+                    )
+                )
+                forwarded = json.loads(await asyncio.wait_for(simulator.recv(), 1.0))
+                await simulator.send(
+                    encode_message(
+                        operating_config_result(
+                            forwarded["commandId"],
+                            accepted=False,
+                            message="grounded only",
+                        )
+                    )
+                )
+
+                error = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                assert error["type"] == "error"
+                assert realtime_server.operating_config == previous
+                assert realtime_server.patrol_regions is previous_store
+
+    asyncio.run(scenario())
+
+
+def test_operating_config_without_drone_syncs_before_later_connection_is_ready():
+    async def scenario():
+        realtime_server = RealtimeServer()
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            base_url = f"ws://127.0.0.1:{port}/ws"
+            async with connect(f"{base_url}?role=tablet") as tablet:
+                await _receive_initial_mission_state(tablet)
+                await tablet.send(
+                    encode_message(
+                        {
+                            "type": "command",
+                            "commandId": "config-offline",
+                            "command": "set_operating_config",
+                            "params": {
+                                "maxFlightRadiusM": 750,
+                                "cruiseAltitudeM": 15,
+                            },
+                        }
+                    )
+                )
+                await asyncio.wait_for(tablet.recv(), 1.0)
+                await asyncio.wait_for(tablet.recv(), 1.0)
+
+                async with connect(f"{base_url}?role=drone") as simulator:
+                    syncing = json.loads(await asyncio.wait_for(simulator.recv(), 1.0))
+                    not_ready = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                    assert not_ready["droneConnected"] is False
+                    await simulator.send(
+                        encode_message(
+                            operating_config_result(
+                                syncing["commandId"], accepted=True
+                            )
+                        )
+                    )
+                    ready = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                    assert ready["droneConnected"] is True
+
+    asyncio.run(scenario())
+
+
+def test_operating_config_is_forwarded_even_when_mission_is_not_on_ground():
+    """Reload-lockout fix: the server no longer rejects set_operating_config
+    just because the mission isn't ON_GROUND -- it forwards to the drone,
+    which is the sole authority on accept/defer/reject."""
+
+    async def scenario():
+        realtime_server = RealtimeServer()
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            base_url = f"ws://127.0.0.1:{port}/ws"
+            async with (
+                connect(f"{base_url}?role=drone") as simulator,
+                connect(f"{base_url}?role=tablet") as tablet,
+            ):
+                await _receive_initial_mission_state(tablet)
+                await tablet.send(
+                    encode_message(
+                        {
+                            "type": "command",
+                            "commandId": "patrol-1",
+                            "command": "start_patrol",
+                            "params": {},
+                        }
+                    )
+                )
+                await asyncio.wait_for(simulator.recv(), 1.0)
+                await asyncio.wait_for(tablet.recv(), 1.0)
+                status = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                assert status["state"] == "TAKING_OFF"
+
+                await tablet.send(
+                    encode_message(
+                        {
+                            "type": "command",
+                            "commandId": "config-airborne",
+                            "command": "set_operating_config",
+                            "params": {"maxFlightRadiusM": 750, "cruiseAltitudeM": 15},
+                        }
+                    )
+                )
+
+                forwarded = json.loads(await asyncio.wait_for(simulator.recv(), 1.0))
+                assert forwarded["command"] == "set_operating_config"
+                await simulator.send(
+                    encode_message(
+                        operating_config_result(forwarded["commandId"], accepted=True)
+                    )
+                )
+                ack = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                assert ack == {
+                    "type": "command_ack",
+                    "commandId": "config-airborne",
+                    "status": "accepted",
+                }
+
+    asyncio.run(scenario())
+
+
+def test_operating_config_pending_ack_surfaces_in_mission_status_and_clears_on_telemetry():
+    async def scenario():
+        realtime_server = RealtimeServer()
+        previous_config = realtime_server.operating_config
+        previous_store = realtime_server.patrol_regions
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            base_url = f"ws://127.0.0.1:{port}/ws"
+            async with (
+                connect(f"{base_url}?role=drone") as simulator,
+                connect(f"{base_url}?role=tablet") as tablet,
+            ):
+                await _receive_initial_mission_state(tablet)
+                await tablet.send(
+                    encode_message(
+                        {
+                            "type": "command",
+                            "commandId": "config-pending",
+                            "command": "set_operating_config",
+                            "params": {"maxFlightRadiusM": 750, "cruiseAltitudeM": 15},
+                        }
+                    )
+                )
+                forwarded = json.loads(await asyncio.wait_for(simulator.recv(), 1.0))
+                await simulator.send(
+                    encode_message(
+                        operating_config_result(
+                            forwarded["commandId"], accepted=True, pending=True
+                        )
+                    )
+                )
+
+                await asyncio.wait_for(tablet.recv(), 1.0)  # command_ack
+                status = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                assert status["operatingConfigPending"] is True
+                # The drone deferred actually applying this -- it's still
+                # flying under the old radius/altitude, so the published
+                # config (and anything derived from it, like the map's
+                # boundary circle and patrol grid) must not jump to the new
+                # values yet. Regression check for the bug where the server
+                # swapped these in on acceptance alone, ahead of the drone
+                # ever enforcing them.
+                assert status["operatingConfig"] == {
+                    "maxFlightRadiusM": previous_config.max_flight_radius_m,
+                    "cruiseAltitudeM": previous_config.cruise_altitude_m,
+                }
+                assert realtime_server.operating_config == previous_config
+                assert realtime_server.patrol_regions is previous_store
+
+                await simulator.send(
+                    encode_message(
+                        build_simulator_telemetry(
+                            position_local=LocalPosition(0.0, 0.0, 15.0),
+                            heading_deg=0.0,
+                            speed_mps=0.0,
+                            state="PATROLLING",
+                            operating_config_pending=False,
+                        )
+                    )
+                )
+                cleared = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                assert cleared["type"] == "mission_status"
+                assert cleared["operatingConfigPending"] is False
+                # Only now -- once telemetry reports the drone has actually
+                # applied it -- does the published config catch up.
+                assert cleared["operatingConfig"] == {
+                    "maxFlightRadiusM": 750.0,
+                    "cruiseAltitudeM": 15.0,
+                }
+                assert realtime_server.operating_config.max_flight_radius_m == 750.0
+                assert max(
+                    region.outer_radius_m
+                    for region in realtime_server.patrol_regions.regions
+                ) == 750.0
+
+    asyncio.run(scenario())
+
+
+def test_operating_config_pending_resets_on_drone_disconnect():
+    async def scenario():
+        realtime_server = RealtimeServer()
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            base_url = f"ws://127.0.0.1:{port}/ws"
+            async with connect(f"{base_url}?role=tablet") as tablet:
+                await _receive_initial_mission_state(tablet)
+
+                async with connect(f"{base_url}?role=drone") as simulator:
+                    await asyncio.wait_for(tablet.recv(), 1.0)  # drone-connected mission_status
+                    await tablet.send(
+                        encode_message(
+                            {
+                                "type": "command",
+                                "commandId": "config-pending-2",
+                                "command": "set_operating_config",
+                                "params": {"maxFlightRadiusM": 750, "cruiseAltitudeM": 15},
+                            }
+                        )
+                    )
+                    forwarded = json.loads(await asyncio.wait_for(simulator.recv(), 1.0))
+                    await simulator.send(
+                        encode_message(
+                            operating_config_result(
+                                forwarded["commandId"], accepted=True, pending=True
+                            )
+                        )
+                    )
+                    await asyncio.wait_for(tablet.recv(), 1.0)  # command_ack
+                    status = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                    assert status["operatingConfigPending"] is True
+
+                disconnected = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                assert disconnected["operatingConfigPending"] is False
 
     asyncio.run(scenario())
 

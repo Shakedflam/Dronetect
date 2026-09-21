@@ -79,12 +79,6 @@ export function ActionBar({
     });
   }
 
-  function handleNewMission() {
-    droneCommandService.newMission().catch((error: unknown) => {
-      console.error('[ActionBar] newMission failed', error);
-    });
-  }
-
   function handleCameraTiltUp() {
     droneCommandService.cameraTiltUp().catch((error: unknown) => {
       console.error('[ActionBar] cameraTiltUp failed', error);
@@ -146,15 +140,6 @@ export function ActionBar({
           title={droneConnected ? undefined : 'Drone is not connected'}
         >
           RTH
-        </button>
-        <button
-          type="button"
-          className={`${styles.button} ${styles.mission}`}
-          onClick={handleNewMission}
-          disabled={missionOverrideDisabled}
-          title={missionOverrideTitle}
-        >
-          NEW MISSION
         </button>
         <button
           type="button"

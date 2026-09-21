@@ -7,6 +7,7 @@ import json
 import math
 from typing import Any
 
+from config.shared_config import default_operating_config, shared_config
 from services.commands import CommandName, SUPPORTED_COMMANDS
 from services.mission_state import MissionState
 from services.patrol_regions import PATROL_REGION_IDS, PatrolAreaType
@@ -15,6 +16,7 @@ from services.patrol_regions import PATROL_REGION_IDS, PatrolAreaType
 MESSAGE_TYPE_TELEMETRY = "telemetry"
 MESSAGE_TYPE_COMMAND = "command"
 MESSAGE_TYPE_COMMAND_ACK = "command_ack"
+MESSAGE_TYPE_OPERATING_CONFIG_RESULT = "operating_config_result"
 MESSAGE_TYPE_DETECTIONS = "detections"
 MESSAGE_TYPE_MISSION_STATE = "mission_state"
 MESSAGE_TYPE_MISSION_STATUS = "mission_status"
@@ -143,12 +145,19 @@ def mission_status_message(
     rth_reason: str | None,
     drone_connected: bool = False,
     patrol_area_types: list[dict[str, Any]] | None = None,
+    operating_config: dict[str, float] | None = None,
+    operating_config_pending: bool = False,
 ) -> dict[str, Any]:
     """Build the authoritative mission snapshot sent to tablet clients."""
     return {
         "type": MESSAGE_TYPE_MISSION_STATUS,
         "state": state.value,
         "droneConnected": drone_connected,
+        "operatingConfig": operating_config or {
+            "maxFlightRadiusM": default_operating_config.max_flight_radius_m,
+            "cruiseAltitudeM": default_operating_config.cruise_altitude_m,
+        },
+        "operatingConfigPending": operating_config_pending,
         "activeRoi": active_roi,
         "patrol": {
             "priorities": patrol_priorities,
@@ -188,6 +197,25 @@ def validate_mission_status_message(message: dict[str, Any]) -> dict[str, Any]:
             "validation_error",
             "droneConnected must be a boolean.",
             details={"field": "droneConnected"},
+        )
+
+    operating_config = _required_object(message, "operatingConfig")
+    max_flight_radius_m = _required_number(
+        operating_config, "maxFlightRadiusM"
+    )
+    cruise_altitude_m = _required_number(operating_config, "cruiseAltitudeM")
+    if max_flight_radius_m <= 0.0 or cruise_altitude_m <= 0.0:
+        raise ProtocolError(
+            "validation_error",
+            "Mission-status operating configuration must be positive.",
+            details={"field": "operatingConfig"},
+        )
+    operating_config_pending = message.get("operatingConfigPending", False)
+    if not isinstance(operating_config_pending, bool):
+        raise ProtocolError(
+            "validation_error",
+            "operatingConfigPending must be a boolean.",
+            details={"field": "operatingConfigPending"},
         )
 
     active_roi = message.get("activeRoi")
@@ -280,6 +308,11 @@ def validate_mission_status_message(message: dict[str, Any]) -> dict[str, Any]:
         rth_reason=_optional_string(battery_rth, "rthReason"),
         drone_connected=drone_connected,
         patrol_area_types=validated_area_types,
+        operating_config={
+            "maxFlightRadiusM": max_flight_radius_m,
+            "cruiseAltitudeM": cruise_altitude_m,
+        },
+        operating_config_pending=operating_config_pending,
     )
 
 
@@ -328,6 +361,13 @@ def validate_telemetry_message(message: dict[str, Any]) -> dict[str, Any]:
         target_follow_diagnostics = _validate_target_follow_diagnostics(
             target_follow_diagnostics
         )
+    operating_config_pending = data.get("operatingConfigPending", False)
+    if not isinstance(operating_config_pending, bool):
+        raise ProtocolError(
+            "validation_error",
+            "operatingConfigPending must be a boolean.",
+            details={"field": "operatingConfigPending"},
+        )
 
     return {
         "type": MESSAGE_TYPE_TELEMETRY,
@@ -351,6 +391,7 @@ def validate_telemetry_message(message: dict[str, Any]) -> dict[str, Any]:
                 data, "aircraftSafetyRthReason"
             ),
             "targetFollowDiagnostics": target_follow_diagnostics,
+            "operatingConfigPending": operating_config_pending,
         },
     }
 
@@ -514,11 +555,100 @@ def command_ack(command_id: str, status: str = "accepted") -> dict[str, str]:
     }
 
 
+def operating_config_result(
+    command_id: str,
+    *,
+    accepted: bool,
+    message: str | None = None,
+    pending: bool = False,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "type": MESSAGE_TYPE_OPERATING_CONFIG_RESULT,
+        "commandId": command_id,
+        "accepted": accepted,
+        "pending": pending,
+    }
+    if message:
+        result["message"] = message
+    return result
+
+
+def validate_operating_config_result_message(
+    message: dict[str, Any],
+) -> dict[str, Any]:
+    if _required_string(message, "type") != MESSAGE_TYPE_OPERATING_CONFIG_RESULT:
+        raise ProtocolError(
+            "invalid_type",
+            "Operating-config results must use type 'operating_config_result'.",
+        )
+    accepted = message.get("accepted")
+    if not isinstance(accepted, bool):
+        raise ProtocolError(
+            "validation_error",
+            "Operating-config result accepted must be a boolean.",
+            details={"field": "accepted"},
+        )
+    raw_message = message.get("message")
+    if raw_message is not None and not isinstance(raw_message, str):
+        raise ProtocolError(
+            "validation_error",
+            "Operating-config result message must be a string.",
+            details={"field": "message"},
+        )
+    pending = message.get("pending", False)
+    if not isinstance(pending, bool):
+        raise ProtocolError(
+            "validation_error",
+            "Operating-config result pending must be a boolean.",
+            details={"field": "pending"},
+        )
+    return operating_config_result(
+        _required_string(message, "commandId"),
+        accepted=accepted,
+        message=raw_message,
+        pending=pending,
+    )
+
+
 def _validate_command_params(
     command: str,
     params: dict[str, Any],
     command_id: str,
 ) -> dict[str, Any]:
+    if command == CommandName.SET_OPERATING_CONFIG:
+        max_flight_radius_m = _finite_number(
+            params, "maxFlightRadiusM", command_id
+        )
+        cruise_altitude_m = _finite_number(
+            params, "cruiseAltitudeM", command_id
+        )
+        if max_flight_radius_m <= 0.0 or cruise_altitude_m <= 0.0:
+            raise ProtocolError(
+                "invalid_params",
+                "Operating configuration values must be greater than zero.",
+                command_id=command_id,
+                details={"field": "operatingConfig"},
+            )
+        if max_flight_radius_m > shared_config.legal_max_flight_radius_m:
+            raise ProtocolError(
+                "invalid_params",
+                "Maximum flight radius exceeds the legal maximum of "
+                f"{shared_config.legal_max_flight_radius_m:.0f} m.",
+                command_id=command_id,
+                details={"field": "maxFlightRadiusM"},
+            )
+        if cruise_altitude_m > shared_config.legal_max_cruise_altitude_m:
+            raise ProtocolError(
+                "invalid_params",
+                "Cruise altitude exceeds the legal maximum of "
+                f"{shared_config.legal_max_cruise_altitude_m:.0f} m.",
+                command_id=command_id,
+                details={"field": "cruiseAltitudeM"},
+            )
+        return {
+            "maxFlightRadiusM": max_flight_radius_m,
+            "cruiseAltitudeM": cruise_altitude_m,
+        }
     if command in {CommandName.APPROVE_TARGET, CommandName.REJECT_TARGET}:
         track_id = params.get("trackId")
         if not isinstance(track_id, str) or not track_id.strip():

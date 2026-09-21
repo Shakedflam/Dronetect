@@ -1,5 +1,6 @@
 import type { MissionState } from '../../types/missionState';
 import type { TargetFollowDiagnostics } from '../../types/drone';
+import type { OperatingConfig } from '../../types/operatingConfig';
 import type { Unsubscribe } from './unsubscribe';
 
 /**
@@ -53,6 +54,8 @@ export interface MissionStatusMessage {
   type: 'mission_status';
   state: MissionState;
   droneConnected: boolean;
+  operatingConfig: OperatingConfig;
+  operatingConfigPending: boolean;
   activeRoi: { center: { lat: number; lon: number }; radiusM: number } | null;
   patrol: {
     priorities: Array<{ regionId: string; rank: number }>;
@@ -71,13 +74,13 @@ export interface MissionStatusMessage {
 
 /** Exactly the command names the realtime server/simulator currently support. */
 export type RealtimeServerCommandName =
+  | 'set_operating_config'
   | 'start_patrol'
   | 'set_patrol_priorities'
   | 'set_patrol_area_types'
   | 'set_roi'
   | 'clear_roi'
   | 'return_home'
-  | 'new_mission'
   | 'camera_tilt_up'
   | 'approve_target'
   | 'reject_target'
@@ -263,6 +266,17 @@ function isMissionStatusMessage(value: unknown): value is MissionStatusMessage {
     !isMissionState(message.state) ||
     typeof message.droneConnected !== 'boolean'
   ) return false;
+  const operatingConfig = message.operatingConfig as Record<string, unknown> | undefined;
+  if (
+    typeof operatingConfig !== 'object' || operatingConfig === null ||
+    typeof operatingConfig.maxFlightRadiusM !== 'number' ||
+    !Number.isFinite(operatingConfig.maxFlightRadiusM) ||
+    operatingConfig.maxFlightRadiusM <= 0 ||
+    typeof operatingConfig.cruiseAltitudeM !== 'number' ||
+    !Number.isFinite(operatingConfig.cruiseAltitudeM) ||
+    operatingConfig.cruiseAltitudeM <= 0
+  ) return false;
+  if (typeof message.operatingConfigPending !== 'boolean') return false;
   if (message.activeRoi !== null) {
     if (typeof message.activeRoi !== 'object') return false;
     const roi = message.activeRoi as Record<string, unknown>;

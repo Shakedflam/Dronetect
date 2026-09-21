@@ -10,14 +10,18 @@ import random
 from typing import Any, Callable, Protocol
 
 try:
-    from .target_decisions import TargetDecisions, ground_projection
+    from .target_decisions import (
+        TargetDecisions, ground_projection, range_estimated_projection,
+    )
     from .pursuit import (
         PursuitConfig, PursuitController, TargetAltitudeEstimate,
         estimate_target_altitude,
     )
     from .roi_patrol import LawnMowerRoiPatrolPlanner, RoiPatrolPlan
 except ImportError:  # Webots loads this directory as top-level modules.
-    from target_decisions import TargetDecisions, ground_projection
+    from target_decisions import (
+        TargetDecisions, ground_projection, range_estimated_projection,
+    )
     from pursuit import (
         PursuitConfig, PursuitController, TargetAltitudeEstimate,
         estimate_target_altitude,
@@ -39,11 +43,11 @@ class FlightState(Enum):
     TRANSITING_TO_ROI = "TRANSITING_TO_ROI"
     ROI_PATROL = "ROI_PATROL"
     PATROLLING = "PATROLLING"
+    REPOSITIONING = "REPOSITIONING"
     TARGET_ACQUISITION = "TARGET_ACQUISITION"
     TARGET_FOLLOW = "TARGET_FOLLOW"
     TARGET_PURSUIT = "TARGET_PURSUIT"
     TARGET_RETURN = "TARGET_RETURN"
-    FLYING_RANDOMLY = "FLYING_RANDOMLY"
     RETURNING_HOME = "RETURNING_HOME"
     LANDING = "LANDING"
     LANDED = "LANDED"
@@ -59,6 +63,13 @@ class FlightConfig:
     # What we count as arrived at a target, for both horizontal and vertical directions, how far away from point of interest.
     horizontal_tolerance: float = 0.5
     vertical_tolerance: float = 0.25
+    # Returning to an interruption checkpoint deliberately skips the dead zone
+    # above so the aircraft flies the whole way back instead of stopping half a
+    # metre short. It still cannot demand an exact match: the controller
+    # commands a pose and reads the next one back off a stepped physics body,
+    # so the reported position always trails the commanded one slightly, and a
+    # gate tighter than that residual never opens at all.
+    checkpoint_tolerance: float = 0.05
     landing_rate: float = 0.35
     landed_height: float = 0.12
     roi_arrival_tolerance: float = 10.0
@@ -174,8 +185,10 @@ class FlightLogic:
         self._takeoff_anchor: Position | None = None
         self._queued_waypoint: Position | None = None
         self._queued_state: FlightState | None = None
+        self._queued_mission_stale = False
         self._roi_center: tuple[float, float] | None = None
         self._roi_radius = 0.0
+        self._roi_first_waypoint: Position | None = None
         self._elapsed_time = 0.0
         self._patrol_resume_target: Position | None = None
         self._patrol_resume_checkpoint: Position | None = None
@@ -206,6 +219,8 @@ class FlightLogic:
         self._takeoff_pursuit_vertical_velocity = 0.0
         self._target_return_waypoints: deque[Position] = deque()
         self._target_return_ready = True
+        self._reposition_waypoints: deque[Position] = deque()
+        self._reposition_resume_state: FlightState | None = None
 
     def initialize_home(self, position: Position) -> None:
         """Capture home once from the first valid simulated GPS reading."""
@@ -226,7 +241,7 @@ class FlightLogic:
         self._elapsed_time += dt
         self.target_decisions.prune(self._elapsed_time)
         if (
-            self.state in {FlightState.TARGET_ACQUISITION, FlightState.TARGET_FOLLOW, FlightState.TARGET_PURSUIT}
+            self.is_target_tracking
             and yaw is not None and camera_pitch is not None
         ):
             # The false-positive evaluation keeps accumulating evidence in
@@ -238,11 +253,21 @@ class FlightLogic:
 
         elif self.state is FlightState.TAKING_OFF:
             self.target = self._takeoff_target()
-            if self._has_reached(position, self.target):
+            if self._has_completed_takeoff(position, self.target):
                 self.state = self._queued_state or FlightState.HOLDING
-                self.target = self._queued_waypoint or self.target
+                queued_waypoint = self._queued_waypoint
+                needs_refresh = self._queued_mission_stale
                 self._queued_waypoint = None
                 self._queued_state = None
+                self._queued_mission_stale = False
+                if needs_refresh and self.state in {FlightState.TRANSITING_TO_ROI, FlightState.PATROLLING}:
+                    # The waypoint queued at request_roi()/request_patrol() time
+                    # (and, for ROI, the clipped geometry behind it) is stale --
+                    # the operating config changed during this climb. Recompute
+                    # fresh from the actual arrival position and current config.
+                    self.target = self._fresh_queued_mission_target(self.state, position)
+                else:
+                    self.target = queued_waypoint or self.target
                 if (
                     self.state is FlightState.TRANSITING_TO_ROI
                     and self._is_inside_roi(position)
@@ -261,7 +286,7 @@ class FlightLogic:
 
         elif self.state is FlightState.ROI_PATROL:
             if not self._is_inside_roi(position):
-                # Recover toward the center after an external disturbance.
+                # Recover to the nearest point in the clipped ROI/home area.
                 self.target = self._roi_center_target()
             elif self.target is None or self._has_reached(position, self.target):
                 self.target = self.roi_patrol_planner.next_waypoint()
@@ -269,6 +294,31 @@ class FlightLogic:
         elif self.state is FlightState.PATROLLING:
             if self.target is None or self._has_reached(position, self.target):
                 self.target = self._next_patrol_waypoint(position, completed=True)
+
+        elif self.state is FlightState.REPOSITIONING:
+            if self.target is not None and self._has_reached(position, self.target):
+                if self._reposition_waypoints:
+                    self.target = self._reposition_waypoints.popleft()
+                elif self._reposition_resume_state is FlightState.ROI_PATROL:
+                    self._reposition_resume_state = None
+                    try:
+                        assert self._roi_center is not None
+                        self._roi_first_waypoint = self.roi_patrol_planner.reset(
+                            self._roi_center, self._roi_radius,
+                            self.config.takeoff_altitude, position,
+                        )
+                        self._start_roi_patrol(position)
+                    except ValueError as exc:
+                        # The ROI no longer overlaps the (now smaller) flight
+                        # radius at all -- degrade to normal area patrol
+                        # rather than leaving the drone stuck here.
+                        print(f"ROI no longer reachable after reconfiguration, falling back to patrol: {exc}")
+                        self.state = FlightState.PATROLLING
+                        self.target = self._next_patrol_waypoint(position, completed=False)
+                else:
+                    self._reposition_resume_state = None
+                    self.state = FlightState.PATROLLING
+                    self.target = self._next_patrol_waypoint(position, completed=False)
 
         elif self.state is FlightState.TARGET_ACQUISITION:
             self.target = self._target_acquisition_target(position)
@@ -344,17 +394,14 @@ class FlightLogic:
         elif self.state is FlightState.TARGET_RETURN:
             if not self._target_return_ready:
                 self.target = position
-            elif self.target is not None and math.dist(position, self.target) <= 1e-6:
+            elif (
+                self.target is not None
+                and math.dist(position, self.target) <= self.config.checkpoint_tolerance
+            ):
                 if self._target_return_waypoints:
                     self.target = self._target_return_waypoints.popleft()
                 else:
                     self._resume_patrol_after_target(position)
-
-        elif self.state is FlightState.FLYING_RANDOMLY:
-            if self.target is None:
-                self.target = self.choose_random_waypoint()
-            elif self._has_reached(position, self.target):
-                self.request_return_home()
 
         elif self.state is FlightState.RETURNING_HOME:
             self.target = self._home_at_cruise_altitude()
@@ -387,11 +434,11 @@ class FlightLogic:
             FlightState.TRANSITING_TO_ROI,
             FlightState.ROI_PATROL,
             FlightState.PATROLLING,
+            FlightState.REPOSITIONING,
             FlightState.TARGET_ACQUISITION,
             FlightState.TARGET_FOLLOW,
             FlightState.TARGET_PURSUIT,
             FlightState.TARGET_RETURN,
-            FlightState.FLYING_RANDOMLY,
         }:
             return False
 
@@ -401,6 +448,8 @@ class FlightLogic:
         self._roi_center = None
         self._roi_radius = 0.0
         self.roi_patrol_planner.clear()
+        self._reposition_waypoints.clear()
+        self._reposition_resume_state = None
         self._clear_target_tracking()
         self.target = self._home_at_cruise_altitude()
         return True
@@ -416,6 +465,8 @@ class FlightLogic:
         self._roi_center = None
         self._roi_radius = 0.0
         self.roi_patrol_planner.clear()
+        self._reposition_waypoints.clear()
+        self._reposition_resume_state = None
         safe_altitude = self.config.takeoff_altitude - self.config.vertical_tolerance
         if position[2] < safe_altitude:
             self._start_takeoff(position)
@@ -431,6 +482,8 @@ class FlightLogic:
         self._roi_center = None
         self._roi_radius = 0.0
         self.roi_patrol_planner.clear()
+        self._reposition_waypoints.clear()
+        self._reposition_resume_state = None
         self._clear_target_tracking()
         waypoint = self._next_patrol_waypoint(position, completed=False)
         safe_altitude = self.config.takeoff_altitude - self.config.vertical_tolerance
@@ -457,9 +510,19 @@ class FlightLogic:
 
         self._roi_center = center
         self._roi_radius = radius_m
-        self.roi_patrol_planner.clear()
+        self._reposition_waypoints.clear()
+        self._reposition_resume_state = None
         self._clear_target_tracking()
-        roi_target = (center[0], center[1], self.config.takeoff_altitude)
+        self._roi_first_waypoint = self.roi_patrol_planner.reset(
+            center,
+            radius_m,
+            self.config.takeoff_altitude,
+            position,
+        )
+        roi_target = self.roi_patrol_planner.entry_target(
+            center,
+            self.config.takeoff_altitude,
+        )
         safe_altitude = self.config.takeoff_altitude - self.config.vertical_tolerance
         if position[2] < safe_altitude:
             self._queued_waypoint = roi_target
@@ -475,39 +538,50 @@ class FlightLogic:
         """Cancel ROI guidance without initiating any new movement."""
         self.target_decisions.memories.clear()
         was_queued_for_roi = self._queued_state is FlightState.TRANSITING_TO_ROI
+        was_repositioning_for_roi = (
+            self.state is FlightState.REPOSITIONING
+            and self._reposition_resume_state is FlightState.ROI_PATROL
+        )
         self._roi_center = None
         self._roi_radius = 0.0
+        self._roi_first_waypoint = None
         self.roi_patrol_planner.clear()
         if was_queued_for_roi:
             self._queued_waypoint = None
             self._queued_state = None
-        if self.state in {FlightState.TRANSITING_TO_ROI, FlightState.ROI_PATROL}:
+        if was_repositioning_for_roi:
+            self._reposition_waypoints.clear()
+            self._reposition_resume_state = None
+        if (
+            self.state in {FlightState.TRANSITING_TO_ROI, FlightState.ROI_PATROL}
+            or was_repositioning_for_roi
+        ):
             self.state = FlightState.HOLDING
             self.target = position
 
-    def request_new_target(self, position: Position) -> Position:
-        """Start a new random mission safely from any flight state."""
-        if self.home is None:
-            raise RuntimeError("Home position must be initialized before commands.")
+    def mark_queued_mission_config_stale(self) -> None:
+        """Flag that the operating config changed while a mission was queued
+        behind an in-progress takeoff, so its precomputed waypoint/geometry
+        must be recomputed fresh once that takeoff completes rather than
+        trusted as-is."""
+        self._queued_mission_stale = True
 
-        self._roi_center = None
-        self._roi_radius = 0.0
-        self.roi_patrol_planner.clear()
-        self._clear_target_tracking()
-        waypoint = self.choose_random_waypoint()
-        safe_altitude = (
-            self.config.takeoff_altitude - self.config.vertical_tolerance
-        )
-        if position[2] < safe_altitude:
-            self._queued_waypoint = waypoint
-            self._queued_state = FlightState.FLYING_RANDOMLY
-            self._start_takeoff(position)
-        else:
-            self._queued_waypoint = None
-            self._queued_state = None
-            self.state = FlightState.FLYING_RANDOMLY
-            self.target = waypoint
-        return waypoint
+    def start_reposition(
+        self,
+        waypoints: list[Position],
+        resume_state: FlightState,
+    ) -> None:
+        """Fly a route (already routed clear of no-fly sectors), then resume
+        PATROLLING or ROI_PATROL under whatever geometry is current once
+        the route completes."""
+        if not waypoints:
+            raise ValueError("Reposition route must contain at least one waypoint")
+        if resume_state not in {FlightState.PATROLLING, FlightState.ROI_PATROL}:
+            raise ValueError("Reposition resume state must be PATROLLING or ROI_PATROL")
+        self.state = FlightState.REPOSITIONING
+        self.target = waypoints[0]
+        self._reposition_waypoints = deque(waypoints[1:])
+        self._reposition_resume_state = resume_state
 
     def choose_random_waypoint(self) -> Position:
         """Create a waypoint within the configured safe flight volume."""
@@ -522,6 +596,26 @@ class FlightLogic:
             if previous is None or not self._has_reached(candidate, previous):
                 return candidate
         return candidate
+
+    @property
+    def reposition_resume_state(self) -> FlightState | None:
+        """Which mission an in-progress reposition leg resumes into."""
+        return self._reposition_resume_state
+
+    @property
+    def reposition_destination(self) -> Position | None:
+        """Where an in-progress reposition leg ultimately ends.
+
+        This is the proportional point the last operating-config change aimed
+        for, so a further change mid-leg rescales *this* rather than the
+        aircraft's current position -- which is only partway along the leg and
+        no longer sits at any meaningful proportion of the boundary.
+        """
+        if self.state is not FlightState.REPOSITIONING:
+            return None
+        if self._reposition_waypoints:
+            return self._reposition_waypoints[-1]
+        return self.target
 
     @property
     def target_yaw(self) -> float | None:
@@ -553,6 +647,15 @@ class FlightLogic:
     @property
     def target_return_ready(self) -> bool:
         return self._target_return_ready
+
+    @property
+    def is_target_tracking(self) -> bool:
+        """Whether the drone is currently acquiring, following, or pursuing a target."""
+        return self.state in {
+            FlightState.TARGET_ACQUISITION,
+            FlightState.TARGET_FOLLOW,
+            FlightState.TARGET_PURSUIT,
+        }
 
     @property
     def diagnostic_state(self) -> str:
@@ -667,6 +770,7 @@ class FlightLogic:
             FlightState.TRANSITING_TO_ROI,
             FlightState.ROI_PATROL,
             FlightState.PATROLLING,
+            FlightState.REPOSITIONING,
             FlightState.TARGET_ACQUISITION,
             FlightState.TARGET_FOLLOW,
             FlightState.TARGET_PURSUIT,
@@ -676,7 +780,7 @@ class FlightLogic:
         if self.state not in interruptible_states:
             return
 
-        if self.state in {FlightState.TARGET_ACQUISITION, FlightState.TARGET_FOLLOW, FlightState.TARGET_PURSUIT}:
+        if self.is_target_tracking:
             self.target_decisions.record_pose(position, yaw, camera_pitch)
             # Retain weak matches as evidence even when they cannot guide flight.
             weak = next((item for item in detections
@@ -711,6 +815,7 @@ class FlightLogic:
             FlightState.TRANSITING_TO_ROI,
             FlightState.ROI_PATROL,
             FlightState.PATROLLING,
+            FlightState.REPOSITIONING,
         }
         if allow_landing_intercept:
             interception_start_states.add(FlightState.LANDING)
@@ -865,7 +970,7 @@ class FlightLogic:
         # The false-positive observation window runs in parallel with an
         # already-started follow/pursuit; it must never gate the transition
         # into TARGET_FOLLOW below.
-        if self.state in {FlightState.TARGET_ACQUISITION, FlightState.TARGET_FOLLOW, FlightState.TARGET_PURSUIT}:
+        if self.is_target_tracking:
             self.target_decisions.record_pose(position, yaw, camera_pitch)
             self.target_decisions.sample(selected, self._elapsed_time, center)
             if not self.target_decisions.evaluated and self.target_decisions.ready(self._elapsed_time):
@@ -897,6 +1002,7 @@ class FlightLogic:
             FlightState.TRANSITING_TO_ROI,
             FlightState.ROI_PATROL,
             FlightState.PATROLLING,
+            FlightState.REPOSITIONING,
         }
         if allow_landing_intercept:
             states.add(FlightState.LANDING)
@@ -1047,18 +1153,29 @@ class FlightLogic:
     def project_detection(self, detection, width, height, position, yaw, camera_pitch):
         if self.home is None:
             return None
-        return ground_projection(
+        ground = ground_projection(
             detection["box"], width, height, position, yaw, camera_pitch,
             self.pursuit.config.horizontal_fov_rad, self.home[2],
             self.config.target_projection_min_angle_rad, self.config.target_projection_max_range_m)
+        if ground is not None:
+            return ground
+        # The camera ray never reaches the ground for anything at or above our
+        # own height, which is every airborne target. Fall back to the same
+        # calibrated-area range estimate pursuit already steers by, so an
+        # operator's rejection sticks to a place and survives the tracker
+        # re-identifying that object under a new id.
+        return range_estimated_projection(
+            detection["box"], width, height, position, yaw, camera_pitch,
+            self.pursuit.config.horizontal_fov_rad,
+            self.config.target_standoff_distance_m,
+            self.config.target_standoff_box_area_ratio,
+            self.config.target_range_estimate_max_m)
 
     def approve_target(self, track_id: str, position: Position) -> bool:
         self.target_decisions.prune(self._elapsed_time)
         memory = self.target_decisions.memories.get(track_id)
         if (track_id != self._tracked_target_id or memory is None or memory.missing_at is not None
-                or not self._target_visible or self.state not in {
-                    FlightState.TARGET_ACQUISITION, FlightState.TARGET_FOLLOW, FlightState.TARGET_PURSUIT,
-                }):
+                or not self._target_visible or not self.is_target_tracking):
             return False
         self._target_confirmed = True
         # Cancel any pending automatic false-positive rejection for good.
@@ -1070,12 +1187,17 @@ class FlightLogic:
         return True
 
     def reject_target(self, track_id: str, position: Position | None = None) -> bool:
-        if not self.target_decisions.reject(track_id, self._elapsed_time):
+        if not self.target_decisions.reject(
+            track_id,
+            self._elapsed_time,
+            # Only the target actually being followed earns a blanket pause:
+            # rejecting some other remembered candidate must not blind the
+            # aircraft to the one it is on.
+            suppress_all_if_unlocatable=track_id == self._tracked_target_id,
+        ):
             return False
         self._followed_track_ids.discard(track_id)
-        if track_id == self._tracked_target_id and self.state in {
-            FlightState.TARGET_ACQUISITION, FlightState.TARGET_FOLLOW, FlightState.TARGET_PURSUIT
-        }:
+        if track_id == self._tracked_target_id and self.is_target_tracking:
             self.complete_target_follow(position)
         return True
 
@@ -1088,9 +1210,7 @@ class FlightLogic:
             "trackId": track_id,
             "canApprove": bool(memory and memory.missing_at is None and self._target_visible
                                and track_id == self._tracked_target_id and not self.target_decisions.evaluated
-                               and self.state in {
-                                   FlightState.TARGET_ACQUISITION, FlightState.TARGET_FOLLOW, FlightState.TARGET_PURSUIT,
-                               }),
+                               and self.is_target_tracking),
             "canReject": memory is not None,
             "rejectableTrackIds": list(memories),
             "lastRejectionReason": self.target_decisions.last_rejection_reason,
@@ -1147,12 +1267,41 @@ class FlightLogic:
                 # queued mission instead of re-entering a stale takeoff climb
                 # that would leave state/camera stuck on TAKING_OFF.
                 resume_state = self._queued_state or FlightState.HOLDING
-                resume_target = self._queued_waypoint or resume_target
+                queued_waypoint = self._queued_waypoint
+                needs_refresh = self._queued_mission_stale
                 self._queued_waypoint = None
                 self._queued_state = None
+                self._queued_mission_stale = False
+                if needs_refresh and resume_state in {FlightState.TRANSITING_TO_ROI, FlightState.PATROLLING}:
+                    # Same staleness concern as the TAKING_OFF branch in
+                    # update(): the queued waypoint/geometry predates an
+                    # operating-config change that happened during pursuit.
+                    resume_target = self._fresh_queued_mission_target(resume_state, position)
+                else:
+                    resume_target = queued_waypoint or resume_target
         self.state = resume_state
         self.target = resume_target
         self._clear_target_tracking(preserve_followed_ids=True)
+
+    def _fresh_queued_mission_target(self, state: FlightState, position: Position) -> Position:
+        """Recompute the entry waypoint for a takeoff-queued mission from the
+        actual arrival position and current config, instead of trusting a
+        value computed back when the mission was originally queued -- which
+        may now be stale (e.g. the operating config changed during the
+        climb). For TRANSITING_TO_ROI this also refreshes the clipped ROI
+        geometry itself, since `_is_inside_roi` must agree with whatever
+        target is returned here or the aircraft can arrive at the target
+        without ever being recognized as "inside" the ROI."""
+        if state is FlightState.TRANSITING_TO_ROI:
+            assert self._roi_center is not None
+            self._roi_first_waypoint = self.roi_patrol_planner.reset(
+                self._roi_center, self._roi_radius, self.config.takeoff_altitude, position,
+            )
+            return self.roi_patrol_planner.entry_target(
+                self._roi_center, self.config.takeoff_altitude,
+            )
+        assert state is FlightState.PATROLLING
+        return self._next_patrol_waypoint(position, completed=False)
 
     def _clear_target_tracking(self, *, preserve_followed_ids: bool = False) -> None:
         self.target_decisions.reset_observation()
@@ -1203,22 +1352,16 @@ class FlightLogic:
         return (self.home[0], self.home[1], self._landing_target_altitude)
 
     def _start_roi_patrol(self, position: Position) -> None:
-        if self._roi_center is None:
+        if self._roi_center is None or self._roi_first_waypoint is None:
             raise RuntimeError("Cannot start ROI patrol without an ROI")
         self.state = FlightState.ROI_PATROL
-        self.target = self.roi_patrol_planner.reset(
-            self._roi_center,
-            self._roi_radius,
-            self.config.takeoff_altitude,
-            position,
-        )
+        self.target = self._roi_first_waypoint
 
     def _roi_center_target(self) -> Position:
         if self._roi_center is None:
             raise RuntimeError("Cannot recover into a missing ROI")
-        return (
-            self._roi_center[0],
-            self._roi_center[1],
+        return self.roi_patrol_planner.entry_target(
+            self._roi_center,
             self.config.takeoff_altitude,
         )
 
@@ -1233,16 +1376,7 @@ class FlightLogic:
         return self.patrol_waypoint_provider(position, completed)
 
     def _is_inside_roi(self, position: Position) -> bool:
-        if self._roi_center is None:
-            return False
-        distance_m = math.hypot(
-            position[0] - self._roi_center[0],
-            position[1] - self._roi_center[1],
-        )
-        # Patrol must not begin in the arrival-tolerance halo outside the ROI.
-        # The configured tolerance remains useful to mission/UI observers, but
-        # flight guidance uses the physical boundary as its safety invariant.
-        return distance_m <= self._roi_radius
+        return self._roi_center is not None and self.roi_patrol_planner.contains(position)
 
     def _has_reached(self, position: Position, target: Position) -> bool:
         """Check if drone reached it's target"""
@@ -1253,6 +1387,16 @@ class FlightLogic:
         return (
             horizontal_distance <= self.config.horizontal_tolerance
             and vertical_distance <= self.config.vertical_tolerance
+        )
+
+    def _has_completed_takeoff(self, position: Position, target: Position) -> bool:
+        """Accept the configured cruise altitude within the existing tolerance."""
+        horizontal_distance = math.hypot(
+            target[0] - position[0], target[1] - position[1]
+        )
+        return (
+            horizontal_distance <= self.config.horizontal_tolerance
+            and position[2] >= self.config.takeoff_altitude - self.config.vertical_tolerance
         )
 
 

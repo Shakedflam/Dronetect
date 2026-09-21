@@ -39,6 +39,7 @@ class SimulatorRealtimeClient:
     ) -> None:
         self.url = url or os.getenv("DRONTECT_SIMULATOR_WS_URL", DEFAULT_SERVER_URL)
         self._outgoing: Queue[dict[str, Any]] = Queue(maxsize=10)
+        self._control_outgoing: Queue[dict[str, Any]] = Queue()
         self._commands: Queue[dict[str, Any]] = Queue()
         self._detections: Queue[dict[str, Any]] = Queue(maxsize=2)
         self._stop = Event()
@@ -89,6 +90,11 @@ class SimulatorRealtimeClient:
             except Empty:
                 pass
         self._outgoing.put_nowait(telemetry)
+
+    def publish_control_message(self, message: dict[str, Any]) -> None:
+        """Queue a non-droppable controller response ahead of telemetry."""
+        if connect is not None:
+            self._control_outgoing.put_nowait(message)
 
     def drain_commands(self) -> list[dict[str, Any]]:
         commands: list[dict[str, Any]] = []
@@ -168,6 +174,13 @@ class SimulatorRealtimeClient:
 
     async def _send_telemetry(self, websocket) -> None:
         while not self._stop.is_set():
+            try:
+                control = self._control_outgoing.get_nowait()
+            except Empty:
+                control = None
+            if control is not None:
+                await websocket.send(encode_message(control))
+                continue
             try:
                 telemetry = await asyncio.to_thread(
                     self._outgoing.get,

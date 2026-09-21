@@ -34,7 +34,7 @@ def test_signed_angle_to_target_reports_none_without_target():
 def test_format_telemetry_hud_contains_key_flight_values():
     hud = format_telemetry_hud(
         TelemetrySnapshot(
-            state=FlightState.FLYING_RANDOMLY,
+            state=FlightState.PATROLLING,
             current=(1.0, 2.0, 3.0),
             home=(0.0, 0.0, 0.5),
             target=(4.0, 6.0, 3.0),
@@ -50,7 +50,7 @@ def test_format_telemetry_hud_contains_key_flight_values():
     )
 
     assert "DRONE TELEMETRY" in hud
-    assert "State   FLYING_RANDOMLY" in hud
+    assert "State   PATROLLING" in hud
     assert "Target  4.0, 6.0, 3.0" in hud
     assert "Speed   5.25 m/s" in hud
     assert "Angle   53.1 deg" in hud

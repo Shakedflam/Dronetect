@@ -8,10 +8,12 @@ from typing import Any, Protocol
 from websockets.asyncio.server import ServerConnection
 
 from realtime_server.protocol import (
+    MESSAGE_TYPE_OPERATING_CONFIG_RESULT,
     ProtocolError,
     encode_message,
     parse_json_message,
     validate_telemetry_message,
+    validate_operating_config_result_message,
 )
 
 
@@ -19,7 +21,7 @@ class DroneSdkConnection(Protocol):
     """Source-agnostic drone connection consumed by the realtime server."""
 
     def iter_telemetry(self) -> AsyncIterator[dict[str, Any]]:
-        """Yield normalized telemetry messages from the connected drone source."""
+        """Yield normalized telemetry and controller-result messages."""
         ...
 
     async def send_command(self, command: dict[str, Any]) -> None:
@@ -44,7 +46,11 @@ class WebSocketDroneSdkAdapter:
     async def iter_telemetry(self) -> AsyncIterator[dict[str, Any]]:
         async for raw in self._websocket:
             try:
-                yield validate_telemetry_message(parse_json_message(str(raw)))
+                message = parse_json_message(str(raw))
+                if message.get("type") == MESSAGE_TYPE_OPERATING_CONFIG_RESULT:
+                    yield validate_operating_config_result_message(message)
+                else:
+                    yield validate_telemetry_message(message)
             except ProtocolError as exc:
                 await self._websocket.send(encode_message(exc.to_message()))
 

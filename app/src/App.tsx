@@ -5,9 +5,11 @@ import { DroneHUD } from './components/hud/DroneHUD';
 import { MapView } from './components/map/MapView';
 import { DroneVideo } from './components/video/DroneVideo';
 import { useDetection } from './hooks/useDetection';
+import { useMissionStatus } from './hooks/useMissionStatus';
 import { useTelemetry } from './hooks/useTelemetry';
 import { useTargetSelection } from './hooks/useTargetSelection';
 import styles from './App.module.css';
+import { DEFAULT_OPERATING_CONFIG } from './config/mapConfig';
 
 /**
  * Top-level layout. Owns target selection plus the short-lived optimistic
@@ -15,6 +17,8 @@ import styles from './App.module.css';
  * Everything else lives behind the hooks/services each child pulls from.
  */
 function App() {
+  const missionStatus = useMissionStatus();
+  const operatingConfig = missionStatus?.operatingConfig ?? DEFAULT_OPERATING_CONFIG;
   const targets = useDetection();
   const telemetry = useTelemetry();
   const diagnostics = telemetry?.targetFollowDiagnostics ?? null;
@@ -38,6 +42,9 @@ function App() {
               targets={targets}
               diagnostics={diagnostics}
               ignoredTargetId={ignoredMapTargetId}
+              maxFlightRadiusM={operatingConfig.maxFlightRadiusM}
+              cruiseAltitudeM={operatingConfig.cruiseAltitudeM}
+              operatingConfigPending={missionStatus?.operatingConfigPending ?? false}
             />
             <DroneHUD />
           </div>

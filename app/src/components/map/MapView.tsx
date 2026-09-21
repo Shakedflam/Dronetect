@@ -27,7 +27,6 @@ import {
   DEFAULT_ROI_RADIUS_METERS,
   DEFAULT_ZOOM,
   FOLLOW_PADDING,
-  HOME_RADIUS_METERS,
   HOME_REFERENCE,
   MAX_FOLLOW_ZOOM,
   MAX_ROI_RADIUS_METERS,
@@ -36,6 +35,7 @@ import {
 import { bearingDeg, destinationPoint, euclideanDistanceMeters } from '../../utils/geo';
 import { clipRoiToHomeRange } from '../../utils/roiClipping';
 import { PatrolLayer } from './PatrolLayer';
+import { FlightParametersLayer } from './FlightParametersLayer';
 import styles from './MapView.module.css';
 
 const droneIcon = L.divIcon({
@@ -68,6 +68,9 @@ interface MapViewProps {
   targets: DetectedTarget[];
   diagnostics: TargetFollowDiagnostics | null;
   ignoredTargetId: string | null;
+  maxFlightRadiusM: number;
+  cruiseAltitudeM: number;
+  operatingConfigPending: boolean;
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {
@@ -175,10 +178,12 @@ function LiveTrackingControl({
   position,
   home,
   target,
+  maxFlightRadiusM,
 }: {
   position: DronePosition;
   home: Coordinates;
   target: Coordinates | null;
+  maxFlightRadiusM: number;
 }) {
   const map = useMap();
   const [autoFollow, setAutoFollow] = useState(true);
@@ -216,6 +221,7 @@ function LiveTrackingControl({
 
   useEffect(() => {
     const bounds = L.latLngBounds([position.lat, position.lng], [home.lat, home.lng]);
+    bounds.extend(L.latLng(home.lat, home.lng).toBounds(maxFlightRadiusM * 2));
     if (target) bounds.extend([target.lat, target.lng]);
     if (!hasCenteredOnce.current) {
       map.fitBounds(bounds, { padding: FOLLOW_PADDING, maxZoom: MAX_FOLLOW_ZOOM, animate: false });
@@ -228,7 +234,7 @@ function LiveTrackingControl({
     if (now - lastFlyAt.current < FOLLOW_REFLY_MIN_INTERVAL_MS) return;
     lastFlyAt.current = now;
     map.flyToBounds(bounds, { padding: FOLLOW_PADDING, maxZoom: MAX_FOLLOW_ZOOM, duration: FOLLOW_FLY_DURATION_S });
-  }, [position, home, target, autoFollow, map]);
+  }, [position, home, target, maxFlightRadiusM, autoFollow, map]);
 
   if (autoFollow) return null;
 
@@ -286,7 +292,15 @@ function toCoordinates(center: RoiCenter): Coordinates {
  * including this layer — picks it up the same way a click here does; this
  * component never simulates or requires a map click to update the ROI.
  */
-function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: number }) {
+function RoiLayer({
+  home,
+  homeRadiusM,
+  onPanelHeightChange,
+}: {
+  home: Coordinates;
+  homeRadiusM: number;
+  onPanelHeightChange?: (heightPx: number) => void;
+}) {
   const roi = useRoi();
   const [defining, setDefining] = useState(false);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -303,6 +317,18 @@ function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: numbe
     L.DomEvent.disableScrollPropagation(panel);
     return () => stopDragRef.current?.();
   }, []);
+
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (!panel || !onPanelHeightChange) return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry) onPanelHeightChange(entry.target.getBoundingClientRect().height);
+    });
+    observer.observe(panel);
+    onPanelHeightChange(panel.getBoundingClientRect().height);
+    return () => observer.disconnect();
+  }, [onPanelHeightChange]);
 
   const map = useMapEvents({
     click(event) {
@@ -518,8 +544,16 @@ function RoiLayer({ home, homeRadiusM }: { home: Coordinates; homeRadiusM: numbe
  * directly. The home marker is a static display anchor (HOME_REFERENCE),
  * not live telemetry — see config/mapConfig.ts.
  */
-export function MapView({ targets, diagnostics, ignoredTargetId }: MapViewProps) {
+export function MapView({
+  targets,
+  diagnostics,
+  ignoredTargetId,
+  maxFlightRadiusM,
+  cruiseAltitudeM,
+  operatingConfigPending,
+}: MapViewProps) {
   const position = useLocation();
+  const [roiPanelHeight, setRoiPanelHeight] = useState(0);
 
   if (!position) {
     return (
@@ -558,7 +592,7 @@ export function MapView({ targets, diagnostics, ignoredTargetId }: MapViewProps)
         />
         <Circle
           center={[HOME_REFERENCE.lat, HOME_REFERENCE.lng]}
-          radius={HOME_RADIUS_METERS}
+          radius={maxFlightRadiusM}
           interactive={false}
           pathOptions={{ color: '#3a6fd8', weight: 2, opacity: 0.55, fill: true, fillColor: '#3a6fd8', fillOpacity: 0.08 }}
         />
@@ -588,9 +622,19 @@ export function MapView({ targets, diagnostics, ignoredTargetId }: MapViewProps)
           position={position}
           home={HOME_REFERENCE}
           target={targetEstimate?.center ?? null}
+          maxFlightRadiusM={maxFlightRadiusM}
         />
-        <RoiLayer home={HOME_REFERENCE} homeRadiusM={HOME_RADIUS_METERS} />
-        <PatrolLayer home={HOME_REFERENCE} homeRadiusM={HOME_RADIUS_METERS} />
+        <RoiLayer
+          home={HOME_REFERENCE}
+          homeRadiusM={maxFlightRadiusM}
+          onPanelHeightChange={setRoiPanelHeight}
+        />
+        <PatrolLayer home={HOME_REFERENCE} homeRadiusM={maxFlightRadiusM} />
+        <FlightParametersLayer
+          config={{ maxFlightRadiusM, cruiseAltitudeM }}
+          pending={operatingConfigPending}
+          topOffsetPx={roiPanelHeight}
+        />
       </MapContainer>
     </div>
   );
