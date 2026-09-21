@@ -126,13 +126,17 @@ def test_lost_predictions_time_out_without_rejection():
     assert not logic.target_decisions.ignored
 
 
-def test_manual_approval_is_immediate_and_does_not_bypass_pursuit_confirmation():
+def test_confirmation_alone_starts_follow_without_bypassing_pursuit_entry():
+    """No operator step gates the follow, and none skips the pursuit gate either."""
     logic = make_logic()
     observe(logic, [box(logic, state="tentative")])
-    assert not logic.approve_target("other", POSITION)
-    assert logic.approve_target("one", POSITION)
-    assert logic.state is FlightState.TARGET_FOLLOW
-    tick(logic, 0.8)
+    assert logic.state is FlightState.TARGET_ACQUISITION
+    tick(logic, 0.1)
+    observe(logic, [box(logic, state="tentative")])
+    # A tentative track is evidence, not a confirmation: still no follow.
+    assert logic.state is FlightState.TARGET_ACQUISITION
+    tick(logic, 0.1)
+    observe(logic, [box(logic, confidence=0.9)])
     assert logic.state is FlightState.TARGET_FOLLOW
     assert logic.pursuit.velocity == (0, 0, 0)
 
@@ -142,7 +146,9 @@ def test_manual_rejection_uses_existing_resume_path_and_expires(mode):
     logic = make_logic()
     observe(logic, [box(logic, confidence=0.9)])
     if mode != "acquisition":
-        assert logic.approve_target("one", POSITION)
+        tick(logic, 0.1)
+        observe(logic, [box(logic, confidence=0.9)])
+        assert logic.state is FlightState.TARGET_FOLLOW
     if mode == "pursuit":
         tick(logic, logic.pursuit.config.stable_duration_s)
         assert logic.state is FlightState.TARGET_PURSUIT
@@ -158,7 +164,7 @@ def test_manual_rejection_uses_existing_resume_path_and_expires(mode):
     assert logic.target == WAYPOINT
     observe(logic)
     assert logic.state is FlightState.PATROLLING
-    tick(logic, 6)
+    tick(logic, logic.config.target_ignore_timeout_s)
     observe(logic)
     assert logic.state is FlightState.TARGET_ACQUISITION
 
@@ -168,7 +174,6 @@ def test_reject_grace_after_box_disappears(delay, allowed):
     logic = make_logic()
     observe(logic)
     observe(logic, [])
-    assert not logic.approve_target("one", POSITION)
     tick(logic, delay)
     assert logic.reject_target("one") is allowed
 
@@ -176,7 +181,6 @@ def test_reject_grace_after_box_disappears(delay, allowed):
 def test_visible_candidate_keeps_reject_available_then_grace_does_not_refresh():
     logic = make_logic()
     observe(logic, [box(logic, confidence=0.9)])
-    logic.approve_target("one", POSITION)
     for _ in range(8):
         tick(logic, 0.5)
         observe(logic, [box(logic, confidence=0.9)])
@@ -193,7 +197,8 @@ def test_reject_succeeds_throughout_the_full_grace_window_and_restores_mission(s
     logic = make_logic()
     observe(logic, [box(logic, confidence=0.9)])
     if start_state == "follow":
-        assert logic.approve_target("one", POSITION)
+        tick(logic, 0.1)
+        observe(logic, [box(logic, confidence=0.9)])
         assert logic.state is FlightState.TARGET_FOLLOW
     observe(logic, [])
     tick(logic, 1.69)
@@ -219,29 +224,33 @@ def test_target_reappearing_during_grace_window_resumes_tracking_without_delay()
     assert logic.state is FlightState.TARGET_ACQUISITION
 
 
-def test_approve_while_already_following_confirms_in_place_and_cancels_auto_reject():
+def test_static_false_positive_is_dropped_even_after_follow_has_started():
+    """The window keeps running once follow begins; nothing locks it out now.
+
+    Confirmation starts the follow on weak evidence, so the filter has to be
+    able to undo that. It stays safe for real targets because it requires the
+    aircraft to be nearly stationary and the box to hold its size -- neither
+    survives an actual pursuit.
+    """
     logic = make_logic()
-    # Confidence stays above target_min_confidence (so it counts as a normal
-    # confirmation hit) but below target_low_confidence (so it would
-    # eventually be auto-rejected as weak if not locked in by approval).
+    # Above target_min_confidence, so it counts as a confirmation hit, but
+    # below target_low_confidence, so the window judges it weak.
     observe(logic, [box(logic, confidence=0.5)])
     tick(logic, 0.1)
     observe(logic, [box(logic, confidence=0.5)])
-    # Two confirmed hits already started follow automatically.
     assert logic.state is FlightState.TARGET_FOLLOW
-    target_before = logic.target
-    velocity_before = logic.pursuit.velocity
-    assert logic.approve_target("one", POSITION)
-    # Approve does not restart tracking, reset the target, or pause movement.
-    assert logic.state is FlightState.TARGET_FOLLOW
-    assert logic.target == target_before
-    assert logic.pursuit.velocity == velocity_before
-    # Advance past the observation window with weak/stationary evidence that
-    # would otherwise trigger automatic rejection -- it must now be locked out.
+
     tick(logic, 0.85)
     observe(logic, [box(logic, confidence=0.5)])
-    assert logic.state in {FlightState.TARGET_FOLLOW, FlightState.TARGET_PURSUIT}
-    assert not logic.target_decisions.ignored
+    tick(logic, 0.85)
+    observe(logic, [box(logic, confidence=0.5)])
+
+    assert not logic.is_target_tracking
+    assert logic.target_decisions.ignored
+    assert (
+        logic.target_decisions.last_rejection_reason
+        == "stationary_with_weak_confidence"
+    )
 
 
 @pytest.mark.parametrize("new_center", [500, 850])
@@ -437,7 +446,7 @@ def test_ground_projection_geometry_and_invalid_rays():
     assert project(position=(0, 0, float("nan"))) is None
 
 
-@pytest.mark.parametrize("command", ["approve_target", "reject_target"])
+@pytest.mark.parametrize("command", ["reject_target"])
 def test_target_commands_validate_and_preserve_track_id(command):
     message = dict(type="command", commandId="decision", command=command, params={"trackId": "one"})
     assert validate_command_message(message)["params"] == {"trackId": "one"}
@@ -456,7 +465,7 @@ def test_decision_diagnostics_survive_protocol_and_legacy_payloads_still_work():
     assert "targetDecision" not in _validate_target_follow_diagnostics(data)
 
 
-@pytest.mark.parametrize("command", ["approve_target", "reject_target"])
+@pytest.mark.parametrize("command", ["reject_target"])
 @pytest.mark.parametrize("safety", [False, True])
 def test_commands_route_with_track_id_and_respect_safety_return(command, safety):
     async def scenario():
@@ -474,3 +483,109 @@ def test_commands_route_with_track_id_and_respect_safety_return(command, safety)
             server.drone.send_command.assert_awaited_once_with(payload)
             assert response["type"] == "command_ack"
     asyncio.run(scenario())
+
+
+def growing_box(logic, *, confidence, half_width):
+    """A centered box whose apparent size changes between frames."""
+    return {
+        "trackId": "one", "trackState": "confirmed", "confidence": confidence,
+        "box": [500 - half_width, 500 - half_width, 500 + half_width, 500 + half_width],
+        "lastSeenTimestamp": logic._elapsed_time,
+        "velocityPxPerSec": {"x": 0, "y": 0},
+    }
+
+
+def test_approaching_target_is_never_auto_rejected_as_a_static_false_positive():
+    """A drone flying straight at a hovering aircraft has no lateral image motion.
+
+    It is therefore indistinguishable from a fixed false positive by frame
+    position alone, and on weak confidence the observation window used to
+    discard it -- silently abandoning the most dangerous kind of target.
+    Its box is growing, which is what tells the two apart.
+    """
+    logic = make_logic()
+    for half_width in (20, 26, 34, 44):
+        observe(logic, [growing_box(logic, confidence=0.5, half_width=half_width)])
+        tick(logic, 0.6)
+
+    assert logic.target_decisions.ready(logic._elapsed_time)
+    assert not logic.target_decisions.should_reject()
+    assert logic.is_target_tracking
+
+
+def test_fixed_size_weak_target_is_still_auto_rejected():
+    """The filter must still discard what it was built for: static objects."""
+    logic = make_logic()
+    for _ in range(4):
+        observe(logic, [growing_box(logic, confidence=0.5, half_width=30)])
+        tick(logic, 0.6)
+
+    # Rejection fires inside the window and hands the mission straight back.
+    assert not logic.is_target_tracking
+    assert logic.state is FlightState.PATROLLING
+    assert (
+        logic.target_decisions.last_rejection_reason
+        == "stationary_with_weak_confidence"
+    )
+
+
+def test_receding_target_is_not_auto_rejected_either():
+    logic = make_logic()
+    for half_width in (44, 34, 26, 20):
+        observe(logic, [growing_box(logic, confidence=0.5, half_width=half_width)])
+        tick(logic, 0.6)
+
+    assert logic.target_decisions.ready(logic._elapsed_time)
+    assert not logic.target_decisions.should_reject()
+
+
+def test_pursuit_hold_suppresses_acquisition_entirely():
+    logic = make_logic()
+    assert not logic.pursuit_blocked
+    assert logic.set_pursuit_blocked(True)
+    assert logic.pursuit_blocked
+
+    for _ in range(6):
+        observe(logic, [box(logic, confidence=0.9)])
+        tick(logic, 0.2)
+
+    assert logic.state is FlightState.PATROLLING
+    assert not logic.is_target_tracking
+    assert logic.pursuit.velocity == (0, 0, 0)
+
+
+def test_engaging_the_hold_mid_pursuit_disengages_and_resumes_the_mission():
+    """A hold that only applied to future targets would leave a chase running."""
+    logic = make_logic()
+    for _ in range(4):
+        observe(logic, [box(logic, confidence=0.9)])
+        tick(logic, 0.2)
+    assert logic.state is FlightState.TARGET_PURSUIT
+
+    assert logic.set_pursuit_blocked(True, POSITION)
+
+    assert not logic.is_target_tracking
+    assert logic.pursuit.velocity == (0, 0, 0)
+    tick(logic, 0.1)
+    assert logic.state in {FlightState.TARGET_RETURN, FlightState.PATROLLING}
+
+
+def test_releasing_the_hold_restores_autonomous_pursuit():
+    logic = make_logic()
+    logic.set_pursuit_blocked(True)
+    observe(logic, [box(logic, confidence=0.9)])
+    assert logic.state is FlightState.PATROLLING
+
+    assert logic.set_pursuit_blocked(False)
+    assert not logic.pursuit_blocked
+    for _ in range(4):
+        observe(logic, [box(logic, confidence=0.9)])
+        tick(logic, 0.2)
+    assert logic.state is FlightState.TARGET_PURSUIT
+
+
+def test_setting_the_hold_to_its_current_value_is_a_no_op():
+    logic = make_logic()
+    assert not logic.set_pursuit_blocked(False)
+    assert logic.set_pursuit_blocked(True)
+    assert not logic.set_pursuit_blocked(True)

@@ -18,6 +18,11 @@ Position = tuple[float, float, float]
 class RoiPatrolPlan(Protocol):
     """Minimal interface consumed by the flight state machine."""
 
+    # The operating config swap replaces this wholesale when the flight radius
+    # changes, so it is part of the interface rather than an implementation
+    # detail of the lawn-mower planner.
+    config: "RoiPatrolConfig"
+
     def reset(
         self,
         center: tuple[float, float],

@@ -14,8 +14,8 @@ try:
         TargetDecisions, ground_projection, range_estimated_projection,
     )
     from .pursuit import (
-        PursuitConfig, PursuitController, TargetAltitudeEstimate,
-        estimate_target_altitude,
+        PursuitConfig, PursuitController, TargetAltitudeEstimate, TargetState,
+        estimate_target_altitude, reference_area_ratio_from_span,
     )
     from .roi_patrol import LawnMowerRoiPatrolPlanner, RoiPatrolPlan
 except ImportError:  # Webots loads this directory as top-level modules.
@@ -23,8 +23,8 @@ except ImportError:  # Webots loads this directory as top-level modules.
         TargetDecisions, ground_projection, range_estimated_projection,
     )
     from pursuit import (
-        PursuitConfig, PursuitController, TargetAltitudeEstimate,
-        estimate_target_altitude,
+        PursuitConfig, PursuitController, TargetAltitudeEstimate, TargetState,
+        estimate_target_altitude, reference_area_ratio_from_span,
     )
     from roi_patrol import LawnMowerRoiPatrolPlanner, RoiPatrolPlan
 
@@ -49,8 +49,26 @@ class FlightState(Enum):
     TARGET_PURSUIT = "TARGET_PURSUIT"
     TARGET_RETURN = "TARGET_RETURN"
     RETURNING_HOME = "RETURNING_HOME"
+    MANUAL = "MANUAL"
     LANDING = "LANDING"
     LANDED = "LANDED"
+
+
+# Where the operator may take the aircraft off the computer: airborne and under
+# control. Taking over a climb, a landing or a parked aircraft is refused --
+# there is nothing useful to fly and no mission to hand back to.
+MANUAL_ALLOWED_STATES = frozenset({
+    FlightState.HOLDING,
+    FlightState.TRANSITING_TO_ROI,
+    FlightState.ROI_PATROL,
+    FlightState.PATROLLING,
+    FlightState.REPOSITIONING,
+    FlightState.TARGET_ACQUISITION,
+    FlightState.TARGET_FOLLOW,
+    FlightState.TARGET_PURSUIT,
+    FlightState.TARGET_RETURN,
+    FlightState.RETURNING_HOME,
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,39 +96,95 @@ class FlightConfig:
     target_observation_s: float = 0.85
     target_observation_min_samples: int = 3
     target_stationary_center_ratio: float = 0.02
+    # Fractional box-area spread below which a target counts as holding its
+    # apparent size, and so as a candidate static false positive.
+    target_static_area_tolerance: float = 0.15
     target_stationary_observer_m: float = 0.25
     target_stationary_angle_rad: float = math.radians(2.0)
     target_low_confidence: float = 0.60
     target_confidence_range: float = 0.20
     target_ignore_radius_m: float = 5.0
-    target_ignore_timeout_s: float = 6.0
+    target_ignore_timeout_s: float = 12.0
     target_reject_grace_s: float = 1.7
     target_projection_min_angle_rad: float = math.radians(5.0)
     target_projection_max_range_m: float = 250.0
     # Must exceed the expected interval between vision frames so a tentative
     # track can receive its confirming hit while the aircraft remains stopped.
     target_acquisition_timeout_s: float = 2.5
-    target_lost_search_timeout_s: float = 2.0
-    target_yaw_gain: float = 0.35
+    # A target behind a roofline is out of sight for longer than it feels
+    # like from the video. Giving up early is what turns a brief occlusion
+    # into a lost track and a mission resume.
+    target_lost_search_timeout_s: float = 3.0
+    # Height gained while searching, measured from where the target was lost.
+    # Seeing over the thing it went behind is what actually reacquires it.
+    target_lost_search_climb_m: float = 1.0
+    target_yaw_gain: float = 0.8
     target_yaw_prediction_horizon_s: float = 0.5
     target_yaw_deadband_ratio: float = 0.04
     target_velocity_smoothing: float = 0.35
-    target_max_yaw_rate_rad_s: float = math.radians(18.0)
+    target_max_yaw_rate_rad_s: float = math.radians(120.0)
     target_gimbal_pitch_gain: float = 0.25
     target_center_tolerance_x: float = 0.08
     target_center_tolerance_y: float = 0.12
-    target_search_yaw_rate_rad_s: float = math.radians(10.0)
+    # Base sweep rate after a loss. Scaled up by how near the frame edge the
+    # target was when it went: one lost centre-frame went behind something and
+    # will reappear near where it was, but one lost at the edge went out
+    # sideways and is already somewhere the camera is not pointing.
+    target_search_yaw_rate_rad_s: float = math.radians(25.0)
     target_follow_step_m: float = 6.0
     target_lateral_motion_gain_m: float = 4.0
     target_standoff_box_area_ratio: float = 0.025
     target_standoff_distance_m: float = 2.0
-    target_altitude_target_band_m: float = 0.5
-    target_altitude_gain_per_s: float = 1.0
+    # Range calibration, deliberately NOT the standoff pair above. Those two
+    # are a setpoint -- "stop closing once the box is this big" -- and reusing
+    # them as a physical calibration silently asserts a target size that was
+    # never measured. Every absolute range the aircraft believes comes from
+    # here, so it gets its own knobs: the airframe span it expects to see, or
+    # a ratio measured directly off a run when the detector's boxes are
+    # looser than the airframe.
+    target_reference_span_m: float = 0.45
+    target_reference_distance_m: float = 2.0
+    target_reference_area_ratio: float | None = None
+    # How closely the standoff height above the target is held. The estimate
+    # behind it is a real measurement -- slant range, camera pitch and where
+    # the box sits in frame, against the aircraft's own altitude -- so the
+    # band exists to absorb box jitter, not to excuse drifting metres high.
+    target_altitude_target_band_m: float = 0.3
+    target_altitude_gain_per_s: float = 1.5
     target_max_vertical_speed_mps: float = 2.0
     target_range_estimate_max_m: float = 100.0
-    target_standoff_deadband_ratio: float = 0.005
-    target_approach_growth_ratio_per_s: float = 0.04
+    target_standoff_deadband_fraction: float = 0.2
     target_collision_avoidance_step_m: float = 3.0
+    # Yaw rate is not a fixed cap: holding a target centered needs
+    # v_perp / range rad/s, so the limit is derived per frame and only
+    # approaches the ceiling for a close, fast-crossing target.
+    target_min_yaw_rate_rad_s: float = math.radians(20.0)
+    target_yaw_rate_margin: float = 2.0
+    # How quickly a bearing error is taken out. Shorter keeps the target
+    # nearer the centre of frame during a hard turn, which is where the
+    # tracker holds identity and the range estimate is least distorted.
+    target_yaw_time_constant_s: float = 0.45
+    # Urgency near the frame edge. A target drifting wide is about to leave
+    # frame entirely, and the cost of that is losing the track -- so the last
+    # of the frame is worth defending far harder than the middle of it, and
+    # the boost is squared so it stays out of the way until it is needed.
+    target_yaw_edge_gain: float = 2.0
+    # Range at and beyond which the bearing correction runs at its nominal
+    # rate. Closer than this it is shortened, because the same lateral motion
+    # sweeps across frame faster the nearer the target is.
+    target_yaw_range_reference_m: float = 30.0
+    # Floor on that shortening, so a very close target cannot demand an
+    # arbitrarily fast correction from the proportional term alone.
+    target_yaw_range_min_factor: float = 0.3
+    # World-frame target estimate feeding the stern chase.
+    target_state_alpha: float = 0.45
+    target_state_beta: float = 0.25
+    target_state_timeout_s: float = 1.0
+    target_state_max_speed_mps: float = 30.0
+    # The alpha-beta velocity is deliberately responsive, which makes a single
+    # box-size step read as metres per second of motion. Flying on it needs a
+    # far slower estimate, so the search drift gets its own smoothing.
+    target_drift_smoothing_s: float = 1.5
     # A takeoff interrupted by a confirmed target may begin cautious pursuit
     # above the hard floor instead of climbing to the normal cruise altitude.
     target_takeoff_pursuit_clearance_m: float = 2.0
@@ -119,12 +193,17 @@ class FlightConfig:
     def __post_init__(self):
         for name in ("target_observation_s", "target_stationary_center_ratio",
                      "target_stationary_observer_m", "target_stationary_angle_rad",
+                     "target_static_area_tolerance",
                      "target_low_confidence", "target_confidence_range", "target_ignore_radius_m",
                      "target_ignore_timeout_s", "target_reject_grace_s",
+                     "target_lost_search_climb_m",
                      "target_projection_min_angle_rad", "target_projection_max_range_m",
                      "target_standoff_distance_m", "target_altitude_target_band_m",
                      "target_altitude_gain_per_s", "target_max_vertical_speed_mps",
-                     "target_range_estimate_max_m"):
+                     "target_range_estimate_max_m", "target_min_yaw_rate_rad_s",
+                     "target_yaw_rate_margin", "target_yaw_time_constant_s",
+                     "target_state_timeout_s", "target_state_max_speed_mps",
+                     "target_drift_smoothing_s"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
@@ -133,6 +212,8 @@ class FlightConfig:
         if self.target_low_confidence > 1 or self.target_confidence_range > 1:
             raise ValueError("Confidence thresholds must be at most 1")
         for name in (
+            "target_reference_span_m",
+            "target_reference_distance_m",
             "target_standoff_distance_m",
             "target_altitude_gain_per_s",
             "target_max_vertical_speed_mps",
@@ -140,6 +221,74 @@ class FlightConfig:
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.target_yaw_edge_gain < 0.0:
+            raise ValueError("target_yaw_edge_gain must be nonnegative")
+        if not 0.0 < self.target_yaw_range_min_factor <= 1.0:
+            raise ValueError("target_yaw_range_min_factor must lie in (0, 1]")
+        for name in ("target_yaw_range_reference_m",
+                     "target_yaw_time_constant_s", "target_state_timeout_s",
+                     "target_state_max_speed_mps", "target_min_yaw_rate_rad_s"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.target_yaw_rate_margin < 1.0:
+            raise ValueError("target_yaw_rate_margin must be at least 1")
+        for name in ("target_state_alpha", "target_state_beta"):
+            if not 0.0 < getattr(self, name) <= 1.0:
+                raise ValueError(f"{name} must lie in (0, 1]")
+        if self.target_min_yaw_rate_rad_s > self.target_max_yaw_rate_rad_s:
+            raise ValueError("target_min_yaw_rate_rad_s must not exceed the maximum")
+        if self.target_reference_area_ratio is not None and not (
+            0.0 < self.target_reference_area_ratio <= 1.0
+        ):
+            raise ValueError("target_reference_area_ratio must lie in (0, 1]")
+
+
+@dataclass(frozen=True, slots=True)
+class ManualStick:
+    """Operator stick input, normalized to [-1, 1] in the aircraft body frame.
+
+    All zeros is the resting position and means hover: the operator is holding
+    the aircraft, not commanding nothing.
+    """
+
+    forward: float = 0.0
+    right: float = 0.0
+    up: float = 0.0
+    yaw_rate: float = 0.0
+
+    @property
+    def is_centered(self) -> bool:
+        return not any((self.forward, self.right, self.up, self.yaw_rate))
+
+
+@dataclass(frozen=True, slots=True)
+class ManualFlightConfig:
+    """Limits the operator flies inside while the autopilot is suspended.
+
+    Deliberately slower than autonomous cruise: a human flying from a video
+    feed has far less situational awareness than the waypoint planner does.
+    """
+
+    max_horizontal_speed_mps: float = 6.0
+    max_vertical_speed_mps: float = 2.0
+    max_yaw_rate_rad_s: float = math.radians(60.0)
+    # Manual may descend, but not into the ground. Landing stays a computer job.
+    min_altitude_m: float = 2.0
+    # No stick update within this long and the aircraft falls back to a hover,
+    # so a dead tablet leaves it holding rather than drifting on a stale stick.
+    command_timeout_s: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class ManualResume:
+    """The mission the computer takes back when the operator releases manual.
+
+    `state` is one of PATROLLING, ROI_PATROL or RETURNING_HOME; `roi` carries
+    the local-frame centre and radius when the aircraft was working an ROI.
+    """
+
+    state: FlightState
+    roi: tuple[tuple[float, float], float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,11 +354,19 @@ class FlightLogic:
         self._target_area_growth_per_s = 0.0
         self._target_visible = False
         self._target_confirmed = False
+        # Altitude the target was lost at, so the search climb is measured
+        # from there rather than ratcheting upward across repeated losses.
+        self._target_lost_altitude: float | None = None
         self._target_yaw: float | None = None
         self._target_camera_pitch: float | None = None
         self._target_last_yaw = 0.0
         self._target_altitude_estimate: TargetAltitudeEstimate | None = None
+        self._target_world_position: Position | None = None
+        self._target_world_velocity = (0.0, 0.0, 0.0)
+        self._target_world_updated_at: float | None = None
+        self._target_state: TargetState | None = None
         self.pursuit = PursuitController(pursuit_config or PursuitConfig())
+        self._target_yaw_rate_limit = self.config.target_max_yaw_rate_rad_s
         self._stable_since: float | None = None
         self._pursuit_usable = False
         self._pursuit_started = False
@@ -221,6 +378,17 @@ class FlightLogic:
         self._target_return_ready = True
         self._reposition_waypoints: deque[Position] = deque()
         self._reposition_resume_state: FlightState | None = None
+        # Operator hold. Pursuit is autonomous by default; this is the one
+        # control that actually gates it, so it must be explicit state rather
+        # than something inferred from whatever the aircraft is doing.
+        self._pursuit_blocked = False
+        # Manual takeover. While engaged the autopilot picks no waypoints at
+        # all; the operator's stick is the only thing moving the aircraft, and
+        # a centered stick is a hover.
+        self._manual_control = False
+        self._manual_stick = ManualStick()
+        self._manual_resume: ManualResume | None = None
+        self._last_target_world_velocity = (0.0, 0.0)
 
     def initialize_home(self, position: Position) -> None:
         """Capture home once from the first valid simulated GPS reading."""
@@ -280,6 +448,26 @@ class FlightLogic:
             if self.target is None:
                 self.target = position
 
+        elif self.state is FlightState.MANUAL:
+            # The operator is flying. Follow them: the nominal target is
+            # wherever the aircraft currently is, so that a centered stick
+            # hovers and the controller always has a target to fall back on.
+            self.target = position
+
+        elif (
+            self.state in {FlightState.TRANSITING_TO_ROI, FlightState.ROI_PATROL}
+            and not self.roi_patrol_planner.snapshot().waypoints
+        ):
+            # request_roi() always resets the planner before entering either
+            # state, so an empty one here is an invariant violation -- a
+            # resume that never landed, or a cleared ROI. Degrade to area
+            # patrol rather than raising: an exception out of this loop does
+            # not pause the aircraft, it stops it being flown at all, and the
+            # airframe simply falls.
+            print("ROI patrol has no plan; falling back to area patrol.")
+            self.state = FlightState.PATROLLING
+            self.target = self._next_patrol_waypoint(position, completed=False)
+
         elif self.state is FlightState.TRANSITING_TO_ROI:
             if self._is_inside_roi(position):
                 self._start_roi_patrol(position)
@@ -338,6 +526,9 @@ class FlightLogic:
                 self._target_visible = False
                 self._pursuit_usable = False
             if self._target_visible:
+                # Back in sight: the next loss measures its climb from wherever
+                # the aircraft is then, not from an older one.
+                self._target_lost_altitude = None
                 self.target = self._target_tracking_hold_target(position)
                 # Approach begins as soon as the tracker is usable and flight
                 # safety allows movement -- no additional stability wait.
@@ -347,17 +538,35 @@ class FlightLogic:
                     self.state = FlightState.TARGET_PURSUIT
                     self._pursuit_started = True
                 if self.state is FlightState.TARGET_PURSUIT and self._pursuit_usable:
+                    altitude_estimate = self._target_altitude_estimate
+                    horizontal_range_m = (
+                        altitude_estimate.slant_range_m
+                        * math.cos(altitude_estimate.elevation_rad)
+                        if altitude_estimate is not None else None
+                    )
                     self.pursuit.update(
                         position=position, home=self.home, yaw=self._target_last_yaw,
                         image_velocity=self._pursuit_image_motion, area=self._target_area_ratio,
                         growth=self._pursuit_growth,
-                        desired_area=self.config.target_standoff_box_area_ratio,
-                        area_deadzone=self.config.target_standoff_deadband_ratio,
-                        collision_growth=self.config.target_approach_growth_ratio_per_s,
-                        collision_detected=(self._target_area_growth_per_s >= self.config.target_approach_growth_ratio_per_s),
-                        collision_side=(-1.0 if self._target_last_center[0] >= 0.5 else 1.0)
-                            * self.config.target_collision_avoidance_step_m,
+                        desired_area=self._standoff_area_ratio(),
+                        area_deadzone=(
+                            self._standoff_area_ratio()
+                            * self.config.target_standoff_deadband_fraction
+                        ),
+                        # The unsmoothed cue reacts a frame sooner; pursuit
+                        # reads it as a time to contact and gates it on range,
+                        # which is what keeps box jitter from braking.
+                        raw_relative_growth=(
+                            self._target_area_growth_per_s
+                            / max(self._target_area_ratio, 1e-6)
+                        ),
+                        collision_side=(
+                            self._pass_under_avoidance_side()
+                            * self.config.target_collision_avoidance_step_m
+                        ),
                         lateral_gain=self.config.target_lateral_motion_gain_m,
+                        estimated_horizontal_range_m=horizontal_range_m,
+                        target_state=self._target_state,
                         height_error_m=(
                             self._target_altitude_estimate.height_error_m
                             if self._target_altitude_estimate is not None else None
@@ -367,27 +576,26 @@ class FlightLogic:
                         max_vertical_speed_mps=self.config.target_max_vertical_speed_mps,
                         dt=dt,
                     )
+                    self._target_yaw = self._desired_target_yaw(
+                        self._target_last_yaw,
+                        avoidance_side=self.pursuit.avoidance_side,
+                    )
+                    self._update_target_yaw_rate_limit(position)
                     self._continue_takeoff_during_pursuit(position, dt)
                 else:
-                    self.pursuit.stop()
+                    # Brief tracker gaps decelerate rather than reset: from
+                    # rest the ramp costs seconds to rebuild.
+                    self.pursuit.coast(dt)
                     self._takeoff_pursuit_vertical_velocity = 0.0
             else:
-                self.pursuit.stop()
+                lost_for = self._elapsed_time - self._target_last_seen_at
+                self._search_for_lost_target(position, dt, lost_for)
                 self._takeoff_pursuit_vertical_velocity = 0.0
                 self._stable_since = None
                 self._pursuit_sample = None
                 self._pursuit_growth = 0.0
                 self._pursuit_image_motion = (0.0, 0.0)
                 self.target = self._target_tracking_hold_target(position)
-                lost_for = self._elapsed_time - self._target_last_seen_at
-                predicted_x = self._target_last_center[0] + self._target_velocity[0] * lost_for
-                image_error = predicted_x - 0.5
-                search_direction = math.copysign(1.0, image_error) if abs(image_error) > 1e-6 else 1.0
-                self._target_yaw = normalized_angle(
-                    (self._target_yaw or self._target_last_yaw)
-                    - self._target_velocity[0] * self.config.target_yaw_gain * dt
-                    - search_direction * self.config.target_search_yaw_rate_rad_s * dt
-                )
                 if lost_for > self.config.target_lost_search_timeout_s:
                     self.complete_target_follow(position)
 
@@ -439,9 +647,13 @@ class FlightLogic:
             FlightState.TARGET_FOLLOW,
             FlightState.TARGET_PURSUIT,
             FlightState.TARGET_RETURN,
+            # A safety RTH has to be able to take the aircraft off the
+            # operator; abort_manual_control() drops the latch first.
+            FlightState.MANUAL,
         }:
             return False
 
+        self._drop_manual_control()
         self.state = FlightState.RETURNING_HOME
         self._queued_waypoint = None
         self._queued_state = None
@@ -459,6 +671,7 @@ class FlightLogic:
         if self.home is None:
             raise RuntimeError("Home position must be initialized before commands.")
 
+        self._drop_manual_control()
         self._clear_target_tracking()
         self._queued_waypoint = None
         self._queued_state = None
@@ -479,6 +692,7 @@ class FlightLogic:
         if self.home is None:
             raise RuntimeError("Home position must be initialized before commands.")
 
+        self._drop_manual_control()
         self._roi_center = None
         self._roi_radius = 0.0
         self.roi_patrol_planner.clear()
@@ -508,6 +722,7 @@ class FlightLogic:
         if self.home is None:
             raise RuntimeError("Home position must be initialized before commands.")
 
+        self._drop_manual_control()
         self._roi_center = center
         self._roi_radius = radius_m
         self._reposition_waypoints.clear()
@@ -546,6 +761,10 @@ class FlightLogic:
         self._roi_radius = 0.0
         self._roi_first_waypoint = None
         self.roi_patrol_planner.clear()
+        if self._manual_control and self._manual_resume is not None:
+            # The operator cleared the ROI while flying. Releasing must not fly
+            # them back to an area they have just said they are done with.
+            self._manual_resume = ManualResume(state=FlightState.PATROLLING)
         if was_queued_for_roi:
             self._queued_waypoint = None
             self._queued_state = None
@@ -621,6 +840,124 @@ class FlightLogic:
     def target_yaw(self) -> float | None:
         """Absolute yaw guidance used while acquiring or following a target."""
         return self._target_yaw
+
+    @property
+    def pursuit_blocked(self) -> bool:
+        """Whether the operator hold is engaged, suppressing all pursuit."""
+        return self._pursuit_blocked
+
+    def set_pursuit_blocked(self, blocked: bool, position: Position | None = None) -> bool:
+        """Engage or release the operator hold.
+
+        Engaging mid-pursuit disengages: a hold that only applied to targets
+        not yet acquired would leave the operator watching a chase they just
+        asked to stop.
+        """
+        blocked = bool(blocked)
+        if blocked == self._pursuit_blocked:
+            return False
+        self._pursuit_blocked = blocked
+        if blocked and self.is_target_tracking:
+            self.complete_target_follow(position)
+        return True
+
+    @property
+    def manual_control(self) -> bool:
+        """Whether the operator currently has the aircraft off the computer."""
+        return self._manual_control
+
+    @property
+    def manual_stick(self) -> ManualStick:
+        """The stick the operator is currently holding; centered means hover."""
+        return self._manual_stick
+
+    def set_manual_stick(self, stick: ManualStick) -> None:
+        """Store the latest stick input, ignored unless manual is engaged."""
+        self._manual_stick = stick if self._manual_control else ManualStick()
+
+    def engage_manual_control(self, position: Position) -> bool:
+        """Hand the aircraft to the operator, remembering what to hand back.
+
+        Engaging mid-pursuit drops the chase for the same reason the pursuit
+        hold does: an operator who has taken the sticks is not expecting the
+        aircraft to keep flying a target on its own.
+        """
+        if self._manual_control or self.state not in MANUAL_ALLOWED_STATES:
+            return False
+
+        self._manual_resume = self._manual_resume_intent()
+        self._clear_target_tracking()
+        self._queued_waypoint = None
+        self._queued_state = None
+        self._reposition_waypoints.clear()
+        self._reposition_resume_state = None
+        self._manual_control = True
+        # Never inherit a stick from a previous takeover.
+        self._manual_stick = ManualStick()
+        self.state = FlightState.MANUAL
+        self.target = position
+        return True
+
+    def release_manual_control(self) -> ManualResume | None:
+        """Give the aircraft back, reporting the mission to restart.
+
+        The state deliberately stays MANUAL until the caller restarts a
+        mission: only the controller knows how to build a fresh patrol, and an
+        aircraft briefly parked in a mission state with no plan behind it is
+        exactly the invariant violation update() has to degrade around.
+        """
+        if not self._manual_control:
+            return None
+        resume = self._manual_resume
+        self._manual_control = False
+        self._manual_stick = ManualStick()
+        self._manual_resume = None
+        return resume or ManualResume(state=FlightState.PATROLLING)
+
+    def abort_manual_control(self) -> bool:
+        """Drop the takeover without handing any mission back.
+
+        This is how a safety RTH takes the aircraft: the operator loses the
+        sticks and the caller flies home instead of resuming what was
+        interrupted.
+        """
+        return self._drop_manual_control()
+
+    def _drop_manual_control(self) -> bool:
+        """End the takeover, whatever ended it.
+
+        Every route out of MANUAL runs through here, because a latch that
+        outlives the takeover is worse than no latch: the computer flies while
+        every readout still says the operator does, detections stay suppressed
+        for the rest of the sortie, and the next press of the button resumes a
+        mission the aircraft left behind long ago.
+        """
+        if not self._manual_control:
+            return False
+        self._manual_control = False
+        self._manual_stick = ManualStick()
+        self._manual_resume = None
+        return True
+
+    def _manual_resume_intent(self) -> ManualResume:
+        if self.state is FlightState.RETURNING_HOME:
+            return ManualResume(state=FlightState.RETURNING_HOME)
+        if self._roi_center is not None:
+            return ManualResume(
+                state=FlightState.ROI_PATROL,
+                roi=(self._roi_center, self._roi_radius),
+            )
+        return ManualResume(state=FlightState.PATROLLING)
+
+    @property
+    def target_yaw_rate_limit(self) -> float:
+        """Yaw rate ceiling for this frame, from target speed and range."""
+        return self._target_yaw_rate_limit
+
+    @property
+    def target_state(self) -> TargetState | None:
+        """Filtered world-frame target estimate, when one is available."""
+        return self._target_state
 
     @property
     def tracked_target_id(self) -> str | None:
@@ -763,6 +1100,12 @@ class FlightLogic:
         """
         if frame_width <= 0 or frame_height <= 0:
             return
+        if self._pursuit_blocked or self._manual_control:
+            # Detections still reach the operator through the vision pipeline;
+            # only the aircraft's reaction to them is suppressed. Under manual
+            # the operator is flying, so an autonomous chase would be the
+            # aircraft fighting them for the controls.
+            return
         project = lambda item: self.project_detection(item, frame_width, frame_height, position, yaw, camera_pitch)
         self.target_decisions.update_visibility(detections, self._elapsed_time, project)
         interruptible_states = {
@@ -789,13 +1132,22 @@ class FlightLogic:
                          and float(item.get("confidence", 0)) < self.config.target_min_confidence), None)
             if weak is not None:
                 box = weak["box"]
-                self.target_decisions.sample(weak, self._elapsed_time, (
-                    (box[0] + box[2]) / (2 * frame_width), (box[1] + box[3]) / (2 * frame_height)))
+                self.target_decisions.sample(
+                    weak,
+                    self._elapsed_time,
+                    (
+                        (box[0] + box[2]) / (2 * frame_width),
+                        (box[1] + box[3]) / (2 * frame_height),
+                    ),
+                    _box_area_ratio(box, frame_width, frame_height),
+                )
 
         selected = self._select_target_detection(detections, project=project)
         if selected is None:
-            self.pursuit.stop()
+            if self.state is not FlightState.TARGET_PURSUIT:
+                self.pursuit.stop(preserve_avoidance=True)
             self._target_altitude_estimate = None
+            self._reset_target_world_state()
             self._stable_since = None
             self._pursuit_usable = False
             self._pursuit_sample = None
@@ -835,6 +1187,7 @@ class FlightLogic:
             self._target_velocity = (0.0, 0.0)
         elif track_id != self._tracked_target_id:
             self.pursuit.stop()
+            self._reset_target_world_state()
             self._stable_since = None
             self._pursuit_sample = None
             self._pursuit_growth = 0.0
@@ -888,8 +1241,10 @@ class FlightLogic:
         elif self.state is FlightState.TARGET_FOLLOW and self._stable_since is None:
             self._stable_since = self._elapsed_time
         if not self._pursuit_usable:
-            self.pursuit.stop()
+            if self.state is not FlightState.TARGET_PURSUIT:
+                self.pursuit.stop(preserve_avoidance=True)
             self._target_altitude_estimate = None
+            self._reset_target_world_state()
             self._pursuit_sample = None
             self._pursuit_growth = 0.0
             self._pursuit_image_motion = (0.0, 0.0)
@@ -903,9 +1258,15 @@ class FlightLogic:
                 frame_height=frame_height,
                 camera_pitch=camera_pitch,
                 horizontal_fov_rad=self.pursuit.config.horizontal_fov_rad,
-                reference_distance_m=self.config.target_standoff_distance_m,
-                reference_area_ratio=self.config.target_standoff_box_area_ratio,
+                reference_distance_m=self.config.target_reference_distance_m,
+                reference_area_ratio=self.reference_area_ratio(frame_width, frame_height),
                 max_range_m=self.config.target_range_estimate_max_m,
+            )
+            self._update_target_world_state(
+                project(selected),
+                self._target_altitude_estimate.height_error_m
+                if self._target_altitude_estimate is not None else None,
+                position,
             )
             if self._pursuit_sample is not None:
                 sample_time, sample_area, sample_yaw = self._pursuit_sample
@@ -937,21 +1298,7 @@ class FlightLogic:
         self._target_velocity = normalized_velocity
         self._target_visible = is_visible
         self._target_last_yaw = yaw
-        predicted_error = max(
-            -0.5,
-            min(
-                0.5,
-                center[0]
-                - 0.5
-                + normalized_velocity[0]
-                * self.config.target_yaw_prediction_horizon_s,
-            ),
-        )
-        if abs(predicted_error) <= self.config.target_yaw_deadband_ratio:
-            predicted_error = 0.0
-        self._target_yaw = normalized_angle(
-            yaw - predicted_error * self.config.target_yaw_gain
-        )
+        self._target_yaw = self._desired_target_yaw(yaw)
         # Image Y grows downward and positive gimbal pitch tilts downward.
         self._target_camera_pitch = (
             camera_pitch + (center[1] - 0.5) * self.config.target_gimbal_pitch_gain
@@ -972,7 +1319,9 @@ class FlightLogic:
         # into TARGET_FOLLOW below.
         if self.is_target_tracking:
             self.target_decisions.record_pose(position, yaw, camera_pitch)
-            self.target_decisions.sample(selected, self._elapsed_time, center)
+            self.target_decisions.sample(
+                selected, self._elapsed_time, center, area_ratio
+            )
             if not self.target_decisions.evaluated and self.target_decisions.ready(self._elapsed_time):
                 if self.target_decisions.should_reject():
                     self.reject_target(track_id, position)
@@ -984,6 +1333,269 @@ class FlightLogic:
         # by _target_tracking_hold_target / _pursuit_altitude_is_safe.
         if self.state is FlightState.TARGET_ACQUISITION and confirmed:
             self._start_target_follow(position, yaw)
+
+    def _desired_target_yaw(
+        self,
+        yaw: float,
+        *,
+        avoidance_side: float = 0.0,
+    ) -> float:
+        predicted_error = max(
+            -0.5,
+            min(
+                0.5,
+                self._target_last_center[0]
+                - 0.5
+                + self._target_velocity[0]
+                * self.config.target_yaw_prediction_horizon_s,
+            ),
+        )
+        if abs(predicted_error) <= self.config.target_yaw_deadband_ratio:
+            predicted_error = 0.0
+        if avoidance_side != 0.0:
+            inward_look_ratio = max(
+                self.config.target_yaw_deadband_ratio,
+                self.config.target_center_tolerance_x,
+            )
+            predicted_error = max(
+                -0.5,
+                min(0.5, predicted_error - avoidance_side * inward_look_ratio),
+            )
+        # Command the bearing the image error actually represents. Treating
+        # the normalized error as radians silently scaled every correction by
+        # the camera FOV and, at 45 deg, under-corrected by better than half
+        # before the rate limiter ever saw the setpoint.
+        bearing_error = math.atan(
+            2.0 * predicted_error * math.tan(self.pursuit.config.horizontal_fov_rad / 2.0)
+        )
+        return normalized_angle(
+            yaw - bearing_error * self.config.target_yaw_gain
+        )
+
+    def _image_bearing_error(self) -> float:
+        """Absolute bearing to the target implied by its image position."""
+        return abs(
+            math.atan(
+                2.0
+                * max(-0.5, min(0.5, self._target_last_center[0] - 0.5))
+                * math.tan(self.pursuit.config.horizontal_fov_rad / 2.0)
+            )
+        )
+
+    def _target_range_estimate_m(self) -> float | None:
+        """Best available range to the target, world fix or box area alone."""
+        state = self._target_state
+        if state is not None and state.range_m > 1e-6:
+            return state.range_m
+        estimate = self._target_altitude_estimate
+        if estimate is not None and estimate.slant_range_m > 1e-6:
+            return estimate.slant_range_m
+        return None
+
+    def _yaw_edge_urgency(self) -> float:
+        """How much harder to turn because the target is nearing frame edge.
+
+        1 at the centre, rising toward the edge. Squared so it stays out of
+        the way while the target is comfortably in frame and only bites once
+        it is genuinely about to be lost off the side.
+        """
+        offset = abs(self._target_last_center[0] - 0.5) / 0.5
+        edge = min(1.0, max(0.0, offset))
+        return 1.0 + self.config.target_yaw_edge_gain * edge * edge
+
+    def _yaw_range_factor(self) -> float:
+        """Shortening of the bearing time constant at close range.
+
+        The same lateral motion sweeps across frame faster the nearer the
+        target is, so a correction that is unhurried at thirty metres is
+        already too slow at ten.
+        """
+        cfg = self.config
+        range_m = self._target_range_estimate_m()
+        if range_m is None:
+            return 1.0
+        return min(
+            1.0,
+            max(
+                cfg.target_yaw_range_min_factor,
+                range_m / max(cfg.target_yaw_range_reference_m, 1e-6),
+            ),
+        )
+
+    def _update_target_yaw_rate_limit(self, position: Position) -> None:
+        """Derive the yaw rate limit from where the target is and what it is doing.
+
+        Three things make turning urgent, and all three are read here:
+
+        * **How fast it is crossing** -- holding a target centered requires
+          exactly ``v_perp / range`` rad/s, which is the feed-forward term.
+        * **How close it is** -- the same lateral motion sweeps frame faster
+          the nearer the target, so the bearing time constant is shortened at
+          close range.
+        * **How near the edge it is** -- a target about to leave frame is a
+          track about to be lost, so the whole rate is scaled up as it drifts
+          wide.
+
+        The floor keeps a distant, centered target from being chased with
+        twitchy corrections, and the ceiling protects both the detector
+        (motion blur) and the own-yaw term that ``_pursuit_image_motion``
+        subtracts out, which is only a first-order correction.
+        """
+        cfg = self.config
+        time_constant = max(
+            1e-6, cfg.target_yaw_time_constant_s * self._yaw_range_factor()
+        )
+        rate = self._image_bearing_error() / time_constant
+        state = self._target_state
+        if state is not None and state.range_m > 1e-6:
+            own = self.pursuit.velocity
+            relative = (
+                state.velocity[0] - own[0],
+                state.velocity[1] - own[1],
+            )
+            line_x = state.position[0] - position[0]
+            line_y = state.position[1] - position[1]
+            line = math.hypot(line_x, line_y)
+            if line > 1e-6:
+                line_x, line_y = line_x / line, line_y / line
+                crossing = abs(relative[0] * line_y - relative[1] * line_x)
+                rate += cfg.target_yaw_rate_margin * crossing / max(state.range_m, 1.0)
+        rate *= self._yaw_edge_urgency()
+        self._target_yaw_rate_limit = max(
+            cfg.target_min_yaw_rate_rad_s,
+            min(cfg.target_max_yaw_rate_rad_s, rate),
+        )
+
+    def _update_target_world_state(
+        self, fix: tuple[float, float] | None, height_error_m: float | None,
+        position: Position,
+    ) -> None:
+        """Track the target in world coordinates with an alpha-beta filter.
+
+        The fix is the same calibrated-area projection used elsewhere, so it
+        is noisy and grows worse with the square of range; the filter is what
+        makes a differenced heading usable for a stern chase at all.
+        """
+        cfg = self.config
+        if fix is None or height_error_m is None or not math.isfinite(height_error_m):
+            self._target_state = None
+            return
+        measured = (fix[0], fix[1], position[2] + height_error_m)
+        if not all(math.isfinite(value) for value in measured):
+            self._target_state = None
+            return
+        previous_at = self._target_world_updated_at
+        stale = (
+            previous_at is None
+            or self._target_world_position is None
+            or self._elapsed_time - previous_at > cfg.target_state_timeout_s
+        )
+        if stale:
+            self._target_world_position = measured
+            self._target_world_velocity = (0.0, 0.0, 0.0)
+            self._target_world_updated_at = self._elapsed_time
+            self._target_state = None
+            return
+        assert self._target_world_position is not None and previous_at is not None
+        dt = self._elapsed_time - previous_at
+        if dt <= 1e-6:
+            return
+        predicted = tuple(
+            self._target_world_position[axis] + self._target_world_velocity[axis] * dt
+            for axis in range(3)
+        )
+        residual = tuple(measured[axis] - predicted[axis] for axis in range(3))
+        alpha, beta = cfg.target_state_alpha, cfg.target_state_beta
+        if math.sqrt(sum(value * value for value in residual)) > (
+            cfg.target_state_max_speed_mps * dt
+        ):
+            # The fix jumped further than any real target could have moved:
+            # a re-identified box or a projection glitch, not motion. Re-seed
+            # rather than let it become a heading the stern chase steers by.
+            self._target_world_position = measured
+            self._target_world_velocity = (0.0, 0.0, 0.0)
+            self._target_world_updated_at = self._elapsed_time
+            self._target_state = None
+            return
+        self._target_world_position = (
+            predicted[0] + alpha * residual[0],
+            predicted[1] + alpha * residual[1],
+            predicted[2] + alpha * residual[2],
+        )
+        velocity = (
+            self._target_world_velocity[0] + beta * residual[0] / dt,
+            self._target_world_velocity[1] + beta * residual[1] / dt,
+            self._target_world_velocity[2] + beta * residual[2] / dt,
+        )
+        speed = math.sqrt(sum(value * value for value in velocity))
+        if speed > cfg.target_state_max_speed_mps:
+            # A projection blow-up must not be read as a hypersonic target.
+            trim = cfg.target_state_max_speed_mps / speed
+            velocity = (velocity[0] * trim, velocity[1] * trim, velocity[2] * trim)
+        self._target_world_velocity = velocity
+        self._target_world_updated_at = self._elapsed_time
+        self._target_state = self._build_target_state(position)
+        # Heavily smoothed heading, kept only for the search after loss.
+        blend = 1 - math.exp(-dt / cfg.target_drift_smoothing_s)
+        previous = self._last_target_world_velocity
+        self._last_target_world_velocity = (
+            previous[0] + blend * (velocity[0] - previous[0]),
+            previous[1] + blend * (velocity[1] - previous[1]),
+        )
+
+    def _reset_target_world_state(self) -> None:
+        # _last_target_world_velocity deliberately survives: it is the only
+        # thing the search after a loss has left to go on.
+        self._target_world_position = None
+        self._target_world_velocity = (0.0, 0.0, 0.0)
+        self._target_world_updated_at = None
+        self._target_state = None
+
+    def _build_target_state(self, position: Position) -> TargetState | None:
+        if self._target_world_position is None:
+            return None
+        target = self._target_world_position
+        velocity = self._target_world_velocity
+        line_x = target[0] - position[0]
+        line_y = target[1] - position[1]
+        range_m = math.hypot(line_x, line_y)
+        if range_m <= 1e-6:
+            return None
+        # Positive when the target is itself flying at us, which is the case
+        # braking cannot answer and a lateral dodge has to.
+        closure = -(velocity[0] * line_x + velocity[1] * line_y) / range_m
+        return TargetState(
+            position=target,
+            velocity=velocity,
+            range_m=range_m,
+            speed_mps=math.hypot(velocity[0], velocity[1]),
+            closure_mps=closure,
+        )
+
+    def _standoff_area_ratio(self) -> float:
+        """Image area the standoff distance subtends, via the range calibration.
+
+        ``target_standoff_box_area_ratio`` at ``target_standoff_distance_m`` is
+        the calibration pair the range estimate is built on; the station the
+        aircraft actually holds is a separate choice, so it is converted here
+        rather than by moving the calibration.
+        """
+        reference_distance = self.config.target_standoff_distance_m
+        standoff = self.pursuit.config.standoff_distance_m
+        return self.config.target_standoff_box_area_ratio * (
+            reference_distance / standoff
+        ) ** 2
+
+    def _pass_under_avoidance_side(self) -> float:
+        cue = self._target_last_center[0] - 0.5
+        if abs(cue) <= self.config.target_yaw_deadband_ratio:
+            cue = (
+                self._pursuit_image_motion[0]
+                * self.config.target_yaw_prediction_horizon_s
+            )
+        if abs(cue) <= self.pursuit.config.motion_deadzone:
+            return 1.0
+        return -1.0 if cue > 0.0 else 1.0
 
     def would_intercept(
         self,
@@ -997,6 +1609,8 @@ class FlightLogic:
         camera_pitch: float = 0.0,
     ) -> bool:
         """Return whether a tracker frame can interrupt normal patrol."""
+        if self._pursuit_blocked:
+            return False
         states = {
             FlightState.TAKING_OFF,
             FlightState.TRANSITING_TO_ROI,
@@ -1091,6 +1705,110 @@ class FlightLogic:
             return (position[0], position[1], max(position[2], floor))
         return position
 
+    def _search_for_lost_target(
+        self, position: Position, dt: float, lost_for: float,
+    ) -> None:
+        """Follow where the target was going, rather than stopping and sweeping.
+
+        A target does not vanish at rest: it goes behind a tree, a mast or a
+        roofline while still moving. Holding station and sweeping from a
+        standstill points the camera at where it *was*, which is precisely
+        where it will not reappear. So the bearing is dead-reckoned at the
+        rate the target was last crossing frame, and the aircraft keeps pace
+        with its last known world velocity, both decaying to nothing across
+        the search window so a target that is genuinely gone leaves the
+        aircraft stopped and pointing sensibly rather than flying off.
+        """
+        assert self.home is not None
+        cfg = self.config
+        window = max(1e-6, cfg.target_lost_search_timeout_s)
+        # 1 at the moment of loss, 0 when the search gives up.
+        confidence = max(0.0, 1.0 - lost_for / window)
+
+        if self._target_lost_altitude is None:
+            self._target_lost_altitude = position[2]
+
+        drift_x, drift_y = self._last_target_world_velocity
+        self.pursuit.coast(
+            dt,
+            toward=(drift_x * confidence, drift_y * confidence),
+            climb=self._search_climb_rate(position),
+            position=position,
+            home=self.home,
+        )
+
+        # Image-x rate converted to a bearing rate through the lens, so the
+        # camera keeps tracking the bearing the target would now be on.
+        half_angle = math.tan(self.pursuit.config.horizontal_fov_rad / 2.0)
+        bearing_rate = self._target_velocity[0] * 2.0 * half_angle
+        limit = self.config.target_max_yaw_rate_rad_s
+        bearing_rate = max(-limit, min(limit, bearing_rate))
+
+        # Widen in the direction it went, not an arbitrary one: a tie used to
+        # default to the right regardless of which way the target had gone.
+        predicted_error = (
+            self._target_last_center[0] - 0.5 + self._target_velocity[0] * lost_for
+        )
+        if abs(predicted_error) > 1e-6:
+            direction = math.copysign(1.0, predicted_error)
+        elif abs(bearing_rate) > 1e-9:
+            direction = math.copysign(1.0, bearing_rate)
+        else:
+            direction = 1.0
+        sweep = direction * self.search_sweep_rate()
+        self._target_yaw = normalized_angle(
+            (self._target_yaw or self._target_last_yaw)
+            - (bearing_rate * confidence + sweep) * dt
+        )
+        # The rate limit is otherwise only refreshed while the target is
+        # visible, so the sweep would be throttled by whatever the limit
+        # happened to be on the last frame that saw it.
+        self._target_yaw_rate_limit = max(
+            cfg.target_min_yaw_rate_rad_s,
+            min(
+                cfg.target_max_yaw_rate_rad_s,
+                abs(bearing_rate * confidence) + abs(sweep),
+            ),
+        )
+
+    def search_sweep_rate(self) -> float:
+        """How fast to sweep after a loss, from where the target went.
+
+        A target that disappeared in the middle of frame went behind
+        something and will come back out close to where it was, so a slow
+        sweep keeps it in view. One that disappeared at the edge left
+        sideways and is already somewhere the camera is not pointing -- the
+        sweep has to catch up to it rather than wait for it.
+        """
+        return self.config.target_search_yaw_rate_rad_s * self._yaw_edge_urgency()
+
+    def _search_climb_rate(self, position: Position) -> float:
+        """Vertical rate that lifts the search to its extra height and holds.
+
+        Only ever upward: descending during a search would put the aircraft
+        behind whatever the target went behind, which is the one place it
+        certainly cannot see it from.
+        """
+        if self._target_lost_altitude is None:
+            return 0.0
+        remaining = (
+            self._target_lost_altitude
+            + self.config.target_lost_search_climb_m
+            - position[2]
+        )
+        # Tight, because this is a height to reach rather than a waypoint to
+        # arrive at: the usual vertical tolerance would quietly deliver three
+        # quarters of the metre that was asked for.
+        if remaining <= 0.02:
+            return 0.0
+        # Brake into the target height rather than easing toward it
+        # asymptotically, so the metre is actually gained inside the search
+        # window instead of still converging when the search gives up.
+        return min(
+            self.config.target_max_vertical_speed_mps,
+            math.sqrt(2.0 * self.pursuit.config.acceleration_mps2 * remaining),
+        )
+
     def _pursuit_altitude_is_safe(self, position: Position) -> bool:
         assert self.home is not None
         if self._target_resume_state is FlightState.TAKING_OFF:
@@ -1150,6 +1868,28 @@ class FlightLogic:
         self.target = position
         self._stable_since = self._elapsed_time if self._target_is_centered() else None
 
+    def reference_area_ratio(self, frame_width: int, frame_height: int) -> float:
+        """Frame fraction the expected target fills at the reference distance.
+
+        A directly measured ratio wins when one has been configured; otherwise
+        it is derived from the expected airframe span and the real lens, so
+        the estimate tracks the camera instead of a constant baked in beside
+        a different one.
+        """
+        configured = self.config.target_reference_area_ratio
+        if configured is not None:
+            return configured
+        derived = reference_area_ratio_from_span(
+            span_m=self.config.target_reference_span_m,
+            distance_m=self.config.target_reference_distance_m,
+            horizontal_fov_rad=self.pursuit.config.horizontal_fov_rad,
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+        # Falling back to the standoff setpoint keeps a degenerate frame or
+        # lens from removing range estimation altogether.
+        return derived if derived is not None else self.config.target_standoff_box_area_ratio
+
     def project_detection(self, detection, width, height, position, yaw, camera_pitch):
         if self.home is None:
             return None
@@ -1167,24 +1907,9 @@ class FlightLogic:
         return range_estimated_projection(
             detection["box"], width, height, position, yaw, camera_pitch,
             self.pursuit.config.horizontal_fov_rad,
-            self.config.target_standoff_distance_m,
-            self.config.target_standoff_box_area_ratio,
+            self.config.target_reference_distance_m,
+            self.reference_area_ratio(width, height),
             self.config.target_range_estimate_max_m)
-
-    def approve_target(self, track_id: str, position: Position) -> bool:
-        self.target_decisions.prune(self._elapsed_time)
-        memory = self.target_decisions.memories.get(track_id)
-        if (track_id != self._tracked_target_id or memory is None or memory.missing_at is not None
-                or not self._target_visible or not self.is_target_tracking):
-            return False
-        self._target_confirmed = True
-        # Cancel any pending automatic false-positive rejection for good.
-        self.target_decisions.evaluated = True
-        if self.state is FlightState.TARGET_ACQUISITION:
-            self._start_target_follow(position, self._target_last_yaw)
-        # Already following/pursuing: confirm in place, do not restart
-        # tracking, reset the target, or pause movement.
-        return True
 
     def reject_target(self, track_id: str, position: Position | None = None) -> bool:
         if not self.target_decisions.reject(
@@ -1208,9 +1933,8 @@ class FlightLogic:
         memory = memories.get(track_id) if track_id is not None else None
         return {
             "trackId": track_id,
-            "canApprove": bool(memory and memory.missing_at is None and self._target_visible
-                               and track_id == self._tracked_target_id and not self.target_decisions.evaluated
-                               and self.is_target_tracking),
+            # Pursuit needs no operator authorization: a confirmed track is
+            # followed on its own, and rejecting is the operator's veto.
             "canReject": memory is not None,
             "rejectableTrackIds": list(memories),
             "lastRejectionReason": self.target_decisions.last_rejection_reason,
@@ -1220,8 +1944,10 @@ class FlightLogic:
         """Stop pursuit, return to the interruption point, then restore navigation."""
         self.pursuit.stop()
         self._target_yaw = None
+        self._target_yaw_rate_limit = self.config.target_max_yaw_rate_rad_s
         self._target_camera_pitch = None
         self._target_altitude_estimate = None
+        self._reset_target_world_state()
         if (
             self._pursuit_started and self._patrol_resume_checkpoint is not None
             and self._target_resume_state is not FlightState.TAKING_OFF
@@ -1255,6 +1981,23 @@ class FlightLogic:
         self.target = position
         self._target_return_waypoints.clear()
         self._target_return_ready = False
+
+    def abandon_target_return(self, position: Position) -> bool:
+        """Give up flying back to the checkpoint and resume the mission here.
+
+        The return exists to put the aircraft back where the target
+        interrupted it. When no safe route there can be found, waiting for one
+        is the worst of the options: the aircraft hovers, and hovering cannot
+        change the one thing the route depends on, so it waits forever. The
+        mission is worth more than the exact point it was interrupted at.
+        """
+        if self.state is not FlightState.TARGET_RETURN:
+            return False
+        self._target_return_waypoints.clear()
+        self._target_return_ready = True
+        self._patrol_resume_checkpoint = None
+        self._resume_patrol_after_target(position)
+        return True
 
     def _resume_patrol_after_target(self, position: Position | None = None) -> None:
         resume_state = self._target_resume_state or FlightState.PATROLLING
@@ -1321,10 +2064,12 @@ class FlightLogic:
         self._patrol_resume_checkpoint = None
         self._target_resume_state = None
         self._tracked_target_id = None
+        self._last_target_world_velocity = (0.0, 0.0)
         self._target_hits = 0
         self._target_confidence = None
         self._target_visible = False
         self._target_confirmed = False
+        self._target_lost_altitude = None
         self._target_yaw = None
         self._target_camera_pitch = None
         self._target_altitude_estimate = None
@@ -1541,11 +2286,79 @@ def advance_kinematic_flight(
     )
 
 
+def manual_velocity_command(
+    *,
+    stick: ManualStick,
+    yaw: float,
+    position: Position,
+    home: Position,
+    max_flight_radius_m: float,
+    max_altitude_m: float,
+    dt: float,
+    config: ManualFlightConfig | None = None,
+) -> Position:
+    """Turn operator stick input into a world-frame velocity the aircraft may fly.
+
+    The sticks are read in the aircraft's own frame -- forward is wherever the
+    nose and therefore the camera is pointing, which is the only mapping that
+    makes sense to someone flying from the video feed.
+
+    The geofence is enforced here rather than in the controller so that every
+    caller gets it. Hitting the boundary zeroes only the outward radial
+    component: the operator keeps flying along the fence instead of having the
+    stick die in their hand, which is what makes a boundary feel like a wall
+    rather than a fault.
+    """
+    cfg = config or ManualFlightConfig()
+    # Body axes in a z-up world: the nose is +x at zero yaw, so starboard is -y.
+    # A diagonal is clamped to the same ceiling as a straight line rather than
+    # being allowed to fly 41% faster than either stick alone.
+    forward = stick.forward
+    right = stick.right
+    magnitude = math.hypot(forward, right)
+    if magnitude > 1.0:
+        forward /= magnitude
+        right /= magnitude
+    horizontal = cfg.max_horizontal_speed_mps
+    vx = (forward * math.cos(yaw) + right * math.sin(yaw)) * horizontal
+    vy = (forward * math.sin(yaw) - right * math.cos(yaw)) * horizontal
+    vz = stick.up * cfg.max_vertical_speed_mps
+
+    step = max(0.0, dt)
+    radial_x = position[0] - home[0]
+    radial_y = position[1] - home[1]
+    radius = math.hypot(radial_x, radial_y)
+    if radius > 1e-6:
+        unit_x = radial_x / radius
+        unit_y = radial_y / radius
+        outward = vx * unit_x + vy * unit_y
+        if outward > 0.0 and radius + outward * step >= max_flight_radius_m:
+            vx -= outward * unit_x
+            vy -= outward * unit_y
+
+    altitude = position[2]
+    if vz > 0.0 and altitude + vz * step >= max_altitude_m:
+        vz = max(0.0, (max_altitude_m - altitude) / step) if step > 0.0 else 0.0
+    elif vz < 0.0 and altitude + vz * step <= cfg.min_altitude_m:
+        vz = min(0.0, (cfg.min_altitude_m - altitude) / step) if step > 0.0 else 0.0
+
+    return (vx, vy, vz)
+
+
 def move_angle_toward(current: float, target: float, max_delta: float) -> float:
     delta = normalized_angle(target - current)
     if abs(delta) <= max_delta:
         return target
     return current + math.copysign(max_delta, delta)
+
+
+def _box_area_ratio(box, frame_width: int, frame_height: int) -> float:
+    """Fraction of the frame a detector box covers."""
+    if frame_width <= 0 or frame_height <= 0:
+        return 0.0
+    width = max(0.0, float(box[2]) - float(box[0]))
+    height = max(0.0, float(box[3]) - float(box[1]))
+    return width * height / (frame_width * frame_height)
 
 
 def normalized_angle(angle: float) -> float:

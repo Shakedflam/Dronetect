@@ -1,0 +1,111 @@
+.pad {
+  position: fixed;
+  right: var(--space-md);
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 1100;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding: var(--space-sm);
+  border-radius: var(--radius-md);
+  background: var(--color-panel);
+  border: 1px solid var(--color-accent-green);
+  backdrop-filter: blur(6px);
+  /* A stick held through a drag must not scroll the page out from under it. */
+  touch-action: none;
+  user-select: none;
+}
+
+.heading {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-align: center;
+  color: var(--color-accent-green);
+}
+
+.dpad {
+  display: grid;
+  grid-template-columns: repeat(3, 44px);
+  grid-template-rows: repeat(3, 44px);
+  gap: 4px;
+}
+
+.dpadCenter {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--color-text-muted);
+}
+
+.row {
+  display: flex;
+  gap: 4px;
+}
+
+.stick {
+  flex: 1;
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-panel-border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  touch-action: none;
+  transition: filter 0.15s ease, transform 0.05s ease;
+}
+
+.stick:hover:not(:disabled) {
+  filter: brightness(1.3);
+}
+
+/* Pressed is the one state that matters here: it is the only confirmation the
+   operator gets that the aircraft is being told to move. */
+.stickHeld {
+  background: var(--color-accent-green);
+  border-color: var(--color-accent-green);
+  color: #052b10;
+}
+
+.stick:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
+.rcNotice {
+  max-width: 148px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.4;
+  letter-spacing: 0.04em;
+  color: var(--color-accent-amber);
+  text-align: center;
+}
+
+@media (max-width: 700px) {
+  .dpad {
+    grid-template-columns: repeat(3, 38px);
+    grid-template-rows: repeat(3, 38px);
+  }
+
+  .stick {
+    min-width: 38px;
+    min-height: 38px;
+  }
+}

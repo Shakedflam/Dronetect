@@ -27,6 +27,15 @@ ROLE_SIMULATOR = "simulator"
 ROLE_TABLET = "tablet"
 SUPPORTED_ROLES = frozenset({ROLE_DRONE, ROLE_SIMULATOR, ROLE_TABLET})
 
+# Where the manual sticks are coming from. A real DJI remote controller always
+# outranks the tablet pad, so the aircraft reports which one it is actually
+# flying on and the tablet stops offering a pad it does not own.
+MANUAL_INPUT_TABLET = "tablet"
+MANUAL_INPUT_RC = "rc"
+MANUAL_INPUT_SOURCES = frozenset({MANUAL_INPUT_TABLET, MANUAL_INPUT_RC})
+# Stick axes, each normalized to [-1, 1] in the aircraft's own body frame.
+MANUAL_STICK_AXES = ("forward", "right", "up", "yawRate")
+
 
 @dataclass(frozen=True, slots=True)
 class ProtocolError(Exception):
@@ -147,6 +156,9 @@ def mission_status_message(
     patrol_area_types: list[dict[str, Any]] | None = None,
     operating_config: dict[str, float] | None = None,
     operating_config_pending: bool = False,
+    pursuit_blocked: bool = False,
+    manual_control_active: bool = False,
+    manual_input_source: str = "tablet",
 ) -> dict[str, Any]:
     """Build the authoritative mission snapshot sent to tablet clients."""
     return {
@@ -158,6 +170,9 @@ def mission_status_message(
             "cruiseAltitudeM": default_operating_config.cruise_altitude_m,
         },
         "operatingConfigPending": operating_config_pending,
+        "pursuitBlocked": pursuit_blocked,
+        "manualControlActive": manual_control_active,
+        "manualInputSource": manual_input_source,
         "activeRoi": active_roi,
         "patrol": {
             "priorities": patrol_priorities,
@@ -210,12 +225,33 @@ def validate_mission_status_message(message: dict[str, Any]) -> dict[str, Any]:
             "Mission-status operating configuration must be positive.",
             details={"field": "operatingConfig"},
         )
+    pursuit_blocked = message.get("pursuitBlocked", False)
+    if not isinstance(pursuit_blocked, bool):
+        raise ProtocolError(
+            "validation_error",
+            "pursuitBlocked must be a boolean.",
+            details={"field": "pursuitBlocked"},
+        )
     operating_config_pending = message.get("operatingConfigPending", False)
     if not isinstance(operating_config_pending, bool):
         raise ProtocolError(
             "validation_error",
             "operatingConfigPending must be a boolean.",
             details={"field": "operatingConfigPending"},
+        )
+    manual_control_active = message.get("manualControlActive", False)
+    if not isinstance(manual_control_active, bool):
+        raise ProtocolError(
+            "validation_error",
+            "manualControlActive must be a boolean.",
+            details={"field": "manualControlActive"},
+        )
+    manual_input_source = message.get("manualInputSource", MANUAL_INPUT_TABLET)
+    if manual_input_source not in MANUAL_INPUT_SOURCES:
+        raise ProtocolError(
+            "validation_error",
+            "manualInputSource must be 'tablet' or 'rc'.",
+            details={"field": "manualInputSource"},
         )
 
     active_roi = message.get("activeRoi")
@@ -313,6 +349,9 @@ def validate_mission_status_message(message: dict[str, Any]) -> dict[str, Any]:
             "cruiseAltitudeM": cruise_altitude_m,
         },
         operating_config_pending=operating_config_pending,
+        pursuit_blocked=pursuit_blocked,
+        manual_control_active=manual_control_active,
+        manual_input_source=manual_input_source,
     )
 
 
@@ -368,6 +407,27 @@ def validate_telemetry_message(message: dict[str, Any]) -> dict[str, Any]:
             "operatingConfigPending must be a boolean.",
             details={"field": "operatingConfigPending"},
         )
+    pursuit_blocked = data.get("pursuitBlocked", False)
+    if not isinstance(pursuit_blocked, bool):
+        raise ProtocolError(
+            "validation_error",
+            "pursuitBlocked must be a boolean.",
+            details={"field": "pursuitBlocked"},
+        )
+    manual_control_active = data.get("manualControlActive", False)
+    if not isinstance(manual_control_active, bool):
+        raise ProtocolError(
+            "validation_error",
+            "manualControlActive must be a boolean.",
+            details={"field": "manualControlActive"},
+        )
+    manual_input_source = data.get("manualInputSource", MANUAL_INPUT_TABLET)
+    if manual_input_source not in MANUAL_INPUT_SOURCES:
+        raise ProtocolError(
+            "validation_error",
+            "manualInputSource must be 'tablet' or 'rc'.",
+            details={"field": "manualInputSource"},
+        )
 
     return {
         "type": MESSAGE_TYPE_TELEMETRY,
@@ -392,6 +452,9 @@ def validate_telemetry_message(message: dict[str, Any]) -> dict[str, Any]:
             ),
             "targetFollowDiagnostics": target_follow_diagnostics,
             "operatingConfigPending": operating_config_pending,
+            "pursuitBlocked": pursuit_blocked,
+            "manualControlActive": manual_control_active,
+            "manualInputSource": manual_input_source,
         },
     }
 
@@ -438,15 +501,14 @@ def _validate_target_follow_diagnostics(value: Any) -> dict[str, Any]:
     decision = value.get("targetDecision")
     if decision is not None:
         decision = _required_object(value, "targetDecision")
-        for key in ("canApprove", "canReject"):
-            if not isinstance(decision.get(key), bool):
-                raise ProtocolError("validation_error", f"targetDecision.{key} must be a boolean.")
+        if not isinstance(decision.get("canReject"), bool):
+            raise ProtocolError("validation_error", "targetDecision.canReject must be a boolean.")
         ids = decision.get("rejectableTrackIds")
         if not isinstance(ids, list) or not all(isinstance(item, str) and item for item in ids):
             raise ProtocolError("validation_error", "rejectableTrackIds must be a list of nonempty strings.")
         extra["targetDecision"] = {
             "trackId": _optional_string(decision, "trackId"),
-            "canApprove": decision["canApprove"], "canReject": decision["canReject"],
+            "canReject": decision["canReject"],
             "rejectableTrackIds": ids,
             "lastRejectionReason": _optional_string(decision, "lastRejectionReason"),
         }
@@ -649,7 +711,45 @@ def _validate_command_params(
             "maxFlightRadiusM": max_flight_radius_m,
             "cruiseAltitudeM": cruise_altitude_m,
         }
-    if command in {CommandName.APPROVE_TARGET, CommandName.REJECT_TARGET}:
+    if command == CommandName.SET_PURSUIT_BLOCK:
+        blocked = params.get("blocked")
+        if not isinstance(blocked, bool):
+            raise ProtocolError("invalid_params", "blocked must be a boolean.", command_id=command_id)
+        return {"blocked": blocked}
+    if command == CommandName.SET_MANUAL_CONTROL:
+        engaged = params.get("engaged")
+        if not isinstance(engaged, bool):
+            raise ProtocolError(
+                "invalid_params",
+                "engaged must be a boolean.",
+                command_id=command_id,
+                details={"field": "engaged"},
+            )
+        return {"engaged": engaged}
+    if command == CommandName.SET_MANUAL_COMMAND:
+        stick: dict[str, float] = {}
+        for axis in MANUAL_STICK_AXES:
+            value = params.get(axis, 0.0)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ProtocolError(
+                    "invalid_params",
+                    f"{axis} must be a number.",
+                    command_id=command_id,
+                    details={"field": axis},
+                )
+            value = float(value)
+            # Out of range is rejected rather than clamped: a client sending 50
+            # is a bug, and silently flying its nearest legal value hides it.
+            if not math.isfinite(value) or not -1.0 <= value <= 1.0:
+                raise ProtocolError(
+                    "invalid_params",
+                    f"{axis} must be between -1 and 1.",
+                    command_id=command_id,
+                    details={"field": axis},
+                )
+            stick[axis] = value
+        return stick
+    if command == CommandName.REJECT_TARGET:
         track_id = params.get("trackId")
         if not isinstance(track_id, str) or not track_id.strip():
             raise ProtocolError("invalid_params", "trackId must be a nonempty string.", command_id=command_id)

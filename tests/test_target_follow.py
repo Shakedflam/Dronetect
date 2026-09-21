@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 from controllers.autonomous_drone.flight_logic import (
@@ -143,7 +145,7 @@ def test_takeoff_starts_horizontal_pursuit_before_normal_cruise_height():
     climbing = (0.0, 0.0, 6.0)
     logic.update(climbing, 0.1)
     logic.observe_detections(
-        [detection(state="confirmed", box=(700.0, 450.0, 800.0, 550.0))],
+        [detection(state="confirmed", box=(725.0, 475.0, 775.0, 525.0))],
         frame_width=FRAME_WIDTH,
         frame_height=FRAME_HEIGHT,
         position=climbing,
@@ -175,7 +177,7 @@ def test_takeoff_pursuit_climbs_and_speed_is_limited_near_height_floor():
     logic.initialize_home((0.0, 0.0, 0.0))
     logic.request_patrol((0.0, 0.0, 0.0))
     low = (0.0, 0.0, 3.75)
-    centered_small = (460.0, 460.0, 540.0, 540.0)
+    centered_small = (475.0, 475.0, 525.0, 525.0)
     logic.observe_detections(
         [detection(box=centered_small)],
         frame_width=FRAME_WIDTH,
@@ -194,7 +196,11 @@ def test_takeoff_pursuit_climbs_and_speed_is_limited_near_height_floor():
     logic.update(low, logic.pursuit.config.stable_duration_s)
 
     assert logic.state is FlightState.TARGET_PURSUIT
-    assert 0.0 < logic.pursuit.velocity[0] <= 1.0
+    clearance = low[2] - logic.pursuit.config.minimum_height_m
+    clearance_limit = math.sqrt(
+        2 * logic.pursuit.config.acceleration_mps2 * clearance
+    )
+    assert 0.0 < logic.pursuit.velocity[0] <= clearance_limit
     assert 0.0 < logic.pursuit.velocity[2] <= logic.config.target_takeoff_pursuit_ascent_mps
     assert logic._takeoff_pursuit_altitude() < logic.config.takeoff_altitude
 
@@ -489,7 +495,7 @@ def test_one_fps_detections_have_time_to_confirm_before_resuming():
 
 
 def test_box_growth_does_not_start_translation_before_stable_pursuit():
-    logic = make_patrolling_logic(target_approach_growth_ratio_per_s=0.01)
+    logic = make_patrolling_logic()
     observe(logic, detection(box=(450.0, 450.0, 550.0, 550.0)))
     logic.update(POSITION, 0.1)
     observe(

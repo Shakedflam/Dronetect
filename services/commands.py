@@ -15,8 +15,10 @@ class CommandName(StrEnum):
     RETURN_HOME = "return_home"
     CAMERA_TILT_UP = "camera_tilt_up"
     CAMERA_TILT_DOWN = "camera_tilt_down"
-    APPROVE_TARGET = "approve_target"
     REJECT_TARGET = "reject_target"
+    SET_PURSUIT_BLOCK = "set_pursuit_block"
+    SET_MANUAL_CONTROL = "set_manual_control"
+    SET_MANUAL_COMMAND = "set_manual_command"
 
 
 SUPPORTED_COMMANDS = frozenset(command.value for command in CommandName)

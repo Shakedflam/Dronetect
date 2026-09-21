@@ -1,6 +1,8 @@
 import asyncio
 import json
 
+import pytest
+
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
@@ -839,7 +841,7 @@ def test_aircraft_connection_loss_rth_is_latched_by_backend():
     asyncio.run(scenario())
 
 
-def test_approve_target_command_cannot_override_active_safety_rth():
+def test_reject_target_command_cannot_override_active_safety_rth():
     async def scenario():
         realtime_server = RealtimeServer()
         realtime_server.mission.apply(CommandName.START_PATROL, {})
@@ -857,8 +859,8 @@ def test_approve_target_command_cannot_override_active_safety_rth():
                     encode_message(
                         {
                             "type": "command",
-                            "commandId": "blocked-approve-target",
-                            "command": "approve_target",
+                            "commandId": "blocked-reject-target",
+                            "command": "reject_target",
                             "params": {"trackId": "one"},
                         }
                     )
@@ -1200,3 +1202,252 @@ async def _receive_initial_mission_state(tablet):
     assert message["patrol"]["priorities"] == []
     assert message["batteryRth"]["batteryPercent"] is None
     return message
+
+
+def test_pursuit_hold_is_published_forwarded_and_survives_a_drone_reconnect():
+    """The hold is a real gate, so it must not lapse when the link blinks.
+
+    A controller restarts unblocked. If the server did not re-assert an
+    engaged hold on reconnect, a drone that dropped mid-hold would come back
+    pursuing -- the one failure this control cannot be allowed to have.
+    """
+    async def scenario():
+        realtime_server = RealtimeServer()
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            base_url = f"ws://127.0.0.1:{port}/ws"
+            async with connect(f"{base_url}?role=tablet") as tablet:
+                initial = await _receive_initial_mission_state(tablet)
+                assert initial["pursuitBlocked"] is False
+
+                drone = await connect(f"{base_url}?role=drone")
+                try:
+                    await asyncio.wait_for(
+                        _wait_for(lambda: realtime_server.drone is not None), 1.0
+                    )
+                    await tablet.recv()  # drone-connected status
+
+                    await tablet.send(
+                        encode_message(
+                            {
+                                "type": "command",
+                                "commandId": "hold-on",
+                                "command": "set_pursuit_block",
+                                "params": {"blocked": True},
+                            }
+                        )
+                    )
+                    forwarded = json.loads(await asyncio.wait_for(drone.recv(), 1.0))
+                    assert forwarded["command"] == "set_pursuit_block"
+                    assert forwarded["params"] == {"blocked": True}
+
+                    ack = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                    assert ack["type"] == "command_ack"
+                    status = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                    assert status["pursuitBlocked"] is True
+                    assert realtime_server.pursuit_blocked is True
+                finally:
+                    await drone.close()
+
+                await asyncio.wait_for(
+                    _wait_for(lambda: realtime_server.drone is None), 1.0
+                )
+                await tablet.recv()  # drone-disconnected status
+
+                # A fresh controller starts unblocked and must be told.
+                async with connect(f"{base_url}?role=drone") as replacement:
+                    resync = json.loads(await asyncio.wait_for(replacement.recv(), 1.0))
+                    assert resync["command"] == "set_pursuit_block"
+                    assert resync["params"] == {"blocked": True}
+
+    asyncio.run(scenario())
+
+
+def test_pursuit_hold_is_allowed_during_safety_rth():
+    """A control whose only effect is to make the aircraft do less is never refused."""
+    async def scenario():
+        realtime_server = RealtimeServer()
+        realtime_server.mission.apply(CommandName.START_PATROL, {})
+        realtime_server.mission.observe_safety(
+            SafetyRthSignal(required=True, reason="low_battery")
+        )
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            async with connect(f"ws://127.0.0.1:{port}/ws?role=tablet") as tablet:
+                await _receive_initial_mission_state(tablet)
+                await tablet.send(
+                    encode_message(
+                        {
+                            "type": "command",
+                            "commandId": "hold-during-rth",
+                            "command": "set_pursuit_block",
+                            "params": {"blocked": True},
+                        }
+                    )
+                )
+                ack = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                assert ack["type"] == "command_ack"
+                assert realtime_server.pursuit_blocked is True
+
+    asyncio.run(scenario())
+
+
+def test_manual_takeover_is_forwarded_and_published():
+    """The operator has to see the aircraft confirm the takeover.
+
+    The button reads the latch back from mission status rather than from its
+    own click, so a takeover the aircraft never received must not look engaged.
+    """
+    async def scenario():
+        realtime_server = RealtimeServer()
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            base_url = f"ws://127.0.0.1:{port}/ws"
+            async with connect(f"{base_url}?role=tablet") as tablet:
+                initial = await _receive_initial_mission_state(tablet)
+                assert initial["manualControlActive"] is False
+                assert initial["manualInputSource"] == "tablet"
+
+                async with connect(f"{base_url}?role=drone") as drone:
+                    await asyncio.wait_for(
+                        _wait_for(lambda: realtime_server.drone is not None), 1.0
+                    )
+                    await tablet.recv()  # drone-connected status
+
+                    await tablet.send(
+                        encode_message(
+                            {
+                                "type": "command",
+                                "commandId": "manual-on",
+                                "command": "set_manual_control",
+                                "params": {"engaged": True},
+                            }
+                        )
+                    )
+                    forwarded = json.loads(await asyncio.wait_for(drone.recv(), 1.0))
+                    assert forwarded["command"] == "set_manual_control"
+                    assert forwarded["params"] == {"engaged": True}
+
+                    ack = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                    assert ack["type"] == "command_ack"
+                    status = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                    assert status["manualControlActive"] is True
+
+                    await tablet.send(
+                        encode_message(
+                            {
+                                "type": "command",
+                                "commandId": "stick",
+                                "command": "set_manual_command",
+                                "params": {
+                                    "forward": 1.0,
+                                    "right": 0.0,
+                                    "up": -0.5,
+                                    "yawRate": 0.25,
+                                },
+                            }
+                        )
+                    )
+                    stick = json.loads(await asyncio.wait_for(drone.recv(), 1.0))
+                    assert stick["command"] == "set_manual_command"
+                    assert stick["params"]["forward"] == 1.0
+                    assert stick["params"]["up"] == -0.5
+
+    asyncio.run(scenario())
+
+
+def test_a_stale_stick_is_never_re_asserted_on_a_drone_reconnect():
+    """Sticks are forwarded and forgotten.
+
+    Re-sending the last stick to a freshly connected controller would fly the
+    aircraft on an input nobody is holding any more.
+    """
+    async def scenario():
+        realtime_server = RealtimeServer()
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            base_url = f"ws://127.0.0.1:{port}/ws"
+            async with connect(f"{base_url}?role=tablet") as tablet:
+                await _receive_initial_mission_state(tablet)
+                drone = await connect(f"{base_url}?role=drone")
+                try:
+                    await asyncio.wait_for(
+                        _wait_for(lambda: realtime_server.drone is not None), 1.0
+                    )
+                    await tablet.recv()  # drone-connected status
+                    await tablet.send(
+                        encode_message(
+                            {
+                                "type": "command",
+                                "commandId": "stick",
+                                "command": "set_manual_command",
+                                "params": {
+                                    "forward": 1.0,
+                                    "right": 0.0,
+                                    "up": 0.0,
+                                    "yawRate": 0.0,
+                                },
+                            }
+                        )
+                    )
+                    await asyncio.wait_for(drone.recv(), 1.0)
+                finally:
+                    await drone.close()
+
+                await asyncio.wait_for(
+                    _wait_for(lambda: realtime_server.drone is None), 1.0
+                )
+                await tablet.recv()  # drone-disconnected status
+
+                async with connect(f"{base_url}?role=drone") as replacement:
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(replacement.recv(), 0.3)
+
+    asyncio.run(scenario())
+
+
+def test_manual_takeover_is_refused_during_safety_rth_but_release_is_not():
+    """Home outranks the operator.
+
+    Taking the sticks off an aircraft that is flying itself home on low
+    battery is the one takeover that can strand it; handing it back never is.
+    """
+    async def scenario():
+        realtime_server = RealtimeServer()
+        realtime_server.mission.apply(CommandName.START_PATROL, {})
+        realtime_server.mission.observe_safety(
+            SafetyRthSignal(required=True, reason="low_battery")
+        )
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            async with connect(f"ws://127.0.0.1:{port}/ws?role=tablet") as tablet:
+                await _receive_initial_mission_state(tablet)
+                await tablet.send(
+                    encode_message(
+                        {
+                            "type": "command",
+                            "commandId": "manual-during-rth",
+                            "command": "set_manual_control",
+                            "params": {"engaged": True},
+                        }
+                    )
+                )
+                error = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                assert error["type"] == "error"
+                assert error["code"] == "invalid_mission_transition"
+                assert realtime_server.manual_control is False
+
+                await tablet.send(
+                    encode_message(
+                        {
+                            "type": "command",
+                            "commandId": "manual-off-during-rth",
+                            "command": "set_manual_control",
+                            "params": {"engaged": False},
+                        }
+                    )
+                )
+                ack = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                assert ack["type"] == "command_ack"
+
+    asyncio.run(scenario())

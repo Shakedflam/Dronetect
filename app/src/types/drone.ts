@@ -30,7 +30,6 @@ export interface TelemetryData {
 export interface TargetFollowDiagnostics {
   targetDecision?: {
     trackId: string | null;
-    canApprove: boolean;
     canReject: boolean;
     rejectableTrackIds: string[];
     lastRejectionReason: string | null;
@@ -100,4 +99,4 @@ export interface DetectedTarget {
 }
 
 /** Commands the operator can issue for a specific detected target. */
-export type TargetCommand = 'approve' | 'reject' | 'engage';
+export type TargetCommand = 'reject';

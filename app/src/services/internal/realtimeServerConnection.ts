@@ -1,6 +1,7 @@
 import type { MissionState } from '../../types/missionState';
 import type { TargetFollowDiagnostics } from '../../types/drone';
 import type { OperatingConfig } from '../../types/operatingConfig';
+import type { ManualInputSource } from '../../types/manualControl';
 import type { Unsubscribe } from './unsubscribe';
 
 /**
@@ -56,6 +57,12 @@ export interface MissionStatusMessage {
   droneConnected: boolean;
   operatingConfig: OperatingConfig;
   operatingConfigPending: boolean;
+  /** Operator hold: true suppresses all pursuit. Backend-owned. */
+  pursuitBlocked: boolean;
+  /** Manual takeover: true means the operator, not the computer, is flying. */
+  manualControlActive: boolean;
+  /** Which stick the aircraft is flying. 'rc' means a bound remote controller. */
+  manualInputSource: ManualInputSource;
   activeRoi: { center: { lat: number; lon: number }; radiusM: number } | null;
   patrol: {
     priorities: Array<{ regionId: string; rank: number }>;
@@ -82,8 +89,10 @@ export type RealtimeServerCommandName =
   | 'clear_roi'
   | 'return_home'
   | 'camera_tilt_up'
-  | 'approve_target'
   | 'reject_target'
+  | 'set_pursuit_block'
+  | 'set_manual_control'
+  | 'set_manual_command'
   | 'camera_tilt_down';
 
 export interface RealtimeServerConnection {
@@ -93,6 +102,13 @@ export interface RealtimeServerConnection {
   subscribeMissionStatus(listener: (status: MissionStatusMessage) => void): Unsubscribe;
   subscribeStatus(listener: (status: ConnectionStatus) => void): Unsubscribe;
   sendCommand(command: RealtimeServerCommandName, params?: Record<string, unknown>): Promise<void>;
+  /**
+   * Send without waiting for the ack. The manual sticks go out ~10x a second
+   * for as long as a button is held; tracking each one as a pending command
+   * would only pile up timeouts and rejections across a reconnect, and a stick
+   * that failed to send is already superseded by the next one.
+   */
+  sendUnacknowledged(command: RealtimeServerCommandName, params?: Record<string, unknown>): void;
 }
 
 const RECONNECT_DELAY_MS = 1000;
@@ -168,7 +184,7 @@ function isTargetFollowDiagnostics(value: unknown): value is TargetFollowDiagnos
   return (
     (decision === undefined || (typeof decision === 'object' && decision !== null &&
       (decision.trackId === null || typeof decision.trackId === 'string') &&
-      typeof decision.canApprove === 'boolean' && typeof decision.canReject === 'boolean' &&
+      typeof decision.canReject === 'boolean' &&
       Array.isArray(decision.rejectableTrackIds) && decision.rejectableTrackIds.every((id) => typeof id === 'string') &&
       (decision.lastRejectionReason === null || typeof decision.lastRejectionReason === 'string'))) &&
     (pursuit === undefined || (typeof pursuit === 'object' && pursuit !== null &&
@@ -277,6 +293,9 @@ function isMissionStatusMessage(value: unknown): value is MissionStatusMessage {
     operatingConfig.cruiseAltitudeM <= 0
   ) return false;
   if (typeof message.operatingConfigPending !== 'boolean') return false;
+  if (typeof message.pursuitBlocked !== 'boolean') return false;
+  if (typeof message.manualControlActive !== 'boolean') return false;
+  if (message.manualInputSource !== 'tablet' && message.manualInputSource !== 'rc') return false;
   if (message.activeRoi !== null) {
     if (typeof message.activeRoi !== 'object') return false;
     const roi = message.activeRoi as Record<string, unknown>;
@@ -494,6 +513,10 @@ function createRealtimeServerConnection(): RealtimeServerConnection {
 
         socket.send(JSON.stringify({ type: 'command', commandId, command, params }));
       });
+    },
+    sendUnacknowledged(command, params = {}) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify({ type: 'command', commandId: generateCommandId(), command, params }));
     },
   };
 }

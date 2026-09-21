@@ -119,7 +119,9 @@ class TargetDecisions:
 
     def reset_observation(self) -> None:
         self.started_at: float | None = None
-        self.samples: deque[tuple[float, float, tuple[float, float]]] = deque(maxlen=256)
+        self.samples: deque[
+            tuple[float, float, tuple[float, float], float]
+        ] = deque(maxlen=256)
         self.evaluated = False
         self.sample_timestamp: float | None = None
         self.origin: Position | None = None
@@ -179,7 +181,9 @@ class TargetDecisions:
         if memory is None:
             self.memories[key] = CandidateMemory(key, point, now, timestamp=detection.get('lastSeenTimestamp'))
 
-    def sample(self, detection: Detection, now: float, center: Point2) -> bool:
+    def sample(
+        self, detection: Detection, now: float, center: Point2, area_ratio: float = 0.0,
+    ) -> bool:
         stamp = detection.get('lastSeenTimestamp')
         # No timestamp is supported only by legacy local callers; production
         # protocol requires it. Lost/repeated timestamps are never evidence.
@@ -190,7 +194,9 @@ class TargetDecisions:
             return False
         self.sample_timestamp = stamp
         if not self.evaluated:
-            self.samples.append((now, float(detection['confidence']), center))
+            self.samples.append(
+                (now, float(detection['confidence']), center, float(area_ratio))
+            )
         return True
 
     def should_reject(self) -> bool:
@@ -207,6 +213,16 @@ class TargetDecisions:
             values = [sample[2][axis] for sample in self.samples]
             if max(values) - min(values) > cfg.target_stationary_center_ratio:
                 return False
+        # A fixed false positive -- an antenna, a mark on a building -- holds
+        # its apparent size. Anything whose box is growing or shrinking is
+        # closing or opening range, so it is not static however still it looks
+        # in frame. This matters most for the case it used to get wrong: a
+        # drone flying straight at a hovering aircraft has no lateral image
+        # motion at all, and was discarded on weak confidence alone.
+        areas = [sample[3] for sample in self.samples]
+        smallest, largest = min(areas), max(areas)
+        if smallest > 0.0 and largest / smallest - 1.0 > cfg.target_static_area_tolerance:
+            return False
         scores = [sample[1] for sample in self.samples]
         return (sum(scores) / len(scores) < cfg.target_low_confidence
                 or (max(scores) - min(scores) >= cfg.target_confidence_range

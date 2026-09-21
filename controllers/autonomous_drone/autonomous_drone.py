@@ -16,6 +16,7 @@ from dataclasses import replace
 import json
 import math
 import os
+import traceback
 from pathlib import Path
 import sys
 from typing import cast
@@ -29,14 +30,19 @@ from adapters.simulator.client import SimulatorRealtimeClient
 from adapters.simulator.video import SimulatorVideoClient
 from camera_control import CameraGimbal
 from pursuit import PursuitConfig
+from pursuit import calibrate_reference_area_ratio
 from flight_logic import (
     advance_kinematic_flight,
     FlightConfig,
     FlightLogic,
     FlightState,
     KinematicFlightConfig,
+    ManualFlightConfig,
+    ManualStick,
+    manual_velocity_command,
     Position,
 )
+from manual_input import ManualInputRouter
 from hud import (
     HUD_STYLE,
     TelemetrySnapshot,
@@ -45,7 +51,7 @@ from hud import (
     signed_angle_to_target_degrees,
 )
 from services.commands import CommandName
-from config.shared_config import OperatingConfig, default_operating_config
+from config.shared_config import OperatingConfig, default_operating_config, shared_config
 from realtime_server.protocol import operating_config_result
 from services.gps import (
     DEFAULT_HOME,
@@ -83,8 +89,213 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
     return min(max(value, minimum), maximum)
 
 
+# Marks a safety RTH caused by the flight logic itself raising.
+TICK_FAILURE_REASON = "flight_logic_error"
+
+TARGET_TRACKING_STATES = frozenset({
+    FlightState.TARGET_ACQUISITION,
+    FlightState.TARGET_FOLLOW,
+    FlightState.TARGET_PURSUIT,
+})
+
+
+def build_flight_config() -> FlightConfig:
+    """Assemble the flight configuration from the environment.
+
+    Callable outside ``AutonomousDrone.__init__`` so the defaults and the
+    cross-field constraints between them can be exercised without Webots.
+    They are otherwise only ever built at simulator startup, where a bad
+    combination surfaces as a controller that dies before it connects.
+    """
+    return FlightConfig(
+        takeoff_altitude=float(
+            os.getenv(
+                "DRONTECT_TAKEOFF_ALTITUDE_M",
+                str(default_operating_config.cruise_altitude_m),
+            )
+        ),
+        x_bounds=(-60.0, -30.0),
+        y_bounds=(5.0, 20.0),
+        z_bounds=(13.0, 18.0),
+        horizontal_tolerance=1.2,
+        vertical_tolerance=0.5,
+        landing_rate=1.0,
+        roi_arrival_tolerance=float(
+            os.getenv("DRONTECT_ROI_ARRIVAL_TOLERANCE_M", "10.0")
+        ),
+        target_min_confidence=float(
+            os.getenv("DRONTECT_TARGET_MIN_CONFIDENCE", "0.45")
+        ),
+        target_confirmation_hits=int(
+            os.getenv("DRONTECT_TARGET_CONFIRMATION_HITS", "2")
+        ),
+        target_observation_s=float(os.getenv("DRONTECT_TARGET_OBSERVATION_S", "1.7")),
+        target_observation_min_samples=int(os.getenv("DRONTECT_TARGET_OBSERVATION_MIN_SAMPLES", "3")),
+        target_stationary_center_ratio=float(os.getenv("DRONTECT_TARGET_STATIONARY_CENTER_RATIO", "0.02")),
+        target_stationary_observer_m=float(os.getenv("DRONTECT_TARGET_STATIONARY_OBSERVER_M", "0.25")),
+        target_stationary_angle_rad=math.radians(float(os.getenv("DRONTECT_TARGET_STATIONARY_ANGLE_DEG", "2"))),
+        target_low_confidence=float(os.getenv("DRONTECT_TARGET_LOW_CONFIDENCE", "0.60")),
+        target_confidence_range=float(os.getenv("DRONTECT_TARGET_CONFIDENCE_RANGE", "0.20")),
+        target_ignore_radius_m=float(os.getenv("DRONTECT_TARGET_IGNORE_RADIUS_M", "5")),
+        target_ignore_timeout_s=float(os.getenv("DRONTECT_TARGET_IGNORE_TIMEOUT_S", "12")),
+        target_reject_grace_s=float(os.getenv("DRONTECT_TARGET_REJECT_GRACE_S", "1.5")),
+        target_projection_min_angle_rad=math.radians(float(os.getenv("DRONTECT_TARGET_PROJECTION_MIN_ANGLE_DEG", "5"))),
+        target_projection_max_range_m=float(os.getenv("DRONTECT_TARGET_PROJECTION_MAX_RANGE_M", "250")),
+        target_acquisition_timeout_s=float(
+            os.getenv("DRONTECT_TARGET_ACQUISITION_TIMEOUT_S", "2.5")
+        ),
+        target_yaw_time_constant_s=float(
+            os.getenv("DRONTECT_TARGET_YAW_TIME_CONSTANT_S", "0.45")
+        ),
+        target_yaw_edge_gain=float(
+            os.getenv("DRONTECT_TARGET_YAW_EDGE_GAIN", "2.0")
+        ),
+        target_yaw_range_reference_m=float(
+            os.getenv("DRONTECT_TARGET_YAW_RANGE_REFERENCE_M", "30.0")
+        ),
+        target_yaw_range_min_factor=float(
+            os.getenv("DRONTECT_TARGET_YAW_RANGE_MIN_FACTOR", "0.3")
+        ),
+        target_lost_search_timeout_s=float(
+            os.getenv("DRONTECT_TARGET_LOST_SEARCH_TIMEOUT_S", "3.0")
+        ),
+        target_lost_search_climb_m=float(
+            os.getenv("DRONTECT_TARGET_LOST_SEARCH_CLIMB_M", "1.0")
+        ),
+        target_yaw_gain=float(
+            os.getenv("DRONTECT_TARGET_YAW_GAIN", "0.35")
+        ),
+        target_yaw_prediction_horizon_s=float(
+            os.getenv("DRONTECT_TARGET_YAW_PREDICTION_SECONDS", "0.5")
+        ),
+        target_yaw_deadband_ratio=float(
+            os.getenv("DRONTECT_TARGET_YAW_DEADBAND_RATIO", "0.04")
+        ),
+        target_velocity_smoothing=float(
+            os.getenv("DRONTECT_TARGET_VELOCITY_SMOOTHING", "0.35")
+        ),
+        target_max_yaw_rate_rad_s=math.radians(
+            float(os.getenv("DRONTECT_TARGET_MAX_YAW_RATE_DEG_S", "120.0"))
+        ),
+        target_search_yaw_rate_rad_s=math.radians(
+            float(os.getenv("DRONTECT_TARGET_SEARCH_YAW_RATE_DEG_S", "25.0"))
+        ),
+        target_gimbal_pitch_gain=float(
+            os.getenv("DRONTECT_TARGET_GIMBAL_PITCH_GAIN", "0.25")
+        ),
+        target_center_tolerance_x=float(
+            os.getenv("DRONTECT_TARGET_CENTER_TOLERANCE_X", "0.08")
+        ),
+        target_center_tolerance_y=float(
+            os.getenv("DRONTECT_TARGET_CENTER_TOLERANCE_Y", "0.12")
+        ),
+        target_follow_step_m=float(
+            os.getenv("DRONTECT_TARGET_FOLLOW_STEP_M", "6.0")
+        ),
+        target_standoff_box_area_ratio=float(
+            os.getenv("DRONTECT_TARGET_STANDOFF_BOX_AREA_RATIO", "0.025")
+        ),
+        target_standoff_distance_m=float(
+            os.getenv("DRONTECT_TARGET_STANDOFF_DISTANCE_M", "2.0")
+        ),
+        target_reference_span_m=float(
+            os.getenv("DRONTECT_TARGET_REFERENCE_SPAN_M", "0.45")
+        ),
+        target_reference_distance_m=float(
+            os.getenv("DRONTECT_TARGET_REFERENCE_DISTANCE_M", "2.0")
+        ),
+        # Unset means derive it from the span and the real lens. Set it only
+        # from a measured run -- DRONTECT_TARGET_RANGE_CALIBRATION prints the
+        # value to use.
+        target_reference_area_ratio=_optional_float_env(
+            "DRONTECT_TARGET_REFERENCE_AREA_RATIO"
+        ),
+        target_altitude_target_band_m=float(
+            os.getenv("DRONTECT_TARGET_ALTITUDE_TARGET_BAND_M", "0.3")
+        ),
+        target_altitude_gain_per_s=float(
+            os.getenv("DRONTECT_TARGET_ALTITUDE_GAIN_PER_S", "1.5")
+        ),
+        target_max_vertical_speed_mps=float(
+            os.getenv("DRONTECT_TARGET_MAX_VERTICAL_SPEED_MPS", "2.0")
+        ),
+        target_range_estimate_max_m=float(
+            os.getenv("DRONTECT_TARGET_RANGE_ESTIMATE_MAX_M", "100.0")
+        ),
+        target_collision_avoidance_step_m=float(
+            os.getenv("DRONTECT_TARGET_COLLISION_AVOIDANCE_STEP_M", "3.0")
+        ),
+        target_min_yaw_rate_rad_s=math.radians(
+            float(os.getenv("DRONTECT_TARGET_MIN_YAW_RATE_DEG_S", "20.0"))
+        ),
+        target_takeoff_pursuit_clearance_m=float(
+            os.getenv("DRONTECT_TARGET_TAKEOFF_PURSUIT_CLEARANCE_M", "2.0")
+        ),
+        target_takeoff_pursuit_ascent_mps=float(
+            os.getenv("DRONTECT_TARGET_TAKEOFF_PURSUIT_ASCENT_MPS", "2.0")
+        ),
+    )
+
+
+def _optional_float_env(name: str) -> float | None:
+    """Read a float override, treating unset and empty alike as absent."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    return float(raw)
+
+
+def build_manual_flight_config() -> ManualFlightConfig:
+    """Assemble the manual-flight limits from the environment."""
+    return ManualFlightConfig(
+        max_horizontal_speed_mps=float(
+            os.getenv("DRONTECT_MANUAL_MAX_SPEED_MPS", "6.0")
+        ),
+        max_vertical_speed_mps=float(
+            os.getenv("DRONTECT_MANUAL_MAX_VERTICAL_SPEED_MPS", "2.0")
+        ),
+        max_yaw_rate_rad_s=math.radians(
+            float(os.getenv("DRONTECT_MANUAL_MAX_YAW_RATE_DEG_S", "60.0"))
+        ),
+        min_altitude_m=float(os.getenv("DRONTECT_MANUAL_MIN_ALTITUDE_M", "2.0")),
+        command_timeout_s=float(
+            os.getenv("DRONTECT_MANUAL_COMMAND_TIMEOUT_SECONDS", "1.0")
+        ),
+    )
+
+
+def build_pursuit_config(*, geofence_radius_m: float) -> PursuitConfig:
+    """Assemble the pursuit configuration from the environment."""
+    return PursuitConfig(
+        stable_duration_s=float(os.getenv("DRONTECT_PURSUIT_STABLE_SECONDS", "0.8")),
+        observation_timeout_s=float(os.getenv("DRONTECT_PURSUIT_OBSERVATION_TIMEOUT_SECONDS", "1.5")),
+        # A stern chase needs a real margin over the target, not parity: at
+        # equal top speeds the gap can only ever hold or grow, so the aircraft
+        # never gets onto the six however well the station law is tuned. The
+        # simulated traffic drones cruise at 6.0-6.6 m/s.
+        max_speed_mps=float(os.getenv("DRONTECT_PURSUIT_MAX_SPEED_MPS", "10.0")),
+        acceleration_mps2=float(os.getenv("DRONTECT_PURSUIT_ACCELERATION_MPS2", "5.0")),
+        smoothing_time_s=float(os.getenv("DRONTECT_PURSUIT_SMOOTHING_SECONDS", "0.2")),
+        standoff_distance_m=float(os.getenv("DRONTECT_PURSUIT_STANDOFF_M", "5.0")),
+        station_keeping_gain_per_s=float(
+            os.getenv("DRONTECT_PURSUIT_STATION_KEEPING_GAIN", "1.6")
+        ),
+        altitude_offset_m=float(os.getenv("DRONTECT_PURSUIT_ALTITUDE_OFFSET_M", "3.0")),
+        entry_time_to_contact_s=float(
+            os.getenv("DRONTECT_PURSUIT_DODGE_ENTRY_SECONDS", "1.8")
+        ),
+        exit_time_to_contact_s=float(
+            os.getenv("DRONTECT_PURSUIT_DODGE_EXIT_SECONDS", "3.0")
+        ),
+        geofence_radius_m=geofence_radius_m,
+    )
+
+
 class AutonomousDrone(Supervisor):
     K_VISUAL_PROPELLER_SPEED = 68.5
+    # Past this many failed ticks the logic is not going to recover, so stop
+    # commanding the aircraft rather than flying on whatever state is left.
+    MAX_TICK_FAILURES = 20
     TAKEOFF_CAMERA_PITCH = -0.2
     # Keep a small amount of ground in view during horizontal flight.
     HORIZONTAL_CAMERA_PITCH = 0.16
@@ -101,6 +312,15 @@ class AutonomousDrone(Supervisor):
         max_ascent_speed_mps=5.0,
         max_descent_speed_mps=3.0,
         max_yaw_rate_rad_s=math.radians(150.0),
+    )
+    # Manual flight integrates the operator's stick directly, so the only limit
+    # that still applies from this profile is the yaw slew rate.
+    MANUAL_KINEMATIC_FLIGHT_CONFIG = KinematicFlightConfig(
+        max_horizontal_speed_mps=6.0,
+        horizontal_acceleration_mps2=3.0,
+        max_ascent_speed_mps=2.0,
+        max_descent_speed_mps=2.0,
+        max_yaw_rate_rad_s=math.radians(60.0),
     )
 
     def __init__(self) -> None:
@@ -122,113 +342,15 @@ class AutonomousDrone(Supervisor):
         self._active_roi_id: str | None = None
         self._mission_interruption: MissionInterruptionContext | None = None
         self._mission_return_prepared = False
+        self._mission_return_waiting_since: float | None = None
         self._pending_operating_config: OperatingConfig | None = None
         self.logic = FlightLogic(
-            FlightConfig(
-                takeoff_altitude=float(
-                    os.getenv(
-                        "DRONTECT_TAKEOFF_ALTITUDE_M",
-                        str(default_operating_config.cruise_altitude_m),
-                    )
-                ),
-                x_bounds=(-60.0, -30.0),
-                y_bounds=(5.0, 20.0),
-                z_bounds=(13.0, 18.0),
-                horizontal_tolerance=1.2,
-                vertical_tolerance=0.5,
-                landing_rate=1.0,
-                roi_arrival_tolerance=float(
-                    os.getenv("DRONTECT_ROI_ARRIVAL_TOLERANCE_M", "10.0")
-                ),
-                target_min_confidence=float(
-                    os.getenv("DRONTECT_TARGET_MIN_CONFIDENCE", "0.45")
-                ),
-                target_confirmation_hits=int(
-                    os.getenv("DRONTECT_TARGET_CONFIRMATION_HITS", "2")
-                ),
-                target_observation_s=float(os.getenv("DRONTECT_TARGET_OBSERVATION_S", "1.7")),
-                target_observation_min_samples=int(os.getenv("DRONTECT_TARGET_OBSERVATION_MIN_SAMPLES", "3")),
-                target_stationary_center_ratio=float(os.getenv("DRONTECT_TARGET_STATIONARY_CENTER_RATIO", "0.02")),
-                target_stationary_observer_m=float(os.getenv("DRONTECT_TARGET_STATIONARY_OBSERVER_M", "0.25")),
-                target_stationary_angle_rad=math.radians(float(os.getenv("DRONTECT_TARGET_STATIONARY_ANGLE_DEG", "2"))),
-                target_low_confidence=float(os.getenv("DRONTECT_TARGET_LOW_CONFIDENCE", "0.60")),
-                target_confidence_range=float(os.getenv("DRONTECT_TARGET_CONFIDENCE_RANGE", "0.20")),
-                target_ignore_radius_m=float(os.getenv("DRONTECT_TARGET_IGNORE_RADIUS_M", "5")),
-                target_ignore_timeout_s=float(os.getenv("DRONTECT_TARGET_IGNORE_TIMEOUT_S", "6")),
-                target_reject_grace_s=float(os.getenv("DRONTECT_TARGET_REJECT_GRACE_S", "1.5")),
-                target_projection_min_angle_rad=math.radians(float(os.getenv("DRONTECT_TARGET_PROJECTION_MIN_ANGLE_DEG", "5"))),
-                target_projection_max_range_m=float(os.getenv("DRONTECT_TARGET_PROJECTION_MAX_RANGE_M", "250")),
-                target_acquisition_timeout_s=float(
-                    os.getenv("DRONTECT_TARGET_ACQUISITION_TIMEOUT_S", "2.5")
-                ),
-                target_lost_search_timeout_s=float(
-                    os.getenv("DRONTECT_TARGET_LOST_SEARCH_TIMEOUT_S", "2.0")
-                ),
-                target_yaw_gain=float(
-                    os.getenv("DRONTECT_TARGET_YAW_GAIN", "0.35")
-                ),
-                target_yaw_prediction_horizon_s=float(
-                    os.getenv("DRONTECT_TARGET_YAW_PREDICTION_SECONDS", "0.5")
-                ),
-                target_yaw_deadband_ratio=float(
-                    os.getenv("DRONTECT_TARGET_YAW_DEADBAND_RATIO", "0.04")
-                ),
-                target_velocity_smoothing=float(
-                    os.getenv("DRONTECT_TARGET_VELOCITY_SMOOTHING", "0.35")
-                ),
-                target_max_yaw_rate_rad_s=math.radians(
-                    float(os.getenv("DRONTECT_TARGET_MAX_YAW_RATE_DEG_S", "18.0"))
-                ),
-                target_search_yaw_rate_rad_s=math.radians(
-                    float(os.getenv("DRONTECT_TARGET_SEARCH_YAW_RATE_DEG_S", "10.0"))
-                ),
-                target_gimbal_pitch_gain=float(
-                    os.getenv("DRONTECT_TARGET_GIMBAL_PITCH_GAIN", "0.25")
-                ),
-                target_center_tolerance_x=float(
-                    os.getenv("DRONTECT_TARGET_CENTER_TOLERANCE_X", "0.08")
-                ),
-                target_center_tolerance_y=float(
-                    os.getenv("DRONTECT_TARGET_CENTER_TOLERANCE_Y", "0.12")
-                ),
-                target_follow_step_m=float(
-                    os.getenv("DRONTECT_TARGET_FOLLOW_STEP_M", "6.0")
-                ),
-                target_standoff_box_area_ratio=float(
-                    os.getenv("DRONTECT_TARGET_STANDOFF_BOX_AREA_RATIO", "0.025")
-                ),
-                target_standoff_distance_m=float(
-                    os.getenv("DRONTECT_TARGET_STANDOFF_DISTANCE_M", "2.0")
-                ),
-                target_altitude_target_band_m=float(
-                    os.getenv("DRONTECT_TARGET_ALTITUDE_TARGET_BAND_M", "0.5")
-                ),
-                target_altitude_gain_per_s=float(
-                    os.getenv("DRONTECT_TARGET_ALTITUDE_GAIN_PER_S", "1.0")
-                ),
-                target_max_vertical_speed_mps=float(
-                    os.getenv("DRONTECT_TARGET_MAX_VERTICAL_SPEED_MPS", "2.0")
-                ),
-                target_range_estimate_max_m=float(
-                    os.getenv("DRONTECT_TARGET_RANGE_ESTIMATE_MAX_M", "100.0")
-                ),
-                target_collision_avoidance_step_m=float(
-                    os.getenv("DRONTECT_TARGET_COLLISION_AVOIDANCE_STEP_M", "3.0")
-                ),
-                target_takeoff_pursuit_clearance_m=float(
-                    os.getenv("DRONTECT_TARGET_TAKEOFF_PURSUIT_CLEARANCE_M", "2.0")
-                ),
-                target_takeoff_pursuit_ascent_mps=float(
-                    os.getenv("DRONTECT_TARGET_TAKEOFF_PURSUIT_ASCENT_MPS", "2.0")
-                ),
-            ),
+            build_flight_config(),
             patrol_waypoint_provider=self._next_patrol_waypoint,
-            pursuit_config=PursuitConfig(
-                stable_duration_s=float(os.getenv("DRONTECT_PURSUIT_STABLE_SECONDS", "0.8")),
-                observation_timeout_s=float(os.getenv("DRONTECT_PURSUIT_OBSERVATION_TIMEOUT_SECONDS", "1.5")),
-                max_speed_mps=float(os.getenv("DRONTECT_PURSUIT_MAX_SPEED_MPS", "6.0")),
-                acceleration_mps2=float(os.getenv("DRONTECT_PURSUIT_ACCELERATION_MPS2", "2.6")),
-                geofence_radius_m=max(region.outer_radius_m for region in self.patrol_regions.regions),
+            pursuit_config=build_pursuit_config(
+                geofence_radius_m=max(
+                    region.outer_radius_m for region in self.patrol_regions.regions
+                ),
             ),
         )
         self._target_tracking_flight_config = KinematicFlightConfig(
@@ -308,9 +430,27 @@ class AutonomousDrone(Supervisor):
             raise ValueError(
                 "DRONTECT_CONNECTION_LOSS_RTH_SECONDS must be a finite positive number"
             )
+        self._mission_return_timeout_s = float(
+            os.getenv("DRONTECT_MISSION_RETURN_TIMEOUT_S", "10.0")
+        )
+        self._tick_failures = 0
         self._connection_loss_rth_active = False
         self._safety_rth_active = False
         self._safety_rth_reason: str | None = None
+        # Simulator-only range-calibration aid. Set to the DEF name of the
+        # target node to have each tracked frame print the reference ratio
+        # that its true range implies, so the calibration is measured off a
+        # real run instead of assumed from airframe drawings.
+        self._range_calibration_def = os.getenv(
+            "DRONTECT_TARGET_RANGE_CALIBRATION", ""
+        ).strip()
+        self._last_range_calibration_at = -1.0
+        self.manual_flight_config = build_manual_flight_config()
+        # No physical transmitter in the simulator; a real drone adapter passes
+        # one in and it takes precedence over the tablet pad.
+        self.manual_input = ManualInputRouter(
+            command_timeout_s=self.manual_flight_config.command_timeout_s,
+        )
         self.realtime_client = SimulatorRealtimeClient()
         self.realtime_client.start()
         self.video_client = SimulatorVideoClient()
@@ -323,54 +463,86 @@ class AutonomousDrone(Supervisor):
         dt = self.time_step / 1000.0
 
         while self.step(self.time_step) != -1:
-            self._elapsed_time += dt
-            gps_values = self.gps.getValues()
-            position: Position = (
-                float(gps_values[0]),
-                float(gps_values[1]),
-                float(gps_values[2]),
-            )
-            roll, pitch, yaw = self.imu.getRollPitchYaw()
+            try:
+                self._tick(dt)
+            except Exception:
+                # A controller that raises stops calling step(), and Webots
+                # waits on it: one exception here freezes the whole world,
+                # every other robot included, with the cause buried. Keep
+                # stepping so the traceback is visible and the rest of the
+                # simulation carries on, and send the aircraft home, because
+                # continuing to fly on logic that just failed is worse than
+                # landing.
+                traceback.print_exc()
+                self._tick_failures += 1
+                if self._tick_failures == 1:
+                    self._safety_rth_active = True
+                    self._safety_rth_reason = TICK_FAILURE_REASON
+                    self.logic.abort_manual_control()
+                    try:
+                        self.logic.request_return_home()
+                    except Exception:
+                        traceback.print_exc()
+                if self._tick_failures >= self.MAX_TICK_FAILURES:
+                    print(
+                        "Flight logic has failed "
+                        f"{self._tick_failures} times; holding motors and "
+                        "stepping only, to keep the simulation alive."
+                    )
+                    self._stop_motors()
 
-            if self.logic.home is None:
-                self.logic.initialize_home(position)
-                print(f"Home captured at {self._format_position(position)}")
+    def _tick(self, dt: float) -> None:
+        """One simulation step of sensing, deciding and commanding."""
+        self._elapsed_time += dt
+        gps_values = self.gps.getValues()
+        position: Position = (
+            float(gps_values[0]),
+            float(gps_values[1]),
+            float(gps_values[2]),
+        )
+        roll, pitch, yaw = self.imu.getRollPitchYaw()
 
-            self._enforce_connection_loss_rth()
-            self._handle_keyboard()
-            self._handle_realtime_commands(position)
-            state_before_detection = self.logic.state
-            self._handle_vision_detections(position, yaw)
-            self.logic.update(position, dt, yaw=yaw, camera_pitch=self.camera_gimbal.pitch)
-            self._coordinate_mission_resume(position, state_before_detection)
-            self._consume_pending_operating_config(position)
-            position, yaw, speed_mps, vertical_speed_mps = self._apply_kinematic_flight(
-                position,
-                yaw,
-                dt,
-            )
-            self._update_altitude_smoke(position)
-            self._update_camera_for_flight_state()
-            self._update_markers()
-            self._announce_changes()
-            self._update_hud(
-                position,
-                speed_mps,
-                vertical_speed_mps,
-                roll,
-                pitch,
-                yaw,
-            )
-            self._publish_realtime_telemetry(
-                position,
-                speed_mps,
-                yaw,
-            )
-            self.video_client.publish_camera_frame(self.camera)
-            if self.logic.state in {FlightState.IDLE, FlightState.LANDED}:
-                self._stop_motors()
-            else:
-                self._set_visual_motor_velocities()
+        if self.logic.home is None:
+            self.logic.initialize_home(position)
+            print(f"Home captured at {self._format_position(position)}")
+
+        self._enforce_connection_loss_rth()
+        self._handle_keyboard()
+        self._handle_realtime_commands(position)
+        self._update_manual_stick()
+        state_before_detection = self.logic.state
+        self._handle_vision_detections(position, yaw)
+        self.logic.update(position, dt, yaw=yaw, camera_pitch=self.camera_gimbal.pitch)
+        self._coordinate_mission_resume(position, state_before_detection)
+        self._consume_pending_operating_config(position)
+        position, yaw, speed_mps, vertical_speed_mps = self._apply_kinematic_flight(
+            position,
+            yaw,
+            dt,
+        )
+        self._update_altitude_smoke(position)
+        self._update_camera_for_flight_state()
+        self._update_markers()
+        self._announce_changes()
+        self._update_hud(
+            position,
+            speed_mps,
+            vertical_speed_mps,
+            roll,
+            pitch,
+            yaw,
+        )
+        self._log_range_calibration(position)
+        self._publish_realtime_telemetry(
+            position,
+            speed_mps,
+            yaw,
+        )
+        self.video_client.publish_camera_frame(self.camera)
+        if self.logic.state in {FlightState.IDLE, FlightState.LANDED}:
+            self._stop_motors()
+        else:
+            self._set_visual_motor_velocities()
 
     def _handle_keyboard(self) -> None:
         key = self.keyboard.getKey()
@@ -398,23 +570,37 @@ class AutonomousDrone(Supervisor):
             if command is CommandName.SET_OPERATING_CONFIG:
                 self._handle_operating_config_command(message, position)
                 continue
-            if self._safety_rth_active and command in {
-                CommandName.START_PATROL,
-                CommandName.SET_ROI,
-                CommandName.CLEAR_ROI,
-                CommandName.APPROVE_TARGET,
-                CommandName.REJECT_TARGET,
-            }:
+            if self._safety_rth_active and (
+                command in {
+                    CommandName.START_PATROL,
+                    CommandName.SET_ROI,
+                    CommandName.CLEAR_ROI,
+                    CommandName.REJECT_TARGET,
+                }
+                # Releasing manual is always allowed; taking the aircraft off a
+                # safety RTH is not. The server refuses this too, but a
+                # connection-loss RTH is latched here before it ever knows.
+                or (
+                    command is CommandName.SET_MANUAL_CONTROL
+                    and bool(message["params"]["engaged"])
+                )
+            ):
                 print(
                     f"Realtime command {command.value} ignored during "
                     "safety RTH."
                 )
                 continue
+            tracking_before = self.logic.state
             if command == CommandName.RETURN_HOME:
                 safety_reason = message.get("safetyReason")
                 if isinstance(safety_reason, str):
                     self._safety_rth_active = True
                     self._safety_rth_reason = safety_reason
+                # Home outranks the operator. Abort rather than release: there
+                # is no mission to hand back to, the aircraft is flying home.
+                if self.logic.abort_manual_control():
+                    self.manual_input.reset()
+                    print("Manual control released: returning home.")
                 if self.logic.request_return_home():
                     self._clear_patrol_progress()
                     self._active_roi_id = None
@@ -486,13 +672,38 @@ class AutonomousDrone(Supervisor):
                 pitch = self.camera_gimbal.tilt_up()
                 self.camera_pitch_motor.setPosition(pitch)
                 print(f"Realtime command camera_tilt_up: {pitch:.2f}")
-            elif command == CommandName.APPROVE_TARGET:
-                track_id = message["params"]["trackId"]
-                if not self.logic.approve_target(track_id, position):
+            elif command == CommandName.SET_PURSUIT_BLOCK:
+                blocked = bool(message["params"]["blocked"])
+                if self.logic.set_pursuit_blocked(blocked, position):
                     print(
-                        f"Realtime command approve_target ignored: {track_id} is not "
-                        f"the tracked candidate while {self.logic.state.value}."
+                        "Realtime command set_pursuit_block: pursuit "
+                        + ("held" if blocked else "released")
+                        + "."
                     )
+            elif command == CommandName.SET_MANUAL_CONTROL:
+                if bool(message["params"]["engaged"]):
+                    if self.logic.engage_manual_control(position):
+                        self.manual_input.reset()
+                        self._discard_mission_interruption()
+                        print("Realtime command set_manual_control: operator has control.")
+                    else:
+                        print(
+                            "Realtime command set_manual_control ignored while "
+                            f"{self.logic.state.value}."
+                        )
+                else:
+                    self._release_manual_control(position)
+            elif command == CommandName.SET_MANUAL_COMMAND:
+                params = message["params"]
+                self.manual_input.accept_tablet_stick(
+                    ManualStick(
+                        forward=params["forward"],
+                        right=params["right"],
+                        up=params["up"],
+                        yaw_rate=params["yawRate"],
+                    ),
+                    self._elapsed_time,
+                )
             elif command == CommandName.REJECT_TARGET:
                 track_id = message["params"]["trackId"]
                 if not self.logic.reject_target(track_id, position):
@@ -508,6 +719,65 @@ class AutonomousDrone(Supervisor):
                 pitch = self.camera_gimbal.tilt_down()
                 self.camera_pitch_motor.setPosition(pitch)
                 print(f"Realtime command camera_tilt_down: {pitch:.2f}")
+
+            # Commands are dispatched before this tick's logic.update(). One
+            # that ended target tracking has to bring the interrupted mission
+            # back with it, or update() runs against a flight state whose
+            # backing data -- the ROI sweep, cleared on capture -- has not
+            # been restored yet, and the aircraft silently drops to area
+            # patrol. Loss-driven resumes avoid this by flipping state inside
+            # update(), where the normal resume call still follows.
+            if (
+                tracking_before is not self.logic.state
+                and tracking_before in TARGET_TRACKING_STATES
+            ):
+                self._coordinate_mission_resume(position, tracking_before)
+
+    def _release_manual_control(self, position: Position) -> None:
+        """Give the aircraft back to the computer and restart its mission.
+
+        Where the operator left it is the only position any of this can be
+        planned from, so the ROI sweep and the patrol route are both rebuilt
+        from here rather than resumed from a waypoint the aircraft may now be
+        kilometres away from.
+        """
+        resume = self.logic.release_manual_control()
+        if resume is None:
+            return
+        self.manual_input.reset()
+
+        if resume.state is FlightState.RETURNING_HOME:
+            self.logic.request_return_home()
+            print("Manual control released: resuming return home.")
+            return
+
+        if resume.roi is not None:
+            center, radius_m = resume.roi
+            try:
+                self.logic.request_roi(position, center, radius_m)
+            except ValueError as exc:
+                # The operator flew somewhere the ROI no longer reaches from.
+                print(f"ROI unreachable after manual flight, falling back to patrol: {exc}")
+            else:
+                print("Manual control released: resuming ROI.")
+                return
+
+        self._clear_patrol_progress()
+        self._active_roi_id = None
+        self.logic.request_patrol(position)
+        print("Manual control released: starting a fresh patrol.")
+
+    def _update_manual_stick(self) -> None:
+        """Hand the autopilot whichever stick is live, or a centered one.
+
+        A takeover can end anywhere -- the RTH key, a mission command, a safety
+        return -- so the held stick is dropped here rather than at each of
+        those call sites, and no route out of manual can leave one behind.
+        """
+        if not self.logic.manual_control:
+            self.manual_input.reset()
+            return
+        self.logic.set_manual_stick(self.manual_input.stick(self._elapsed_time))
 
     def _handle_operating_config_command(self, message: dict, position: Position) -> None:
         command_id = message["commandId"]
@@ -622,26 +892,23 @@ class AutonomousDrone(Supervisor):
         if transition.discard_patrol_progress:
             self._clear_patrol_progress()
 
+        if altitude_changed:
+            # Patch every waypoint already computed under the old altitude so
+            # the change reaches flight, not just future computations. This
+            # is deliberately unconditional: stored waypoints outlive the
+            # state that produced them. A pursuit resumes into whatever
+            # mission it interrupted, and a reposition leg is followed by
+            # replaying exactly these -- so gating the retarget on the
+            # current state, or making it the alternative to repositioning,
+            # left the aircraft climbing to the new altitude for the leg and
+            # then descending back to the old one to fly the sweep.
+            self._retarget_stored_altitudes(candidate.cruise_altitude_m)
+
         if transition.resume_state is not None:
             self.logic.start_reposition(
                 list(transition.reposition_waypoints),
                 FlightState(transition.resume_state),
             )
-        elif altitude_changed:
-            # No reposition leg is happening (radius unchanged, or this state
-            # has no coverage mission to resume proportionally) -- patch every
-            # waypoint already computed/stored under the old altitude so the
-            # change actually reaches flight, not just future computations.
-            if self.logic.target is not None:
-                target_x, target_y, _ = self.logic.target
-                self.logic.target = (target_x, target_y, candidate.cruise_altitude_m)
-            if current_state is FlightState.PATROLLING:
-                self._patrol_route_waypoints = deque(
-                    (x, y, candidate.cruise_altitude_m)
-                    for x, y, _ in self._patrol_route_waypoints
-                )
-            if current_state in {FlightState.TRANSITING_TO_ROI, FlightState.ROI_PATROL}:
-                self.logic.roi_patrol_planner.retarget_altitude(candidate.cruise_altitude_m)
 
         if current_state is FlightState.TAKING_OFF and (radius_changed or altitude_changed):
             # A mission is queued behind this climb (request_roi()/
@@ -657,6 +924,57 @@ class AutonomousDrone(Supervisor):
             f"cruise={candidate.cruise_altitude_m:.2f} m"
             + (" (repositioning before resuming)" if transition.resume_state is not None else "")
             + "."
+        )
+
+    def _retarget_stored_altitudes(self, altitude_m: float) -> None:
+        """Rewrite the Z of every stored waypoint, preserving XY and order.
+
+        Covers the active target, the patrol route, the ROI sweep cursor, and
+        the progress stashed for a mission that a pursuit interrupted -- that
+        last one matters because a config change during pursuit is applied
+        while the interrupted mission is still parked.
+        """
+        def moved(waypoint: Position | None) -> Position | None:
+            if waypoint is None:
+                return None
+            return (waypoint[0], waypoint[1], altitude_m)
+
+        def moved_all(waypoints) -> tuple[Position, ...]:
+            return tuple((x, y, altitude_m) for x, y, _ in waypoints)
+
+        target = moved(self.logic.target)
+        if target is not None:
+            self.logic.target = target
+        self._patrol_route_waypoints = deque(moved_all(self._patrol_route_waypoints))
+        self.logic.roi_patrol_planner.retarget_altitude(altitude_m)
+
+        if self._paused_patrol_coverage is not None:
+            self._paused_patrol_coverage = replace(
+                self._paused_patrol_coverage,
+                active_waypoint=moved(self._paused_patrol_coverage.active_waypoint),
+                remaining_waypoints=moved_all(
+                    self._paused_patrol_coverage.remaining_waypoints
+                ),
+            )
+
+        context = self._mission_interruption
+        if context is None:
+            return
+        progress = context.progress
+        if isinstance(progress, PausedPatrolCoverage):
+            progress = replace(
+                progress,
+                active_waypoint=moved(progress.active_waypoint),
+                remaining_waypoints=moved_all(progress.remaining_waypoints),
+            )
+        elif progress is not None and hasattr(progress, "waypoints"):
+            # The ROI planner's own snapshot type, kept opaque here.
+            progress = replace(progress, waypoints=moved_all(progress.waypoints))
+        self._mission_interruption = replace(
+            context,
+            active_waypoint=moved(context.active_waypoint),
+            remaining_path=moved_all(context.remaining_path),
+            progress=progress,
         )
 
     def _consume_pending_operating_config(self, position: Position) -> None:
@@ -736,9 +1054,24 @@ class AutonomousDrone(Supervisor):
                 self.patrol_regions.regions,
             )
         except NoFlyRouteUnavailable as exc:
+            if self._mission_return_waiting_since is None:
+                self._mission_return_waiting_since = self._elapsed_time
+                print(f"Mission resume waiting for a safe NO_FLY egress route: {exc}")
+            waited = self._elapsed_time - self._mission_return_waiting_since
+            if waited >= self._mission_return_timeout_s:
+                # Hovering cannot change what the route depends on, so this
+                # wait never ends on its own. Take the mission back here
+                # rather than holding position until the battery decides.
+                print(
+                    f"No safe route back after {waited:.1f}s; resuming the "
+                    "mission from the current position instead."
+                )
+                self._restore_mission_interruption(context)
+                self._mission_return_waiting_since = None
+                self.logic.abandon_target_return(position)
+                return
             self.logic.hold_target_return(position)
             self._mission_return_prepared = False
-            print(f"Mission resume waiting for a safe NO_FLY egress route: {exc}")
             return
         altitude = self.logic.config.takeoff_altitude
         waypoints: list[Position] = [
@@ -749,6 +1082,7 @@ class AutonomousDrone(Supervisor):
             self._deduplicate_waypoints(waypoints)
         )
         self._mission_return_prepared = True
+        self._mission_return_waiting_since = None
 
     def _capture_mission_interruption(self, position: Position) -> None:
         if self._mission_interruption is not None:
@@ -814,6 +1148,7 @@ class AutonomousDrone(Supervisor):
             )
         self._mission_interruption = context
         self._mission_return_prepared = False
+        self._mission_return_waiting_since = None
 
     def _restore_mission_interruption(
         self,
@@ -838,10 +1173,12 @@ class AutonomousDrone(Supervisor):
                 self.logic.target = context.active_waypoint
         self._mission_interruption = None
         self._mission_return_prepared = False
+        self._mission_return_waiting_since = None
 
     def _discard_mission_interruption(self) -> None:
         self._mission_interruption = None
         self._mission_return_prepared = False
+        self._mission_return_waiting_since = None
 
     def _update_markers(self) -> None:
         self.markers.update(
@@ -1003,7 +1340,9 @@ class AutonomousDrone(Supervisor):
             "reason": reason,
             "simulationTimeS": self.getTime(),
             "convergenceTimeS": (
-                None if self._altitude_smoke_converged_at is None
+                None
+                if self._altitude_smoke_converged_at is None
+                or self._altitude_smoke_started_at is None
                 else self._altitude_smoke_converged_at - self._altitude_smoke_started_at
             ),
             "finalTrueHeightDifferenceM": true_error_m,
@@ -1041,6 +1380,29 @@ class AutonomousDrone(Supervisor):
 
         target = self.logic.target
         assert target is not None
+        manual = self.logic.state is FlightState.MANUAL
+        velocity_command = None
+        desired_yaw = self.logic.target_yaw
+        if manual:
+            stick = self.logic.manual_stick
+            velocity_command = manual_velocity_command(
+                stick=stick,
+                yaw=self._kinematic_yaw,
+                position=position,
+                home=self.logic.home or position,
+                max_flight_radius_m=self.logic.pursuit.config.geofence_radius_m,
+                max_altitude_m=shared_config.legal_max_cruise_altitude_m,
+                dt=dt,
+                config=self.manual_flight_config,
+            )
+            # Yaw is commanded as a rate, so the stick asks for a heading one
+            # tick ahead and the slew limit in the profile does the rest.
+            desired_yaw = (
+                self._kinematic_yaw
+                + stick.yaw_rate * self.manual_flight_config.max_yaw_rate_rad_s * dt
+            )
+        elif self.logic.state is FlightState.TARGET_PURSUIT:
+            velocity_command = self.logic.pursuit.velocity
         step = advance_kinematic_flight(
             position=position,
             target=target,
@@ -1048,9 +1410,8 @@ class AutonomousDrone(Supervisor):
             horizontal_speed_mps=self._horizontal_speed_mps,
             dt=dt,
             config=self._kinematic_config_for_state(),
-            desired_yaw=self.logic.target_yaw,
-            velocity_command=(self.logic.pursuit.velocity
-                              if self.logic.state is FlightState.TARGET_PURSUIT else None),
+            desired_yaw=desired_yaw,
+            velocity_command=velocity_command,
         )
         self.translation.setSFVec3f(list(step.position))
         self.rotation.setSFRotation([0.0, 0.0, 1.0, step.yaw])
@@ -1065,6 +1426,8 @@ class AutonomousDrone(Supervisor):
         )
 
     def _kinematic_config_for_state(self) -> KinematicFlightConfig:
+        if self.logic.state is FlightState.MANUAL:
+            return self.MANUAL_KINEMATIC_FLIGHT_CONFIG
         if self.logic.state is FlightState.TARGET_RETURN:
             return replace(self.SEARCH_KINEMATIC_FLIGHT_CONFIG, yaw_hold_horizontal_distance_m=0.0)
         if self.logic.state in {
@@ -1072,7 +1435,12 @@ class AutonomousDrone(Supervisor):
             FlightState.TARGET_FOLLOW,
             FlightState.TARGET_PURSUIT,
         }:
-            return self._target_tracking_flight_config
+            # Slew fast enough for a close, fast target and no faster: the
+            # limit is recomputed each pursuit tick from its speed and range.
+            return replace(
+                self._target_tracking_flight_config,
+                max_yaw_rate_rad_s=self.logic.target_yaw_rate_limit,
+            )
         if self.logic.state in {
             FlightState.ROI_PATROL,
             FlightState.PATROLLING,
@@ -1142,6 +1510,64 @@ class AutonomousDrone(Supervisor):
             HUD_STYLE.font,
         )
 
+    def _log_range_calibration(self, position: Position) -> None:
+        """Print what the current box says the range calibration should be.
+
+        Reads the target's true position straight out of the world, so one
+        pass at any distance yields the ratio to configure. Throttled to once
+        a second: the point is a number to read, not a flood to grep.
+        """
+        if not self._range_calibration_def or not self.logic.is_target_tracking:
+            return
+        if self._elapsed_time - self._last_range_calibration_at < 1.0:
+            return
+
+        node = self.getFromDef(self._range_calibration_def)
+        if node is None:
+            print(
+                "Range calibration: no node named "
+                f"{self._range_calibration_def}; set DRONTECT_TARGET_RANGE_CALIBRATION "
+                "to a DEF in the world."
+            )
+            self._range_calibration_def = ""
+            return
+
+        diagnostics = self.logic.target_follow_diagnostics() or {}
+        pursuit = diagnostics.get("pursuit") or {}
+        area_ratio = pursuit.get("boundingBoxAreaRatio")
+        if not isinstance(area_ratio, (int, float)) or area_ratio <= 0.0:
+            return
+
+        truth = node.getField("translation").getSFVec3f()
+        true_range_m = distance_3d(position, (truth[0], truth[1], truth[2]))
+        suggested = calibrate_reference_area_ratio(
+            measured_area_ratio=float(area_ratio),
+            measured_range_m=true_range_m,
+            reference_distance_m=self.logic.config.target_reference_distance_m,
+        )
+        if suggested is None:
+            return
+
+        self._last_range_calibration_at = self._elapsed_time
+        reported = pursuit.get("estimatedTargetDistanceM")
+        print(
+            "DRONTECT_TARGET_RANGE_CALIBRATION "
+            + json.dumps(
+                {
+                    "node": self._range_calibration_def,
+                    "boxAreaRatio": round(float(area_ratio), 8),
+                    "trueRangeM": round(true_range_m, 2),
+                    "reportedRangeM": (
+                        round(float(reported), 2)
+                        if isinstance(reported, (int, float)) else None
+                    ),
+                    "referenceDistanceM": self.logic.config.target_reference_distance_m,
+                    "suggestedReferenceAreaRatio": round(suggested, 6),
+                },
+                sort_keys=True,
+            )
+        )
+
     def _publish_realtime_telemetry(
         self,
         position: Position,
@@ -1163,6 +1589,9 @@ class AutonomousDrone(Supervisor):
             aircraft_safety_rth_reason=self._safety_rth_reason,
             target_follow_diagnostics=self.logic.target_follow_diagnostics(),
             operating_config_pending=self._pending_operating_config is not None,
+            pursuit_blocked=self.logic.pursuit_blocked,
+            manual_control_active=self.logic.manual_control,
+            manual_input_source=self.manual_input.source,
         )
         self.realtime_client.publish_telemetry(telemetry)
 
@@ -1190,6 +1619,9 @@ class AutonomousDrone(Supervisor):
             FlightState.TARGET_PURSUIT,
             FlightState.TARGET_RETURN,
             FlightState.RETURNING_HOME,
+            # A link lost mid-takeover must still bring the aircraft home; the
+            # operator's pad is on the far end of the link that just died.
+            FlightState.MANUAL,
             FlightState.LANDING,
         }
         if self.logic.state not in airborne_states:
@@ -1198,6 +1630,8 @@ class AutonomousDrone(Supervisor):
         self._safety_rth_active = True
         self._safety_rth_reason = CONNECTION_LOSS_REASON
         self._clear_patrol_progress()
+        if self.logic.abort_manual_control():
+            self.manual_input.reset()
         if self.logic.state not in {
             FlightState.RETURNING_HOME,
             FlightState.LANDING,

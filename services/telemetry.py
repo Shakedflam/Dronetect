@@ -35,6 +35,9 @@ def build_simulator_telemetry(
     aircraft_safety_rth_reason: str | None = None,
     target_follow_diagnostics: dict[str, Any] | None = None,
     operating_config_pending: bool = False,
+    pursuit_blocked: bool = False,
+    manual_control_active: bool = False,
+    manual_input_source: str = "tablet",
     timestamp: float | None = None,
 ) -> dict:
     """Build the JSON-compatible simulator telemetry message."""
@@ -59,5 +62,8 @@ def build_simulator_telemetry(
             "aircraftSafetyRthReason": aircraft_safety_rth_reason,
             "targetFollowDiagnostics": target_follow_diagnostics,
             "operatingConfigPending": operating_config_pending,
+            "pursuitBlocked": pursuit_blocked,
+            "manualControlActive": manual_control_active,
+            "manualInputSource": manual_input_source,
         },
     }

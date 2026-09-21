@@ -4,6 +4,7 @@ import { ResizableSplitView } from './components/layout/ResizableSplitView';
 import { DroneHUD } from './components/hud/DroneHUD';
 import { MapView } from './components/map/MapView';
 import { DroneVideo } from './components/video/DroneVideo';
+import { ManualControlPad } from './components/manualControl/ManualControlPad';
 import { StartupSplash } from './components/startup/StartupSplash';
 import { useDetection } from './hooks/useDetection';
 import { useMissionStatus } from './hooks/useMissionStatus';
@@ -61,7 +62,6 @@ function App() {
         />
         <ActionBar
           selectedTargetId={selectedTargetId}
-          canApprove={Boolean(decision?.canApprove && decision.trackId === selectedTargetId && targets.some((target) => target.id === selectedTargetId))}
           canReject={Boolean(selectedTargetId && decision?.rejectableTrackIds.includes(selectedTargetId))}
           onClearSelection={() => setSelectedTargetId(null)}
           onTargetIgnoreStart={setIgnoredMapTargetId}
@@ -70,6 +70,10 @@ function App() {
           }}
         />
       </div>
+      <ManualControlPad
+        engaged={missionStatus?.manualControlActive ?? false}
+        inputSource={missionStatus?.manualInputSource ?? 'tablet'}
+      />
       <StartupSplash ready={missionStatus !== null} />
     </>
   );

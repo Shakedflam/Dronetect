@@ -3,6 +3,7 @@ import random
 
 import pytest
 
+from controllers.autonomous_drone.roi_patrol import RoiPatrolConfig
 from controllers.autonomous_drone.flight_logic import (
     advance_kinematic_flight,
     boost_forward_pitch,
@@ -222,6 +223,7 @@ class _SpyRoiPatrolPlanner:
     def __init__(self, first_waypoint):
         self._first_waypoint = first_waypoint
         self.reset_calls = []
+        self.config = RoiPatrolConfig()
 
     def reset(self, center, radius_m, altitude_m, current_position):
         self.reset_calls.append((center, radius_m, altitude_m, current_position))

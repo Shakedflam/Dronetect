@@ -51,21 +51,23 @@
   color: #1a0505;
 }
 
-.follow {
-  background: transparent;
-  border-color: var(--color-accent-green);
-  color: var(--color-accent-green);
-}
-
 .ignore {
   background: transparent;
   border-color: var(--color-text-muted);
   color: var(--color-text-muted);
 }
 
-.engage {
-  background: var(--color-accent-amber);
+/* A hold that is off must not look like an action waiting to be taken, and a
+   hold that is on must be unmistakable: outline when released, filled when
+   engaged, matching the patrol/ROI toggles. */
+.pursuitHold {
+  background: transparent;
   border-color: var(--color-accent-amber);
+  color: var(--color-accent-amber);
+}
+
+.pursuitHeld {
+  background: var(--color-accent-amber);
   color: #241a00;
 }
 
@@ -98,6 +100,25 @@
 }
 
 .roi:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  filter: none;
+}
+
+/* MANUAL takes the aircraft off the computer, so engaged has to be unmistakable
+   across the room: outline when the computer is flying, filled when you are. */
+.manual {
+  background: transparent;
+  border-color: var(--color-accent-green);
+  color: var(--color-accent-green);
+}
+
+.manualActive {
+  background: var(--color-accent-green);
+  color: #052b10;
+}
+
+.button:disabled {
   opacity: 0.4;
   cursor: not-allowed;
   filter: none;

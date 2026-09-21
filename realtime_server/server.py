@@ -16,6 +16,8 @@ from config.video import VideoConfig, load_video_config
 from config.shared_config import OperatingConfig, default_operating_config
 from realtime_server.drone_sdk import DroneSdkConnection, WebSocketDroneSdkAdapter
 from realtime_server.protocol import (
+    MANUAL_INPUT_SOURCES,
+    MANUAL_INPUT_TABLET,
     ROLE_DRONE,
     MESSAGE_TYPE_OPERATING_CONFIG_RESULT,
     ROLE_TABLET,
@@ -119,6 +121,17 @@ class RealtimeServer:
         )
         self._battery_percent: float | None = None
         self._low_battery = False
+        # The operator hold. Held here so a reconnecting drone is told about
+        # it -- a hold that silently lapsed into "pursuing" when the link
+        # blinked would be the worst possible failure for this control.
+        self.pursuit_blocked = False
+        # Manual takeover. Unlike the pursuit hold this is NOT re-asserted on a
+        # drone reconnect: the hold only ever makes the aircraft do less, while
+        # manual makes it do more, and a controller that restarted has no idea
+        # what the sticks were doing. The aircraft is the authority -- this is
+        # refreshed from its telemetry and only mirrored here for the tablet.
+        self.manual_control = False
+        self.manual_input_source = MANUAL_INPUT_TABLET
         self._target_patrol_region_id: str | None = None
 
     async def handler(self, websocket: ServerConnection) -> None:
@@ -192,6 +205,7 @@ class RealtimeServer:
         self._drone_config_ready = self._operating_config_revision == 0
         sync_task: asyncio.Task | None = None
         if self._drone_config_ready:
+            await self._send_pursuit_block_to_drone(drone)
             await self._send_patrol_priorities_to_drone(drone)
             await self._send_patrol_area_types_to_drone(drone)
         else:
@@ -231,6 +245,7 @@ class RealtimeServer:
                 return
             self._drone_config_ready = True
             self._operating_config_pending = bool(result.get("pending", False))
+            await self._send_pursuit_block_to_drone(drone)
             await self._send_patrol_priorities_to_drone(drone)
             await self._send_patrol_area_types_to_drone(drone)
             await self._send_to_tablet(encode_message(self._mission_status()))
@@ -316,6 +331,15 @@ class RealtimeServer:
         )
         self._battery_percent = float(data["batteryPercent"])
         self._target_patrol_region_id = data["targetPatrolRegionId"]
+        reported_block = data.get("pursuitBlocked")
+        if isinstance(reported_block, bool):
+            self.pursuit_blocked = reported_block
+        reported_manual = data.get("manualControlActive")
+        if isinstance(reported_manual, bool):
+            self.manual_control = reported_manual
+        reported_manual_source = data.get("manualInputSource")
+        if reported_manual_source in MANUAL_INPUT_SOURCES:
+            self.manual_input_source = reported_manual_source
         was_pending = self._operating_config_pending
         self._operating_config_pending = bool(data.get("operatingConfigPending", False))
         if (
@@ -348,6 +372,17 @@ class RealtimeServer:
         await self._send_to_tablet(encode_message(self._mission_status()))
         await self._send_to_tablet(encode_message(telemetry))
 
+    async def _forward_to_drone(self, command: dict) -> None:
+        """Pass a validated command through to the aircraft, if one is linked."""
+        drone = self.drone
+        if drone is None:
+            return
+        try:
+            await drone.send_command(command)
+        except ConnectionClosed:
+            if self.drone is drone:
+                self.drone = None
+
     async def _send_safety_rth_to_drone(self) -> None:
         drone = self.drone
         if drone is None:
@@ -358,6 +393,30 @@ class RealtimeServer:
             "command": CommandName.RETURN_HOME.value,
             "params": {},
             "safetyReason": self.mission.safety_rth_reason or "safety_rth",
+        }
+        try:
+            await drone.send_command(command)
+        except ConnectionClosed:
+            if self.drone is drone:
+                self.drone = None
+
+    async def _send_pursuit_block_to_drone(
+        self,
+        drone: DroneSdkConnection,
+    ) -> None:
+        """Re-assert the operator hold on a freshly connected drone.
+
+        A controller starts unblocked, so only an engaged hold needs sending
+        -- but it must be sent, or a controller that restarted mid-hold comes
+        back pursuing because the command predated its connection.
+        """
+        if not self.pursuit_blocked:
+            return
+        command = {
+            "type": "command",
+            "commandId": f"pursuit-block-{uuid.uuid4()}",
+            "command": CommandName.SET_PURSUIT_BLOCK.value,
+            "params": {"blocked": self.pursuit_blocked},
         }
         try:
             await drone.send_command(command)
@@ -464,12 +523,54 @@ class RealtimeServer:
             return
 
         command_name = CommandName(command["command"])
+        if command_name is CommandName.SET_MANUAL_CONTROL:
+            engaged = bool(command["params"]["engaged"])
+            if engaged and self.mission.safety_rth_active:
+                # Taking the sticks away from a safety RTH is the one takeover
+                # that is never allowed. Releasing always is.
+                await tablet.send(
+                    encode_message(
+                        ProtocolError(
+                            "invalid_mission_transition",
+                            f"Command {command_name.value} is invalid while in "
+                            f"{self.mission.state.value}",
+                            command_id=command["commandId"],
+                            details={"state": self.mission.state.value},
+                        ).to_message()
+                    )
+                )
+                return
+            await self._forward_to_drone(command)
+            await tablet.send(encode_message(command_ack(command["commandId"])))
+            # The aircraft confirms the latch in its own telemetry; this only
+            # keeps the tablet from waiting a frame to see the button change.
+            self.manual_control = engaged
+            await tablet.send(encode_message(self._mission_status()))
+            return
+        if command_name is CommandName.SET_MANUAL_COMMAND:
+            # Sticks are forwarded and forgotten. Nothing here may remember
+            # them: a stale stick re-asserted later flies the aircraft.
+            await self._forward_to_drone(command)
+            await tablet.send(encode_message(command_ack(command["commandId"])))
+            return
+        if command_name is CommandName.SET_PURSUIT_BLOCK:
+            self.pursuit_blocked = bool(command["params"]["blocked"])
+            drone = self.drone
+            if drone is not None:
+                try:
+                    await drone.send_command(command)
+                except ConnectionClosed:
+                    if self.drone is drone:
+                        self.drone = None
+            await tablet.send(encode_message(command_ack(command["commandId"])))
+            await tablet.send(encode_message(self._mission_status()))
+            return
         if command_name is CommandName.SET_OPERATING_CONFIG:
             await self._route_operating_config_command(tablet, command)
             return
         if (
             self.mission.safety_rth_active
-            and command_name in {CommandName.APPROVE_TARGET, CommandName.REJECT_TARGET}
+            and command_name is CommandName.REJECT_TARGET
         ):
             await tablet.send(
                 encode_message(
@@ -824,6 +925,9 @@ class RealtimeServer:
                 "cruiseAltitudeM": self.operating_config.cruise_altitude_m,
             },
             operating_config_pending=self._operating_config_pending,
+            pursuit_blocked=self.pursuit_blocked,
+            manual_control_active=self.manual_control,
+            manual_input_source=self.manual_input_source,
         )
 
     async def _send_to_tablet(self, message: str) -> None:
