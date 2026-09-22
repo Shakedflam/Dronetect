@@ -11,7 +11,9 @@ from urllib.parse import parse_qs, urlsplit
 
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
+from websockets.http11 import Request, Response
 
+from config.deployment import DeploymentConfig, build_ssl_context, load_realtime_deployment_config
 from config.video import VideoConfig, load_video_config
 from config.shared_config import OperatingConfig, default_operating_config
 from realtime_server.drone_sdk import DroneSdkConnection, WebSocketDroneSdkAdapter
@@ -58,6 +60,7 @@ from services.patrol_regions import PatrolAreaType, PatrolRegionStore
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 WS_PATH = "/ws"
+HEALTH_PATH = "/healthz"
 
 
 class RealtimeServer:
@@ -941,10 +944,32 @@ class RealtimeServer:
                 self.tablet = None
 
 
-async def run_realtime_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+def _process_health_check(connection: ServerConnection, request: Request) -> Response | None:
+    """Answer a plain HTTP GET to HEALTH_PATH without a WebSocket handshake,
+    for container/load-balancer health probes. Any other request continues
+    through the normal WebSocket upgrade unchanged."""
+    if request.path == HEALTH_PATH:
+        return connection.respond(200, "ok\n")
+    return None
+
+
+async def run_realtime_server(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    deployment: DeploymentConfig | None = None,
+) -> None:
+    deployment = deployment or DeploymentConfig()
     realtime_server = RealtimeServer()
     realtime_server.start_background_tasks()
-    async with serve(realtime_server.handler, host, port, max_size=VIDEO_MAX_PACKET_BYTES):
+    async with serve(
+        realtime_server.handler,
+        host,
+        port,
+        max_size=VIDEO_MAX_PACKET_BYTES,
+        process_request=_process_health_check,
+        origins=deployment.origins,
+        ssl=build_ssl_context(deployment.tls),
+    ):
         print(f"Drontect realtime server listening on ws://{host}:{port}{WS_PATH}")
         await asyncio.Future()
 
@@ -952,7 +977,8 @@ async def run_realtime_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT
 def main() -> None:
     host = os.getenv("DRONTECT_REALTIME_HOST", DEFAULT_HOST)
     port = int(os.getenv("DRONTECT_REALTIME_PORT", str(DEFAULT_PORT)))
-    asyncio.run(run_realtime_server(host, port))
+    deployment = load_realtime_deployment_config()
+    asyncio.run(run_realtime_server(host, port, deployment))
 
 
 if __name__ == "__main__":

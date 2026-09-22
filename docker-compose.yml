@@ -1,0 +1,45 @@
+# Local, cloud-like smoke test for realtime_server + vision_server running
+# as containers on one Docker network. This does NOT replace or interfere
+# with the existing local workflow (`python -m realtime_server.server`,
+# `python -m vision_server.server`, Webots) -- it's for verifying the
+# container/env-var topology before an actual cloud deploy.
+#
+# Usage:
+#   docker compose build
+#   docker compose up
+#
+# Then point the local Webots simulator at the published realtime_server
+# port (DRONTECT_SIMULATOR_WS_URL=ws://127.0.0.1:8765/ws?role=drone, etc.)
+# and the tablet app's VITE_REALTIME_SERVER_WS_URL at ws://127.0.0.1:8765 --
+# see docs/deployment.md.
+#
+# Optional: create a local `.env` file (gitignored) at the repo root to
+# override any ${VAR:-default} below, e.g. DRONTECT_ALLOWED_ORIGINS.
+
+services:
+  vision_server:
+    build:
+      context: .
+      dockerfile: vision_server/Dockerfile
+    volumes:
+      - ./models:/app/models:ro
+    ports:
+      - "8870:8870"
+      - "8871:8871"
+    environment:
+      DRONTECT_ALLOWED_ORIGINS: ${DRONTECT_ALLOWED_ORIGINS:-}
+
+  realtime_server:
+    build:
+      context: .
+      dockerfile: realtime_server/Dockerfile
+    depends_on:
+      - vision_server
+    ports:
+      - "8765:8765"
+    environment:
+      # Compose's built-in DNS resolves the vision_server hostname to that
+      # container -- this is the cross-host override added in config/video.py.
+      DRONTECT_VISION_FRAMES_URL: ws://vision_server:8870/frames
+      DRONTECT_ALLOWED_ORIGINS: ${DRONTECT_ALLOWED_ORIGINS:-}
+      DRONTECT_WEBRTC_STUN_URLS: ${DRONTECT_WEBRTC_STUN_URLS:-}

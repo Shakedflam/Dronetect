@@ -1,0 +1,8 @@
+# Runtime dependencies for realtime_server only (used to build its Docker
+# image). The root requirements.txt remains the source of truth for local
+# development -- `pip install -r requirements.txt` still installs everything
+# needed to run both services and the test suite unchanged.
+aiortc==1.15.0
+Pillow==12.3.0
+Shapely==2.1.2
+websockets==15.0.1

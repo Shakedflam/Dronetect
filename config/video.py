@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -33,18 +34,18 @@ class VideoConfig:
 def load_video_config(path: str | Path | None = None) -> VideoConfig:
     config_path = Path(path) if path is not None else DEFAULT_VIDEO_CONFIG_PATH
     if not config_path.exists():
-        return VideoConfig()
+        return _apply_deployment_env_overrides(VideoConfig())
 
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return VideoConfig()
+        return _apply_deployment_env_overrides(VideoConfig())
 
     if not isinstance(raw, dict):
-        return VideoConfig()
+        return _apply_deployment_env_overrides(VideoConfig())
 
     defaults = VideoConfig()
-    return VideoConfig(
+    return _apply_deployment_env_overrides(VideoConfig(
         source_target_fps=_positive_int(
             raw.get("source_target_fps"),
             defaults.source_target_fps,
@@ -105,7 +106,30 @@ def load_video_config(path: str | Path | None = None) -> VideoConfig:
             raw.get("vision_server_diagnostics_port"),
             defaults.vision_server_diagnostics_port,
         ),
-    )
+    ))
+
+
+def _apply_deployment_env_overrides(config: VideoConfig) -> VideoConfig:
+    """Cross-host overrides for pointing realtime_server at a non-local
+    vision_server (e.g. a separate cloud container). Unset by default, so
+    behavior is unchanged unless these env vars are explicitly set."""
+    updates: dict[str, Any] = {}
+
+    frames_url = os.getenv("DRONTECT_VISION_FRAMES_URL")
+    if frames_url:
+        updates["vision_server_frames_url"] = frames_url
+
+    diagnostics_host = os.getenv("DRONTECT_VISION_DIAGNOSTICS_HOST")
+    if diagnostics_host:
+        updates["vision_server_diagnostics_host"] = diagnostics_host
+
+    diagnostics_port = os.getenv("DRONTECT_VISION_DIAGNOSTICS_PORT")
+    if diagnostics_port:
+        parsed_port = _positive_int(int(diagnostics_port), 0) if diagnostics_port.isdigit() else 0
+        if parsed_port:
+            updates["vision_server_diagnostics_port"] = parsed_port
+
+    return replace(config, **updates) if updates else config
 
 
 def _positive_int(value: Any, fallback: int) -> int:

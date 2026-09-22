@@ -8,6 +8,7 @@ import os
 
 from websockets.asyncio.server import ServerConnection, serve
 
+from config.deployment import DeploymentConfig, load_vision_deployment_config
 from config.video import VideoConfig, load_video_config
 from realtime_server.protocol import build_detection_message, encode_message
 from services.video import VIDEO_MAX_PACKET_BYTES, VideoFrame, VideoPacketError, decode_video_frame
@@ -74,12 +75,16 @@ class VisionServer:
             request_line = await reader.readline()
             parts = request_line.decode("ascii", errors="ignore").split()
             path = parts[1] if len(parts) >= 2 else "/"
-            body = (
-                json.dumps(self.diagnostics.to_dict(), separators=(",", ":"))
-                if path == "/diagnostics"
-                else json.dumps({"error": "not_found"}, separators=(",", ":"))
-            ).encode("utf-8")
-            status = "200 OK" if path == "/diagnostics" else "404 Not Found"
+            if path == "/diagnostics":
+                body_obj: dict = self.diagnostics.to_dict()
+                status = "200 OK"
+            elif path == "/health":
+                body_obj = {"status": "ok"}
+                status = "200 OK"
+            else:
+                body_obj = {"error": "not_found"}
+                status = "404 Not Found"
+            body = json.dumps(body_obj, separators=(",", ":")).encode("utf-8")
             writer.write(
                 b"\r\n".join(
                     [
@@ -135,7 +140,9 @@ class VisionServer:
 async def run_vision_server(
     frame_host: str = DEFAULT_FRAME_HOST,
     frame_port: int = DEFAULT_FRAME_PORT,
+    deployment: DeploymentConfig | None = None,
 ) -> None:
+    deployment = deployment or DeploymentConfig()
     vision_server = VisionServer()
     diagnostics_server = await asyncio.start_server(
         vision_server.diagnostics_handler,
@@ -149,6 +156,7 @@ async def run_vision_server(
             frame_host,
             frame_port,
             max_size=VIDEO_MAX_PACKET_BYTES,
+            origins=deployment.origins,
         ),
     ):
         print(f"Drontect vision server receiving frames on ws://{frame_host}:{frame_port}{FRAMES_PATH}")
@@ -163,7 +171,8 @@ async def run_vision_server(
 def main() -> None:
     frame_host = os.getenv("DRONTECT_VISION_HOST", DEFAULT_FRAME_HOST)
     frame_port = int(os.getenv("DRONTECT_VISION_PORT", str(DEFAULT_FRAME_PORT)))
-    asyncio.run(run_vision_server(frame_host, frame_port))
+    deployment = load_vision_deployment_config()
+    asyncio.run(run_vision_server(frame_host, frame_port, deployment))
 
 
 if __name__ == "__main__":

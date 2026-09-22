@@ -6,13 +6,21 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from io import BytesIO
 from fractions import Fraction
+import os
 from queue import Empty, Full, Queue
 
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from aiortc import (
+    RTCConfiguration,
+    RTCIceServer,
+    RTCPeerConnection,
+    RTCSessionDescription,
+    VideoStreamTrack,
+)
 from av import VideoFrame as AvVideoFrame
 from PIL import Image
 from websockets.exceptions import ConnectionClosed
 
+from config.deployment import DEFAULT_STUN_URLS
 from config.video import VideoConfig
 from realtime_server.protocol import (
     ProtocolError,
@@ -197,7 +205,7 @@ class VideoPipeline:
             self.vision.publish(bundle.vision)
 
     async def handle_webrtc_viewer(self, websocket) -> None:
-        peer = RTCPeerConnection()
+        peer = RTCPeerConnection(configuration=RTCConfiguration(iceServers=_ice_servers()))
         peer.addTrack(self.hub.create_track())
 
         try:
@@ -232,6 +240,12 @@ class VideoPipeline:
             pass
         finally:
             await peer.close()
+
+
+def _ice_servers() -> list[RTCIceServer]:
+    raw = os.getenv("DRONTECT_WEBRTC_STUN_URLS")
+    urls = tuple(url.strip() for url in raw.split(",") if url.strip()) if raw else DEFAULT_STUN_URLS
+    return [RTCIceServer(urls=list(urls))] if urls else []
 
 
 def validate_video_role(role: str | None, *, expected: str) -> str:

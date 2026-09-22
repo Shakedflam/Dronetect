@@ -1,4 +1,5 @@
 import type { Unsubscribe } from './unsubscribe';
+import { realtimeServerUrl } from './runtimeConfig';
 
 /**
  * Owns the single live WebRTC link to the edge realtime server's video
@@ -17,11 +18,22 @@ export type WebrtcConnectionStatus = 'connecting' | 'open' | 'reconnecting' | 'c
 
 const RECONNECT_DELAY_MS = 1000;
 const ICE_GATHERING_TIMEOUT_MS = 2000;
-const DEFAULT_REALTIME_SERVER_ORIGIN = 'ws://127.0.0.1:8765';
+// Matches config/deployment.py's DEFAULT_STUN_URLS. Only matters once the
+// realtime server and this client aren't on the same LAN -- without it, ICE
+// has no way to find a route and the connection silently never completes.
+const DEFAULT_STUN_URLS = 'stun:stun.l.google.com:19302';
 
 function resolveWebrtcSignalingUrl(): string {
-  const origin = import.meta.env.VITE_REALTIME_SERVER_WS_URL || DEFAULT_REALTIME_SERVER_ORIGIN;
-  return `${origin}/video/webrtc?role=viewer`;
+  return realtimeServerUrl('/video/webrtc', 'viewer');
+}
+
+function resolveIceServers(): RTCIceServer[] {
+  const raw = import.meta.env.VITE_WEBRTC_STUN_URLS || DEFAULT_STUN_URLS;
+  const urls = raw
+    .split(',')
+    .map((url) => url.trim())
+    .filter((url) => url.length > 0);
+  return urls.length > 0 ? [{ urls }] : [];
 }
 
 function waitForIceGatheringComplete(peer: RTCPeerConnection): Promise<void> {
@@ -115,7 +127,7 @@ function createWebrtcConnection() {
   }
 
   function connect(): void {
-    peer = new RTCPeerConnection();
+    peer = new RTCPeerConnection({ iceServers: resolveIceServers() });
     peer.addTransceiver('video', { direction: 'recvonly' });
 
     peer.ontrack = (event) => {
