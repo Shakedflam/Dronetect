@@ -26,13 +26,6 @@ export interface DroneCommandService {
   sendManualStick(stick: ManualStick): void;
 }
 
-const MOCK_LATENCY_MS = 200;
-
-function mockCommand(label: string): Promise<void> {
-  console.info(`[droneCommandService:mock] ${label}`);
-  return new Promise((resolve) => setTimeout(resolve, MOCK_LATENCY_MS));
-}
-
 function createDroneCommandService(): DroneCommandService {
   return {
     setOperatingConfig: (config) =>

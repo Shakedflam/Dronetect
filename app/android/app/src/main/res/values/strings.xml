@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Dronetect</string>
+    <string name="title_activity_main">Dronetect</string>
+    <string name="package_name">com.dronetect.app</string>
+    <string name="custom_url_scheme">com.dronetect.app</string>
+</resources>

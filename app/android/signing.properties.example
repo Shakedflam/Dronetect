@@ -1,0 +1,5 @@
+# Copy to signing.properties and keep it out of source control.
+storeFile=C:/secure/path/dronetect-release.jks
+storePassword=replace-me
+keyAlias=dronetect
+keyPassword=replace-me

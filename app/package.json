@@ -6,16 +6,25 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:android": "tsc -b && vite build --mode android",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "android:sync": "npm run build:android && cap sync android",
+    "android:open": "npm run android:sync && cap open android",
+    "android:test": "node scripts/run-android-gradle.mjs testDebugUnitTest",
+    "android:apk": "npm run android:sync && node scripts/run-android-gradle.mjs testDebugUnitTest assembleDebug",
+    "android:apk:release": "npm run android:sync && node scripts/run-android-gradle.mjs testReleaseUnitTest assembleRelease"
   },
   "dependencies": {
+    "@capacitor/android": "7.6.9",
+    "@capacitor/core": "7.6.9",
     "leaflet": "^1.9.4",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-leaflet": "^5.0.0"
   },
   "devDependencies": {
+    "@capacitor/cli": "7.6.9",
     "@types/leaflet": "^1.9.22",
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.18",

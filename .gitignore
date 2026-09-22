@@ -29,8 +29,12 @@ lerna-debug.log*
 .env
 .env.*
 !.env.example
+!.env.*.example
 *.pem
 *.key
+*.jks
+*.keystore
+google-services.json
 
 # Dependency folders
 node_modules/
@@ -62,6 +66,22 @@ coverage/
 
 # Mobile and desktop build output
 android/.gradle/
+app/android/.gradle/
+app/android/.kotlin/
+app/android/.idea/
+app/android/*.iml
+app/android/app/build/
+app/android/build/
+app/android/.externalNativeBuild/
+app/android/.cxx/
+app/android/local.properties
+app/android/signing.properties
+app/android/key.properties
+app/android/capacitor-cordova-android-plugins/
+app/android/app/src/main/assets/public/
+app/android/app/src/main/assets/capacitor.config.json
+app/android/app/src/main/assets/capacitor.plugins.json
+app/android/app/src/main/res/xml/config.xml
 ios/Pods/
 *.apk
 *.ipa

@@ -3,6 +3,7 @@ import type { TargetFollowDiagnostics } from '../../types/drone';
 import type { OperatingConfig } from '../../types/operatingConfig';
 import type { ManualInputSource } from '../../types/manualControl';
 import type { Unsubscribe } from './unsubscribe';
+import { realtimeServerUrl } from './runtimeConfig';
 
 /**
  * Owns the single live WebSocket link to the edge realtime server
@@ -113,11 +114,8 @@ export interface RealtimeServerConnection {
 
 const RECONNECT_DELAY_MS = 1000;
 const COMMAND_TIMEOUT_MS = 5000;
-const DEFAULT_REALTIME_SERVER_ORIGIN = 'ws://127.0.0.1:8765';
-
 function resolveRealtimeServerUrl(): string {
-  const origin = import.meta.env.VITE_REALTIME_SERVER_WS_URL || DEFAULT_REALTIME_SERVER_ORIGIN;
-  return `${origin}/ws?role=tablet`;
+  return realtimeServerUrl('/ws', 'tablet');
 }
 
 /**
