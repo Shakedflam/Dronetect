@@ -14,6 +14,22 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
+# ultralytics pulls in opencv-python, whose compiled extension dynamically
+# links against a handful of X11/GL shared libraries at import time even
+# though nothing here ever opens a window -- python:3.13-slim's Debian base
+# doesn't ship them, so `import cv2` (and therefore `from ultralytics import
+# YOLO`) fails to load without them (e.g. "libxcb.so.1: cannot open shared
+# object file"). --no-install-recommends plus dropping the apt list cache
+# keeps this from meaningfully growing the image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libxcb1 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements-vision.txt ./
 RUN pip install --no-cache-dir -r requirements-vision.txt
 

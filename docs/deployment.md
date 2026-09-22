@@ -90,7 +90,12 @@ Two images, split because `vision_server` pulls in `ultralytics`/`torch`
 - `vision_server/Dockerfile` -- installs `requirements-vision.txt`, CPU-only
   inference (no CUDA base image). Model weights (`models/*.pt`) are **not**
   baked in -- mount them as a volume at `/app/models` so updating a model
-  doesn't require an image rebuild.
+  doesn't require an image rebuild. Also installs a small set of system
+  libraries (`libgl1`, `libglib2.0-0`, `libsm6`, `libxext6`, `libxrender1`,
+  `libxcb1`) that `ultralytics`' `opencv-python` dependency dynamically links
+  against at import time, even headless -- without them `from ultralytics
+  import YOLO` fails inside the container with errors like `libxcb.so.1:
+  cannot open shared object file`, even though `pip install` succeeded.
 
 Both Dockerfiles must be built with the **repository root** as the build
 context (they need `config/` and `services/`, and `vision_server` also needs
