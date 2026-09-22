@@ -32,6 +32,19 @@
   opacity: 0.82;
 }
 
+.djiSection {
+  margin-top: var(--space-xs);
+  padding-top: var(--space-xs);
+  border-top: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+.sectionTitle {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--color-text-muted);
+  padding: 3px 0;
+}
+
 .label {
   font-size: 10px;
   letter-spacing: 0.08em;

@@ -1,4 +1,5 @@
-import type { TelemetryData } from '../types/drone';
+import { Capacitor, registerPlugin, type PluginListenerHandle } from '@capacitor/core';
+import type { DjiTelemetryData, TelemetryData } from '../types/drone';
 import { realtimeServerConnection } from './internal/realtimeServerConnection';
 import type { Unsubscribe } from './internal/unsubscribe';
 
@@ -13,13 +14,22 @@ import type { Unsubscribe } from './internal/unsubscribe';
  */
 export interface TelemetryService {
   subscribe(listener: (telemetry: TelemetryData) => void): Unsubscribe;
+  subscribeDji(listener: (telemetry: DjiTelemetryData) => void): Unsubscribe;
 }
+
+interface DjiTelemetryPlugin {
+  getSnapshot(): Promise<DjiTelemetryData>;
+  addListener(eventName: 'snapshot', listener: (snapshot: DjiTelemetryData) => void): Promise<PluginListenerHandle>;
+}
+
+const djiTelemetryPlugin = registerPlugin<DjiTelemetryPlugin>('DjiTelemetry');
 
 function createRealtimeServerTelemetryService(): TelemetryService {
   return {
     subscribe(listener) {
       return realtimeServerConnection.subscribeTelemetry((message) => {
         listener({
+          source: message.source,
           speedMps: message.data.speedMps,
           altitudeM: message.data.altitudeM,
           batteryPercent: message.data.batteryPercent,
@@ -27,6 +37,32 @@ function createRealtimeServerTelemetryService(): TelemetryService {
           targetFollowDiagnostics: message.data.targetFollowDiagnostics ?? null,
         });
       });
+    },
+    subscribeDji(listener) {
+      if (Capacitor.getPlatform() !== 'android') return () => {};
+
+      let disposed = false;
+      let latestTimestampMs = -1;
+      let receivedEvent = false;
+      const deliver = (snapshot: DjiTelemetryData) => {
+        if (disposed || snapshot.timestampMs < latestTimestampMs) return;
+        latestTimestampMs = snapshot.timestampMs;
+        listener(snapshot);
+      };
+      const handle = djiTelemetryPlugin.addListener('snapshot', (snapshot) => {
+        receivedEvent = true;
+        deliver(snapshot);
+      });
+      void handle.then(() => djiTelemetryPlugin.getSnapshot())
+        .then((snapshot) => {
+          if (!receivedEvent) deliver(snapshot);
+        })
+        .catch((error: unknown) => console.warn('DJI telemetry bridge unavailable', error));
+
+      return () => {
+        disposed = true;
+        void handle.then((registered) => registered.remove());
+      };
     },
   };
 }

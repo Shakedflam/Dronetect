@@ -11,9 +11,10 @@
     "preview": "vite preview",
     "android:sync": "npm run build:android && cap sync android",
     "android:open": "npm run android:sync && cap open android",
-    "android:test": "node scripts/run-android-gradle.mjs testDebugUnitTest",
-    "android:apk": "npm run android:sync && node scripts/run-android-gradle.mjs testDebugUnitTest assembleDebug",
-    "android:apk:release": "npm run android:sync && node scripts/run-android-gradle.mjs testReleaseUnitTest assembleRelease"
+    "android:gradle": "node scripts/run-android-gradle.mjs",
+    "android:test": "npm run android:gradle -- testDebugUnitTest",
+    "android:apk": "npm run android:sync && npm run android:gradle -- testDebugUnitTest assembleDebug",
+    "android:apk:release": "npm run android:sync && npm run android:gradle -- testReleaseUnitTest assembleRelease"
   },
   "dependencies": {
     "@capacitor/android": "7.6.9",

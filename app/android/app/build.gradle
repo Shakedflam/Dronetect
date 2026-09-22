@@ -7,6 +7,16 @@ if (releaseSigningFile.exists()) {
     releaseSigning.load(new FileInputStream(releaseSigningFile))
 }
 
+def localPropertiesFile = rootProject.file('local.properties')
+def localProperties = new Properties()
+if (localPropertiesFile.exists()) {
+    localProperties.load(new FileInputStream(localPropertiesFile))
+}
+def djiApiKey = localProperties.getProperty('DJI_API_KEY')
+if (!djiApiKey?.trim()) {
+    throw new GradleException('DJI_API_KEY must be set in app/android/local.properties')
+}
+
 android {
     namespace "com.dronetect.app"
     compileSdk rootProject.ext.compileSdkVersion
@@ -21,7 +31,10 @@ android {
             // prevents accidentally distributing an incompatible APK.
             abiFilters 'arm64-v8a'
         }
-        manifestPlaceholders = [usesCleartextTraffic: "false"]
+        manifestPlaceholders = [
+            usesCleartextTraffic: "false",
+            DJI_API_KEY: djiApiKey
+        ]
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -71,6 +84,9 @@ dependencies {
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')
+    implementation "com.dji:dji-sdk-v5-aircraft:5.18.0"
+    compileOnly "com.dji:dji-sdk-v5-aircraft-provided:5.18.0"
+    runtimeOnly "com.dji:dji-sdk-v5-networkImp:5.18.0"
 }
 
 apply from: 'capacitor.build.gradle'

@@ -10,6 +10,7 @@ class MainActivity : BridgeActivity() {
     private val vehicleAdapter: VehicleAdapter = DjiVehicleAdapter()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        registerPlugin(DjiTelemetryPlugin::class.java)
         super.onCreate(savedInstanceState)
         vehicleAdapter.start()
     }

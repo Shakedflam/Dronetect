@@ -21,13 +21,24 @@ function javaMajor(javaHome) {
   return match ? Number(match[1]) : null;
 }
 
+function isFullJdk21(javaHome) {
+  const executableSuffix = process.platform === 'win32' ? '.exe' : '';
+  return (
+    javaMajor(javaHome) === 21 &&
+    existsSync(path.join(javaHome, 'bin', `javac${executableSuffix}`)) &&
+    existsSync(path.join(javaHome, 'bin', `jlink${executableSuffix}`))
+  );
+}
+
 function javaCandidates() {
   const candidates = [process.env.DRONTECT_ANDROID_JAVA_HOME, process.env.JAVA_HOME];
   if (process.platform === 'win32') {
     const javaRoot = path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Java');
+    candidates.push(path.join(javaRoot, 'jdk-21'));
     if (existsSync(javaRoot)) {
       const installed = readdirSync(javaRoot, { withFileTypes: true })
         .filter((entry) => entry.isDirectory())
+        .sort((left, right) => left.name.localeCompare(right.name))
         .map((entry) => path.join(javaRoot, entry.name));
       candidates.push(...installed);
     }
@@ -48,10 +59,11 @@ function sdkCandidates() {
   return [...new Set(candidates.filter(Boolean))];
 }
 
-const javaHome = javaCandidates().find((candidate) => javaMajor(candidate) === 21);
+const javaHome = javaCandidates().find(isFullJdk21);
 if (!javaHome) {
   throw new Error(
-    'Android builds require JDK 21. Set DRONTECT_ANDROID_JAVA_HOME to your JDK 21 installation.',
+    'Android builds require a full JDK 21 with javac and jlink. ' +
+      'Set DRONTECT_ANDROID_JAVA_HOME to your JDK 21 installation.',
   );
 }
 
@@ -67,10 +79,24 @@ if (!sdkRoot) {
 console.info(`Android build using JDK ${javaMajor(javaHome)} at ${javaHome}`);
 console.info(`Android build using SDK at ${sdkRoot}`);
 
+function gradleSystemProperty(name, value) {
+  const argument = `-D${name}=${value}`;
+  return process.platform === 'win32' ? `"${argument}"` : argument;
+}
+
 // Keep the Android SDK/JDK environment isolated to this invocation. In
 // particular, do not reuse a daemon first started by a shell whose JAVA_HOME
 // points at an unsupported JDK and whose Android SDK variables may differ.
-const result = spawnSync(gradleCommand, [...requestedTasks, '--no-daemon'], {
+const gradleArguments = [
+  ...requestedTasks,
+  '--no-daemon',
+  gradleSystemProperty('org.gradle.java.home', javaHome),
+  gradleSystemProperty('org.gradle.java.installations.paths', javaHome),
+  '-Dorg.gradle.java.installations.auto-detect=false',
+  '-Dorg.gradle.java.installations.auto-download=false',
+];
+
+const result = spawnSync(gradleCommand, gradleArguments, {
   cwd: androidRoot,
   env: {
     ...process.env,

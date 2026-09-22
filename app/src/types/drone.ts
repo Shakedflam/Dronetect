@@ -14,6 +14,8 @@ export interface DronePosition extends Coordinates {
 
 /** Flight instrument readout, as reported by the TelemetryService. */
 export interface TelemetryData {
+  /** Source reported by the existing realtime server (normally simulator). */
+  source: string;
   speedMps: number;
   altitudeM: number;
   /** Battery charge, 0-100. */
@@ -25,6 +27,22 @@ export interface TelemetryData {
   destinationName?: string;
   /** Mock-only field with no realtime server equivalent; absent on live telemetry. */
   etaSeconds?: number;
+}
+
+/** Read-only physical aircraft snapshot; null means DJI has no current value. */
+export interface DjiTelemetryData {
+  source: 'dji';
+  timestampMs: number;
+  connectionState: 'connected' | 'disconnected';
+  latitude: number | null;
+  longitude: number | null;
+  altitudeM: number | null;
+  headingDeg: number | null;
+  batteryPercent: number | null;
+  gpsSatellites: number | null;
+  gpsSignal: string | null;
+  isFlying: boolean | null;
+  groundState: 'airborne' | 'on_ground' | 'unavailable';
 }
 
 export interface TargetFollowDiagnostics {

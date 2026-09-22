@@ -1,5 +1,7 @@
+import { Capacitor } from '@capacitor/core';
 import { useLocation } from '../../hooks/useLocation';
 import { useTelemetry } from '../../hooks/useTelemetry';
+import { useDjiTelemetry } from '../../hooks/useDjiTelemetry';
 import { useMissionState } from '../../hooks/useMissionState';
 import styles from './DroneHUD.module.css';
 
@@ -60,6 +62,7 @@ function HudRow({ label, value }: HudRowProps) {
 export function DroneHUD() {
   const position = useLocation();
   const telemetry = useTelemetry();
+  const djiTelemetry = useDjiTelemetry();
   const missionState = useMissionState();
 
   const isReady = position !== null && telemetry !== null;
@@ -69,6 +72,7 @@ export function DroneHUD() {
     <div className={styles.panel}>
       {isReady ? (
         <>
+          <HudRow label="SOURCE" value={telemetry.source.toUpperCase()} />
           <HudRow label="SPEED" value={formatSpeed(telemetry.speedMps)} />
           <HudRow label="ALTITUDE" value={formatAltitude(telemetry.altitudeM)} />
           <HudRow label="BATTERY" value={formatBattery(telemetry.batteryPercent)} />
@@ -143,6 +147,21 @@ export function DroneHUD() {
         </>
       ) : (
         <div className={styles.connecting}>CONNECTING…</div>
+      )}
+      {Capacitor.getPlatform() === 'android' && (
+        <div className={styles.djiSection}>
+          <div className={styles.sectionTitle}>DJI · READ ONLY</div>
+          <HudRow label="CONNECTION" value={djiTelemetry?.connectionState ?? 'waiting'} />
+          {djiTelemetry?.connectionState === 'connected' && <>
+            <HudRow label="ALTITUDE" value={djiTelemetry.altitudeM === null ? 'unavailable' : formatAltitude(djiTelemetry.altitudeM)} />
+            <HudRow label="HEADING" value={djiTelemetry.headingDeg === null ? 'unavailable' : `${djiTelemetry.headingDeg.toFixed(1)}°`} />
+            <HudRow label="BATTERY" value={djiTelemetry.batteryPercent === null ? 'unavailable' : formatBattery(djiTelemetry.batteryPercent)} />
+            <HudRow label="GPS" value={djiTelemetry.gpsSatellites === null ? 'unavailable' : `${djiTelemetry.gpsSatellites} sats · ${djiTelemetry.gpsSignal ?? 'unknown'}`} />
+            <HudRow label="GROUND" value={formatState(djiTelemetry.groundState)} />
+            <HudRow label="LATITUDE" value={djiTelemetry.latitude === null ? 'unavailable' : formatCoordinate(djiTelemetry.latitude)} />
+            <HudRow label="LONGITUDE" value={djiTelemetry.longitude === null ? 'unavailable' : formatCoordinate(djiTelemetry.longitude)} />
+          </>}
+        </div>
       )}
     </div>
   );

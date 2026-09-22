@@ -2,15 +2,12 @@ package com.dronetect.app.vehicle
 
 import android.util.Log
 
-/**
- * Deliberately inert until the RC-N3/tablet/firmware matrix and DJI MSDK APIs
- * are verified on project hardware. It cannot connect or execute commands.
- */
+/** Command-rejecting boundary retained while MSDK runs in read-only mode. */
 class DjiVehicleAdapter : VehicleAdapter {
     override val availability = VehicleAvailability.UNAVAILABLE
 
     override fun start() {
-        Log.i(TAG, "DJI vehicle adapter is disabled; no MSDK dependency is installed")
+        Log.i(TAG, "DJI vehicle adapter is read-only; aircraft commands are disabled")
     }
 
     override fun stop() = Unit
