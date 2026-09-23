@@ -110,6 +110,146 @@ def test_phase1_uses_measured_dji_state_and_never_sends_aircraft_commands(monkey
     assert not bridge.realtime_link.drain_commands()
 
 
+# -- phase1_telemetry_only: read-only targetFollowDiagnostics display -------
+# See DjiFlightBridge._update_phase1_detection_diagnostics/_build_phase1_
+# target_follow_diagnostics. These tests use _confident_detection_message
+# (defined further below, alongside the legacy-path mission-interruption
+# tests that also use it).
+
+
+def test_phase1_no_detections_drained_keeps_target_follow_diagnostics_none(monkeypatch):
+    """No regression: with nothing drained this tick, the telemetry field
+    stays exactly None, as it always has."""
+    monkeypatch.setenv("DRONTECT_DJI_PHASE1_TELEMETRY_ONLY", "1")
+    now = [100.0]
+    bridge = _make_bridge(now)
+    _feed_telemetry(bridge, now, is_flying=False)
+
+    outcome = asyncio.run(bridge.run_tick_once())
+    message = bridge.build_telemetry_message(outcome)
+
+    assert message["data"]["targetFollowDiagnostics"] is None
+    assert validate_telemetry_message(message)["data"]["targetFollowDiagnostics"] is None
+
+
+def test_phase1_confirmed_detection_populates_valid_target_follow_diagnostics(monkeypatch):
+    """A confirmed detection drained this tick produces a wire-valid
+    targetFollowDiagnostics object, with the right trackerId, and with
+    pursuit/targetDecision omitted (both optional in the schema) rather
+    than fabricated."""
+    monkeypatch.setenv("DRONTECT_DJI_PHASE1_TELEMETRY_ONLY", "1")
+    now = [100.0]
+    bridge = _make_bridge(now)
+    _feed_telemetry(bridge, now, is_flying=False)
+    bridge.realtime_link._detections.put(_confident_detection_message())
+
+    outcome = asyncio.run(bridge.run_tick_once())
+    message = bridge.build_telemetry_message(outcome)
+    validated = validate_telemetry_message(message)
+
+    assert message["data"]["state"] == "LANDED"
+    diagnostics = validated["data"]["targetFollowDiagnostics"]
+    assert diagnostics is not None
+    assert diagnostics["trackerId"] == "one"
+    assert diagnostics["detectionConfidence"] == 0.9
+    assert diagnostics["flightState"] == "LANDED"
+    assert "pursuit" not in diagnostics
+    assert "targetDecision" not in diagnostics
+    assert diagnostics["patrolInterrupted"] is False
+    assert diagnostics["patrolResumeState"] is None
+    assert diagnostics["patrolResumeStatus"] == "inactive"
+    assert diagnostics["altitudeMatchingActive"] is False
+    assert diagnostics["confirmation"] == {"hits": 1, "requiredHits": 1, "progress": 1.0}
+    assert math.isclose(diagnostics["boundingBoxAreaRatio"], 0.05, rel_tol=1e-6)
+    assert math.isclose(diagnostics["boundingBoxScale"], math.sqrt(0.05), rel_tol=1e-6)
+    assert diagnostics["imageCenterError"] == {"x": 0.0, "y": 0.0}  # box is frame-centered
+    assert diagnostics["estimatedImageVelocity"] == {
+        "x": 0.0, "y": 0.0, "magnitude": 0.0, "directionDeg": None,
+    }
+
+
+def test_phase1_detection_diagnostics_expire_after_ttl(monkeypatch):
+    """Freshness rule: once nothing is drained, the last detection keeps
+    being reported briefly (surviving the tick/publish-throttle gap), then
+    falls back to None once config.target_follow_diagnostics_ttl_s elapses."""
+    monkeypatch.setenv("DRONTECT_DJI_PHASE1_TELEMETRY_ONLY", "1")
+    now = [100.0]
+    bridge = _make_bridge(now)
+    bridge.config = BridgeConfig(
+        android_telemetry_timeout_s=bridge.config.android_telemetry_timeout_s,
+        android_connection_loss_rth_s=bridge.config.android_connection_loss_rth_s,
+        realtime_connection_loss_rth_s=bridge.config.realtime_connection_loss_rth_s,
+        target_follow_diagnostics_ttl_s=0.2,
+    )
+    _feed_telemetry(bridge, now, is_flying=False)
+    bridge.realtime_link._detections.put(_confident_detection_message())
+    outcome = asyncio.run(bridge.run_tick_once())
+    assert bridge.build_telemetry_message(outcome)["data"]["targetFollowDiagnostics"] is not None
+
+    now[0] += 0.1  # still within the TTL, nothing new drained
+    _feed_telemetry(bridge, now, is_flying=False)
+    outcome = asyncio.run(bridge.run_tick_once())
+    assert bridge.build_telemetry_message(outcome)["data"]["targetFollowDiagnostics"] is not None
+
+    now[0] += 0.3  # now past the TTL
+    _feed_telemetry(bridge, now, is_flying=False)
+    outcome = asyncio.run(bridge.run_tick_once())
+    assert bridge.build_telemetry_message(outcome)["data"]["targetFollowDiagnostics"] is None
+
+
+def test_phase1_detection_diagnostics_do_not_affect_flight_control(monkeypatch):
+    """The critical read-only claim: feeding a confirmed detection through
+    phase1's tick()/run_tick_once() must leave FlightLogic.state/target,
+    patrol bookkeeping, and everything sent to android_link byte-for-byte
+    identical to a scenario where no detection was ever fed -- proving the
+    new targetFollowDiagnostics bookkeeping is a pure display computation
+    with zero coupling to flight control."""
+    monkeypatch.setenv("DRONTECT_DJI_PHASE1_TELEMETRY_ONLY", "1")
+    monkeypatch.setenv("DRONTECT_DJI_PHASE2_ACTIONS", "1")
+
+    async def _fail_if_called(*args, **kwargs):
+        raise AssertionError("send_setpoint must never be called in phase1_telemetry_only mode")
+
+    monkeypatch.setattr(AndroidLink, "send_setpoint", _fail_if_called)
+
+    class RecordingConnection:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, raw):
+            self.messages.append(json.loads(raw))
+
+    def run_scenario(feed_detection: bool):
+        now = [100.0]
+        bridge = _make_bridge(now)
+        bridge.realtime_link._mark_connected()
+        connection = RecordingConnection()
+        for _ in range(5):
+            if feed_detection:
+                bridge.realtime_link._detections.put(_confident_detection_message())
+            now[0] += 0.05
+            _feed_telemetry(bridge, now, is_flying=False)
+            bridge.android_link._connection = connection
+            asyncio.run(bridge.run_tick_once())
+        return bridge, connection
+
+    baseline_bridge, baseline_connection = run_scenario(feed_detection=False)
+    detected_bridge, detected_connection = run_scenario(feed_detection=True)
+
+    # The detection was in fact seen and recorded for display -- otherwise
+    # the comparison below would be vacuous.
+    assert detected_bridge._phase1_detection_snapshot is not None
+    assert baseline_bridge._phase1_detection_snapshot is None
+
+    assert detected_bridge.logic.state is baseline_bridge.logic.state
+    assert detected_bridge.logic.target == baseline_bridge.logic.target
+    assert detected_bridge._target_patrol_region_id == baseline_bridge._target_patrol_region_id
+    assert detected_bridge._paused_patrol_coverage == baseline_bridge._paused_patrol_coverage
+    assert detected_bridge._active_roi_id == baseline_bridge._active_roi_id
+    assert detected_bridge._mission_interruption == baseline_bridge._mission_interruption
+    assert detected_connection.messages == baseline_connection.messages == []
+
+
 def test_phase2_sends_only_one_gimbal_or_rth_action_and_never_setpoints(monkeypatch):
     monkeypatch.setenv("DRONTECT_DJI_PHASE1_TELEMETRY_ONLY", "1")
     monkeypatch.setenv("DRONTECT_DJI_PHASE2_ACTIONS", "1")
