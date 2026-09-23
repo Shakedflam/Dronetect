@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#FFFFFF</color>
+    <!-- Sampled from the Dronetect badge interior (logos/main_icon.png) so
+         the adaptive icon's masked area matches the logo instead of framing
+         it in white. -->
+    <color name="ic_launcher_background">#001220</color>
 </resources>

@@ -30,6 +30,7 @@ object DjiSdkRuntime {
         "disconnected", DjiTelemetrySnapshot(), System.currentTimeMillis(),
     )
     private val telemetryMonitor = DjiTelemetryMonitor { publishTelemetry(it) }
+    private val videoIngest = DjiVideoIngestService()
 
     fun telemetrySnapshot(): DjiTelemetrySnapshot = telemetryMonitor.snapshot()
 
@@ -80,6 +81,7 @@ object DjiSdkRuntime {
                     override fun onProductDisconnect(productId: Int) {
                         productConnected.set(false)
                         telemetryMonitor.stop("product_disconnected")
+                        videoIngest.stop("product_disconnected")
                         publishTelemetry()
                         Log.i(TAG, "product=disconnected productId=$productId")
                     }
@@ -89,12 +91,14 @@ object DjiSdkRuntime {
                         Log.i(TAG, "product=connected productId=$productId")
                         publishTelemetry(DjiTelemetrySnapshot())
                         telemetryMonitor.start(productId)
+                        videoIngest.start(productId)
                     }
 
                     override fun onProductChanged(productId: Int) {
                         Log.i(TAG, "product=changed productId=$productId")
                         if (productConnected.get()) {
                             telemetryMonitor.restart(productId)
+                            videoIngest.restart(productId)
                             publishTelemetry(DjiTelemetrySnapshot())
                         }
                     }

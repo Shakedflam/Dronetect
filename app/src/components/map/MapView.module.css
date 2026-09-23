@@ -11,14 +11,24 @@
   background: #0e1217;
 }
 
-.acquiring {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
+/** Shown over the map while no drone-role telemetry has arrived yet. Kept to
+ * a corner badge rather than a full-pane placeholder so the mission controls
+ * (ROI, flight radius/altitude) stay usable without a fix. */
+.awaitingFix {
+  position: absolute;
+  left: var(--space-md);
+  bottom: var(--space-md);
+  z-index: 1000;
+  padding: var(--space-xs) var(--space-sm);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-panel-border);
+  background: var(--color-panel);
+  backdrop-filter: blur(6px);
   color: var(--color-text-muted);
   font-family: var(--font-mono);
+  font-size: 11px;
   letter-spacing: 0.04em;
+  pointer-events: none;
 }
 
 .droneIcon {
@@ -259,18 +269,26 @@
 }
 
 /** The invisible wide-hit-area twin of the ROI outline circle — any point
- * along it can be dragged to resize. */
+ * along it can be dragged to resize.
+ *
+ * `touch-action: none` is required for the touch drag: without it the
+ * browser treats a finger press on the handle as the start of a map
+ * pan/zoom, takes over the gesture, and fires pointercancel — which ends
+ * the resize before it moves. */
 .roiBoundaryHandle {
   cursor: grab;
+  touch-action: none;
 }
 
 .roiBoundaryHandle:active {
   cursor: grabbing;
 }
 
-/** The invisible fill covering the ROI's interior — dragging it moves the whole ROI. */
+/** The invisible fill covering the ROI's interior — dragging it moves the
+ * whole ROI. Same touch-action reasoning as the boundary handle above. */
 .roiMoveHandle {
   cursor: move;
+  touch-action: none;
 }
 
 .roiMoveHandle:active {

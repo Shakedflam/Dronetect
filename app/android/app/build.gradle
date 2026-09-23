@@ -17,9 +17,44 @@ if (!djiApiKey?.trim()) {
     throw new GradleException('DJI_API_KEY must be set in app/android/local.properties')
 }
 
+// The native video-ingest client must reach the same backend the packaged
+// WebView UI is built against, so it reads the SAME app/.env.android value
+// rather than carrying its own copy that could silently diverge. There is
+// deliberately no default: a missing or malformed value fails the build.
+def androidEnvFile = rootProject.file('../.env.android')
+if (!androidEnvFile.exists()) {
+    throw new GradleException(
+        'app/.env.android is required: copy app/.env.android.example and set ' +
+        'VITE_REALTIME_SERVER_WS_URL (it configures both the WebView UI and the ' +
+        'native /video/ingest client).'
+    )
+}
+def realtimeOrigin = null
+androidEnvFile.eachLine { line ->
+    def trimmed = line.trim()
+    if (trimmed.startsWith('#')) return
+    def separator = trimmed.indexOf('=')
+    if (separator <= 0) return
+    if (trimmed.substring(0, separator).trim() != 'VITE_REALTIME_SERVER_WS_URL') return
+    realtimeOrigin = trimmed.substring(separator + 1).trim()
+}
+if (!realtimeOrigin) {
+    throw new GradleException('VITE_REALTIME_SERVER_WS_URL must be set in app/.env.android')
+}
+if (!(realtimeOrigin.startsWith('ws://') || realtimeOrigin.startsWith('wss://'))) {
+    throw new GradleException(
+        "VITE_REALTIME_SERVER_WS_URL must start with ws:// or wss:// (got: ${realtimeOrigin})"
+    )
+}
+
 android {
     namespace "com.dronetect.app"
     compileSdk rootProject.ext.compileSdkVersion
+    // AGP 8 disables BuildConfig generation by default; the native video
+    // ingest client reads DRONTECT_REALTIME_WS_ORIGIN from it.
+    buildFeatures {
+        buildConfig true
+    }
     defaultConfig {
         applicationId "com.dronetect.app"
         minSdkVersion rootProject.ext.minSdkVersion
@@ -35,6 +70,7 @@ android {
             usesCleartextTraffic: "false",
             DJI_API_KEY: djiApiKey
         ]
+        buildConfigField "String", "DRONTECT_REALTIME_WS_ORIGIN", "\"${realtimeOrigin}\""
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -87,6 +123,9 @@ dependencies {
     implementation "com.dji:dji-sdk-v5-aircraft:5.18.0"
     compileOnly "com.dji:dji-sdk-v5-aircraft-provided:5.18.0"
     runtimeOnly "com.dji:dji-sdk-v5-networkImp:5.18.0"
+    // WebSocket client for the native /video/ingest link. Pinned to the
+    // version MSDK already resolves so this adds no new transitive graph.
+    implementation "com.squareup.okhttp3:okhttp:3.14.9"
 }
 
 apply from: 'capacitor.build.gradle'

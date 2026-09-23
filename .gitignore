@@ -102,3 +102,10 @@ captures/
 # Local generated artifacts
 artifacts/
 dronetect-demo.pem
+
+# Local debug output
+dronetect-debug.txt
+dronetect-fresh-log.txt
+dji-video-test.txt
+dronetect-wss-test.txt
+dronetect-crash.txt

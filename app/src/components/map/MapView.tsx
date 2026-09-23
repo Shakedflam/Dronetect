@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ChangeEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react';
 import {
   Circle,
   MapContainer,
@@ -307,6 +307,18 @@ function RoiLayer({
   // Shared by both the boundary (resize) and interior (move) drag gestures
   // below — only one can ever be active at a time, so one ref is enough.
   const stopDragRef = useRef<(() => void) | null>(null);
+  const interiorHandleRef = useRef<L.Circle | null>(null);
+  const boundaryHandleRef = useRef<L.Circle | null>(null);
+  // The drag handlers are bound to the SVG paths once and then read the ROI
+  // through this ref, so a mid-drag update (every pointermove calls setRoi)
+  // never has to tear the listeners down and rebind them. Written in an
+  // effect rather than during render; only pointerdown reads it, which
+  // cannot run before the commit that set it.
+  const roiRef = useRef(roi);
+  useEffect(() => {
+    roiRef.current = roi;
+  }, [roi]);
+  const hasRoi = roi !== null;
 
   useEffect(() => {
     const panel = panelRef.current;
@@ -344,85 +356,111 @@ function RoiLayer({
     },
   });
 
-  function handleBoundaryMouseDown(event: L.LeafletMouseEvent): void {
-    if (!roi) return;
-    const roiCenter = roi.center;
-    const centerCoords = toCoordinates(roiCenter);
-    L.DomEvent.stopPropagation(event.originalEvent);
+  /**
+   * Shared drag driver for both ROI gestures.
+   *
+   * Pointer events rather than mouse events, because these handles have to
+   * work under a finger on the tablet as well as a mouse on the desktop. A
+   * touch delivers `mousedown` only as a compatibility event *after* the
+   * gesture finishes, and never delivers `mousemove` during it, so the
+   * previous mouse-only listeners could not drive a touch drag at all.
+   * `pointer*` is emitted uniformly for mouse, touch and stylus, and
+   * PointerEvent extends MouseEvent so Leaflet's coordinate conversion still
+   * accepts it directly.
+   */
+  const beginPointerDrag = useCallback((
+    event: PointerEvent,
+    onMove: (latlng: L.LatLng) => void,
+  ): void => {
+    // Keeps the browser from claiming the gesture as a map pan/scroll, and
+    // keeps Leaflet from also starting its own drag from the same press.
+    event.preventDefault();
+    L.DomEvent.stopPropagation(event);
     stopDragRef.current?.();
     map.dragging.disable();
     let active = true;
 
-    function onMove(moveEvent: L.LeafletMouseEvent): void {
-      const radiusM = clampRoiRadius(euclideanDistanceMeters(centerCoords, moveEvent.latlng));
-      roiService.setRoi({ center: roiCenter, radiusM });
+    function handleMove(moveEvent: PointerEvent): void {
+      // Ignore a second finger mid-drag; the first one owns the gesture.
+      if (moveEvent.pointerId !== event.pointerId) return;
+      onMove(map.mouseEventToLatLng(moveEvent));
     }
 
     function stopDragging(): void {
       if (!active) return;
       active = false;
       map.dragging.enable();
-      map.off('mousemove', onMove);
-      map.off('mouseup', stopDragging);
-      document.removeEventListener('mouseup', stopDragging);
+      document.removeEventListener('pointermove', handleMove);
+      document.removeEventListener('pointerup', stopDragging);
+      document.removeEventListener('pointercancel', stopDragging);
       window.removeEventListener('blur', stopDragging);
       if (stopDragRef.current === stopDragging) {
         stopDragRef.current = null;
       }
     }
 
-    map.on('mousemove', onMove);
-    map.on('mouseup', stopDragging);
-    document.addEventListener('mouseup', stopDragging);
+    document.addEventListener('pointermove', handleMove);
+    document.addEventListener('pointerup', stopDragging);
+    document.addEventListener('pointercancel', stopDragging);
     window.addEventListener('blur', stopDragging);
     stopDragRef.current = stopDragging;
-  }
+  }, [map]);
+
+  /** Drag the boundary ring to resize. */
+  const handleBoundaryPointerDown = useCallback((event: PointerEvent): void => {
+    const current = roiRef.current;
+    if (!current) return;
+    const roiCenter = current.center;
+    const centerCoords = toCoordinates(roiCenter);
+    beginPointerDrag(event, (latlng) => {
+      roiService.setRoi({
+        center: roiCenter,
+        radiusM: clampRoiRadius(euclideanDistanceMeters(centerCoords, latlng)),
+      });
+    });
+  }, [beginPointerDrag]);
 
   /**
    * Drag-to-move: grabbing anywhere inside the circle (not on the boundary
    * ring, which resizes instead — see the interactive circle's render order
-   * below) translates the ROI by the same lat/lng delta as the cursor, so
-   * the circle tracks the pointer exactly regardless of map projection,
-   * the same way dragging any other map object would.
+   * below) translates the ROI by the same lat/lng delta as the pointer, so
+   * the circle tracks it exactly regardless of map projection, the same way
+   * dragging any other map object would.
    */
-  function handleInteriorMouseDown(event: L.LeafletMouseEvent): void {
-    if (!roi) return;
-    const roiCenter = roi.center;
-    const radiusM = roi.radiusM;
-    const grabLatLng = event.latlng;
-    L.DomEvent.stopPropagation(event.originalEvent);
-    stopDragRef.current?.();
-    map.dragging.disable();
-    let active = true;
-
-    function onMove(moveEvent: L.LeafletMouseEvent): void {
-      const deltaLat = moveEvent.latlng.lat - grabLatLng.lat;
-      const deltaLng = moveEvent.latlng.lng - grabLatLng.lng;
+  const handleInteriorPointerDown = useCallback((event: PointerEvent): void => {
+    const current = roiRef.current;
+    if (!current) return;
+    const roiCenter = current.center;
+    const radiusM = current.radiusM;
+    const grabLatLng = map.mouseEventToLatLng(event);
+    beginPointerDrag(event, (latlng) => {
       roiService.setRoi({
-        center: { lat: roiCenter.lat + deltaLat, lon: roiCenter.lon + deltaLng },
+        center: {
+          lat: roiCenter.lat + (latlng.lat - grabLatLng.lat),
+          lon: roiCenter.lon + (latlng.lng - grabLatLng.lng),
+        },
         radiusM,
       });
-    }
+    });
+  }, [beginPointerDrag, map]);
 
-    function stopDragging(): void {
-      if (!active) return;
-      active = false;
-      map.dragging.enable();
-      map.off('mousemove', onMove);
-      map.off('mouseup', stopDragging);
-      document.removeEventListener('mouseup', stopDragging);
-      window.removeEventListener('blur', stopDragging);
-      if (stopDragRef.current === stopDragging) {
-        stopDragRef.current = null;
-      }
-    }
-
-    map.on('mousemove', onMove);
-    map.on('mouseup', stopDragging);
-    document.addEventListener('mouseup', stopDragging);
-    window.addEventListener('blur', stopDragging);
-    stopDragRef.current = stopDragging;
-  }
+  // Bound straight to the rendered SVG paths: react-leaflet's `eventHandlers`
+  // only exposes Leaflet's own (mouse) event names, which is exactly what
+  // did not reach touch. Leaflet mutates a path's geometry in place rather
+  // than recreating the element, so re-binding only has to track the
+  // circles appearing/disappearing with the ROI itself.
+  useEffect(() => {
+    // Leaflet types getElement() as the generic Element, whose event map has
+    // no pointer events; the rendered handle is always an SVG path.
+    const interior = interiorHandleRef.current?.getElement() as SVGElement | undefined;
+    const boundary = boundaryHandleRef.current?.getElement() as SVGElement | undefined;
+    interior?.addEventListener('pointerdown', handleInteriorPointerDown);
+    boundary?.addEventListener('pointerdown', handleBoundaryPointerDown);
+    return () => {
+      interior?.removeEventListener('pointerdown', handleInteriorPointerDown);
+      boundary?.removeEventListener('pointerdown', handleBoundaryPointerDown);
+    };
+  }, [hasRoi, handleInteriorPointerDown, handleBoundaryPointerDown]);
 
   function handleRadiusInputChange(event: ChangeEvent<HTMLInputElement>): void {
     if (!roi) return;
@@ -469,10 +507,10 @@ function RoiLayer({
               actual edge — wins the hit test near the boundary, leaving
               this one to catch everything strictly inside it. */}
           <Circle
+            ref={interiorHandleRef}
             center={[roiCenterCoords.lat, roiCenterCoords.lng]}
             radius={roi.radiusM}
             interactive
-            eventHandlers={{ mousedown: handleInteriorMouseDown }}
             pathOptions={{
               stroke: false,
               fill: true,
@@ -483,10 +521,10 @@ function RoiLayer({
           {/* Invisible, wider-stroke twin of the outline circle: any point
               along the circumference can be grabbed and dragged to resize. */}
           <Circle
+            ref={boundaryHandleRef}
             center={[roiCenterCoords.lat, roiCenterCoords.lng]}
             radius={roi.radiusM}
             interactive
-            eventHandlers={{ mousedown: handleBoundaryMouseDown }}
             pathOptions={{
               color: ROI_COLOR,
               weight: ROI_BOUNDARY_HIT_WEIGHT,
@@ -555,31 +593,29 @@ export function MapView({
   const position = useLocation();
   const [roiPanelHeight, setRoiPanelHeight] = useState(0);
 
-  if (!position) {
-    return (
-      <div className={styles.wrapper}>
-        <div className={styles.acquiring}>Acquiring GPS fix…</div>
-      </div>
-    );
-  }
-
-  const homeBearing = bearingDeg(position, HOME_REFERENCE);
-  const homeDistanceM = euclideanDistanceMeters(position, HOME_REFERENCE);
-  const targetEstimate = estimateTargetMapPosition(
-    position,
-    targets,
-    diagnostics,
-    ignoredTargetId,
-  );
-  const arrowPosition: [number, number] = [
-    position.lat + (HOME_REFERENCE.lat - position.lat) * HOME_ARROW_T,
-    position.lng + (HOME_REFERENCE.lng - position.lng) * HOME_ARROW_T,
-  ];
+  // ROI and flight radius/altitude configure the *mission*, not the aircraft,
+  // so they have to stay reachable before the first fix arrives. Previously
+  // this component returned an "Acquiring GPS fix" placeholder instead, which
+  // meant those controls were never mounted at all whenever no drone-role
+  // client was feeding telemetry to the realtime server. The map now falls
+  // back to the home reference and only the aircraft-derived layers are
+  // withheld.
+  const targetEstimate = position
+    ? estimateTargetMapPosition(position, targets, diagnostics, ignoredTargetId)
+    : null;
+  const homeBearing = position ? bearingDeg(position, HOME_REFERENCE) : 0;
+  const homeDistanceM = position ? euclideanDistanceMeters(position, HOME_REFERENCE) : 0;
+  const arrowPosition: [number, number] | null = position
+    ? [
+        position.lat + (HOME_REFERENCE.lat - position.lat) * HOME_ARROW_T,
+        position.lng + (HOME_REFERENCE.lng - position.lng) * HOME_ARROW_T,
+      ]
+    : null;
 
   return (
     <div className={styles.wrapper}>
       <MapContainer
-        center={[position.lat, position.lng]}
+        center={position ? [position.lat, position.lng] : [HOME_REFERENCE.lat, HOME_REFERENCE.lng]}
         zoom={DEFAULT_ZOOM}
         className={styles.map}
         // Off so a rapid double-click (the first two taps of an ROI
@@ -596,20 +632,24 @@ export function MapView({
           interactive={false}
           pathOptions={{ color: '#3a6fd8', weight: 2, opacity: 0.55, fill: true, fillColor: '#3a6fd8', fillOpacity: 0.08 }}
         />
-        <Polyline
-          positions={[
-            [position.lat, position.lng],
-            [HOME_REFERENCE.lat, HOME_REFERENCE.lng],
-          ]}
-          pathOptions={{ color: '#ffb020', weight: 2, dashArray: '6 6', opacity: 0.85 }}
-        />
-        <Marker position={arrowPosition} icon={createHomeArrowIcon(homeBearing)} interactive={false}>
-          <Tooltip permanent direction="top" offset={[0, -6]} className={styles.homeDistanceTooltip}>
-            {formatDistance(homeDistanceM)}
-          </Tooltip>
-        </Marker>
+        {position && arrowPosition && (
+          <>
+            <Polyline
+              positions={[
+                [position.lat, position.lng],
+                [HOME_REFERENCE.lat, HOME_REFERENCE.lng],
+              ]}
+              pathOptions={{ color: '#ffb020', weight: 2, dashArray: '6 6', opacity: 0.85 }}
+            />
+            <Marker position={arrowPosition} icon={createHomeArrowIcon(homeBearing)} interactive={false}>
+              <Tooltip permanent direction="top" offset={[0, -6]} className={styles.homeDistanceTooltip}>
+                {formatDistance(homeDistanceM)}
+              </Tooltip>
+            </Marker>
+          </>
+        )}
         <Marker position={[HOME_REFERENCE.lat, HOME_REFERENCE.lng]} icon={homeIcon} />
-        <Marker position={[position.lat, position.lng]} icon={droneIcon} />
+        {position && <Marker position={[position.lat, position.lng]} icon={droneIcon} />}
         {targetEstimate && (
           <Marker
             position={[targetEstimate.center.lat, targetEstimate.center.lng]}
@@ -618,12 +658,14 @@ export function MapView({
             zIndexOffset={1000}
           />
         )}
-        <LiveTrackingControl
-          position={position}
-          home={HOME_REFERENCE}
-          target={targetEstimate?.center ?? null}
-          maxFlightRadiusM={maxFlightRadiusM}
-        />
+        {position && (
+          <LiveTrackingControl
+            position={position}
+            home={HOME_REFERENCE}
+            target={targetEstimate?.center ?? null}
+            maxFlightRadiusM={maxFlightRadiusM}
+          />
+        )}
         <RoiLayer
           home={HOME_REFERENCE}
           homeRadiusM={maxFlightRadiusM}
@@ -635,6 +677,7 @@ export function MapView({
           pending={operatingConfigPending}
           topOffsetPx={roiPanelHeight}
         />
+        {!position && <div className={styles.awaitingFix}>Acquiring GPS fix…</div>}
       </MapContainer>
     </div>
   );
