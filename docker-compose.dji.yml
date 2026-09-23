@@ -1,0 +1,16 @@
+# Optional DJI Phase 1 service on the existing AWS host. Port 8790 is loopback only.
+services:
+  dji_bridge:
+    build:
+      context: .
+      dockerfile: adapters/dji/Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      DRONTECT_DJI_PHASE1_TELEMETRY_ONLY: "1"
+      DRONTECT_DJI_PHASE2_ACTIONS: "1"
+      DRONTECT_DJI_PHASE3_ZERO_STICK: "1"
+      DRONTECT_DJI_LOCAL_HOST: 127.0.0.1
+      DRONTECT_DJI_LOCAL_PORT: "8790"
+      DRONTECT_DJI_REALTIME_WS_URL: ws://127.0.0.1:8765/ws?role=drone
+      DRONTECT_DJI_BRIDGE_TOKEN: ${DRONTECT_DJI_BRIDGE_TOKEN:?Set the private bridge token}

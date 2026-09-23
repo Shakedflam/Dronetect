@@ -159,8 +159,16 @@ def mission_status_message(
     pursuit_blocked: bool = False,
     manual_control_active: bool = False,
     manual_input_source: str = "tablet",
+    session_home: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    """Build the authoritative mission snapshot sent to tablet clients."""
+    """Build the authoritative mission snapshot sent to tablet clients.
+
+    `session_home` is the confirmed real-DJI session home (RealtimeServer's
+    own `_session_home`, captured once from the first grounded DJI telemetry
+    sample) -- None for simulator/browser mode and until a real DJI session
+    confirms one. This is what the frontend must use for patrol/ROI geometry
+    once real-DJI, not the static HOME_REFERENCE -- see MapView.tsx.
+    """
     return {
         "type": MESSAGE_TYPE_MISSION_STATUS,
         "state": state.value,
@@ -173,6 +181,7 @@ def mission_status_message(
         "pursuitBlocked": pursuit_blocked,
         "manualControlActive": manual_control_active,
         "manualInputSource": manual_input_source,
+        "sessionHome": session_home,
         "activeRoi": active_roi,
         "patrol": {
             "priorities": patrol_priorities,
@@ -266,6 +275,14 @@ def validate_mission_status_message(message: dict[str, Any]) -> dict[str, Any]:
             "radiusM": _required_number(active_roi, "radiusM"),
         }
 
+    session_home = message.get("sessionHome")
+    if session_home is not None:
+        session_home = _required_object(message, "sessionHome")
+        session_home = {
+            "lat": _required_number(session_home, "lat"),
+            "lng": _required_number(session_home, "lng"),
+        }
+
     patrol = _required_object(message, "patrol")
     priorities = patrol.get("priorities")
     if not isinstance(priorities, list):
@@ -352,6 +369,7 @@ def validate_mission_status_message(message: dict[str, Any]) -> dict[str, Any]:
         pursuit_blocked=pursuit_blocked,
         manual_control_active=manual_control_active,
         manual_input_source=manual_input_source,
+        session_home=session_home,
     )
 
 

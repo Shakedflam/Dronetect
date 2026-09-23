@@ -62,6 +62,19 @@ DEFAULT_PORT = 8765
 WS_PATH = "/ws"
 HEALTH_PATH = "/healthz"
 
+# Matches adapters/dji/flight_bridge.py's DJI_TELEMETRY_SOURCE and Android's
+# DroneWireProtocol.kt -- the only two things that ever report this source.
+# The simulator always reports "simulator" (services/telemetry.py's
+# SIMULATOR_SOURCE), so gating session-home capture on this string is what
+# keeps simulator/browser mode on DEFAULT_HOME unconditionally.
+DJI_TELEMETRY_SOURCE = "dji"
+# DjiTelemetryMapper.kt (Android) and flight_bridge.py's own phase1 telemetry
+# both report this state string exactly when the aircraft is grounded -- the
+# one grounded/airborne signal common to *every* path telemetry can reach
+# this server through (the AWS bridge, or a tablet connecting directly as
+# role=drone), so it's what session-home capture keys off here.
+DJI_GROUNDED_STATE = "LANDED"
+
 
 class RealtimeServer:
     """Routes telemetry from one drone source to one connected tablet client."""
@@ -102,6 +115,16 @@ class RealtimeServer:
             home_radius_m=self.operating_config.max_flight_radius_m
         )
         self.patrol_planner = PatrolPlanner(store=self.patrol_regions)
+        # Real-DJI session home, captured once from the first grounded DJI
+        # telemetry sample (see _route_drone_telemetry) and never moved again
+        # for this process's lifetime -- the same "one process lifetime is
+        # one aircraft session" rule adapters/dji/flight_bridge.py uses, kept
+        # independent of it since telemetry can reach this server either via
+        # that bridge or directly from a tablet (DroneWireProtocol.kt).
+        # Stays None (and every home-dependent computation below keeps using
+        # DEFAULT_HOME) for simulator/browser mode, which never reports
+        # source="dji".
+        self._session_home: Wgs84Point | None = None
         self._operating_config_revision = 0
         self._drone_config_ready = False
         self._pending_drone_config_results: dict[str, asyncio.Future[dict]] = {}
@@ -372,6 +395,21 @@ class RealtimeServer:
         gps = data["gps"]
         self.mission.observe_position(Wgs84Point(lat=gps["lat"], lng=gps["lng"]))
         self.mission.observe_flight_state(data["state"])
+        if (
+            self._session_home is None
+            and telemetry.get("source") == DJI_TELEMETRY_SOURCE
+            and data["state"] == DJI_GROUNDED_STATE
+        ):
+            # First grounded real-DJI fix, from whichever path it arrived
+            # through (the AWS bridge or a tablet connecting directly) --
+            # captured once, mirrored here independently of
+            # flight_bridge.py's own session_home so this server's SET_ROI
+            # validation, patrol_regions copy, and the home it reports to
+            # tablets all agree with whatever geometry the aircraft itself is
+            # actually flying against.
+            self._session_home = Wgs84Point(lat=gps["lat"], lng=gps["lng"])
+            store, planner, _ = self._prepare_operating_config(self.operating_config)
+            self.patrol_regions, self.patrol_planner = store, planner
         await self._send_to_tablet(encode_message(self._mission_status()))
         await self._send_to_tablet(encode_message(telemetry))
 
@@ -748,6 +786,9 @@ class RealtimeServer:
         await tablet.send(encode_message(command_ack(command["commandId"])))
         await tablet.send(encode_message(self._mission_status()))
 
+    def _effective_home(self) -> Wgs84Point:
+        return self._session_home if self._session_home is not None else DEFAULT_HOME
+
     def _prepare_operating_config(
         self,
         candidate: OperatingConfig,
@@ -762,7 +803,7 @@ class RealtimeServer:
             for region in self.patrol_regions.regions
             if region.area_type is not PatrolAreaType.PATROL
         ]
-        store = PatrolRegionStore(home_radius_m=candidate.max_flight_radius_m)
+        store = PatrolRegionStore(home=self._effective_home(), home_radius_m=candidate.max_flight_radius_m)
         store.replace_area_types(area_types)
         store.replace_priorities(priorities)
         planner = PatrolPlanner(
@@ -822,7 +863,7 @@ class RealtimeServer:
             center = params["center"]
             distance_from_home_m = wgs84_distance_m(
                 Wgs84Point(lat=center["lat"], lng=center["lon"]),
-                DEFAULT_HOME,
+                self._effective_home(),
             )
             if (
                 distance_from_home_m
@@ -928,6 +969,11 @@ class RealtimeServer:
                 "cruiseAltitudeM": self.operating_config.cruise_altitude_m,
             },
             operating_config_pending=self._operating_config_pending,
+            session_home=(
+                {"lat": self._session_home.lat, "lng": self._session_home.lng}
+                if self._session_home is not None
+                else None
+            ),
             pursuit_blocked=self.pursuit_blocked,
             manual_control_active=self.manual_control,
             manual_input_source=self.manual_input_source,

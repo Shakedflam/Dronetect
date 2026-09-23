@@ -19,6 +19,8 @@ import type {
   TargetFollowDiagnostics,
 } from '../../types/drone';
 import type { RoiCenter } from '../../types/roi';
+import { useGeometryReady } from '../../hooks/useGeometryReady';
+import { useHome } from '../../hooks/useHome';
 import { useLocation } from '../../hooks/useLocation';
 import { useRoi } from '../../hooks/useRoi';
 import { droneCommandService } from '../../services/droneCommandService';
@@ -27,7 +29,6 @@ import {
   DEFAULT_ROI_RADIUS_METERS,
   DEFAULT_ZOOM,
   FOLLOW_PADDING,
-  HOME_REFERENCE,
   MAX_FOLLOW_ZOOM,
   MAX_ROI_RADIUS_METERS,
   MIN_ROI_RADIUS_METERS,
@@ -579,8 +580,13 @@ function RoiLayer({
  * Renders the interactive map and the drone's live position. Position comes
  * exclusively from useLocation()/LocationService, which is backed by the
  * live realtime server connection — this component never touches mock data
- * directly. The home marker is a static display anchor (HOME_REFERENCE),
- * not live telemetry — see config/mapConfig.ts.
+ * directly. The home marker, patrol grid, and ROI editing all use this
+ * session's home (useHome()): the backend-confirmed real-DJI session home
+ * once the backend reports one, an unconfirmed local guess until then, or
+ * the static HOME_REFERENCE default off Android/without DJI — see
+ * locationService.ts's subscribeHome. Patrol/ROI editing (geometry-dependent
+ * real-flight controls) stay hidden while a real DJI session is detected but
+ * not yet confirmed — see useGeometryReady().
  */
 export function MapView({
   targets,
@@ -591,6 +597,8 @@ export function MapView({
   operatingConfigPending,
 }: MapViewProps) {
   const position = useLocation();
+  const home = useHome();
+  const geometryReady = useGeometryReady();
   const [roiPanelHeight, setRoiPanelHeight] = useState(0);
 
   // ROI and flight radius/altitude configure the *mission*, not the aircraft,
@@ -603,19 +611,19 @@ export function MapView({
   const targetEstimate = position
     ? estimateTargetMapPosition(position, targets, diagnostics, ignoredTargetId)
     : null;
-  const homeBearing = position ? bearingDeg(position, HOME_REFERENCE) : 0;
-  const homeDistanceM = position ? euclideanDistanceMeters(position, HOME_REFERENCE) : 0;
+  const homeBearing = position ? bearingDeg(position, home) : 0;
+  const homeDistanceM = position ? euclideanDistanceMeters(position, home) : 0;
   const arrowPosition: [number, number] | null = position
     ? [
-        position.lat + (HOME_REFERENCE.lat - position.lat) * HOME_ARROW_T,
-        position.lng + (HOME_REFERENCE.lng - position.lng) * HOME_ARROW_T,
+        position.lat + (home.lat - position.lat) * HOME_ARROW_T,
+        position.lng + (home.lng - position.lng) * HOME_ARROW_T,
       ]
     : null;
 
   return (
     <div className={styles.wrapper}>
       <MapContainer
-        center={position ? [position.lat, position.lng] : [HOME_REFERENCE.lat, HOME_REFERENCE.lng]}
+        center={position ? [position.lat, position.lng] : [home.lat, home.lng]}
         zoom={DEFAULT_ZOOM}
         className={styles.map}
         // Off so a rapid double-click (the first two taps of an ROI
@@ -627,7 +635,7 @@ export function MapView({
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
         />
         <Circle
-          center={[HOME_REFERENCE.lat, HOME_REFERENCE.lng]}
+          center={[home.lat, home.lng]}
           radius={maxFlightRadiusM}
           interactive={false}
           pathOptions={{ color: '#3a6fd8', weight: 2, opacity: 0.55, fill: true, fillColor: '#3a6fd8', fillOpacity: 0.08 }}
@@ -637,7 +645,7 @@ export function MapView({
             <Polyline
               positions={[
                 [position.lat, position.lng],
-                [HOME_REFERENCE.lat, HOME_REFERENCE.lng],
+                [home.lat, home.lng],
               ]}
               pathOptions={{ color: '#ffb020', weight: 2, dashArray: '6 6', opacity: 0.85 }}
             />
@@ -648,7 +656,7 @@ export function MapView({
             </Marker>
           </>
         )}
-        <Marker position={[HOME_REFERENCE.lat, HOME_REFERENCE.lng]} icon={homeIcon} />
+        <Marker position={[home.lat, home.lng]} icon={homeIcon} />
         {position && <Marker position={[position.lat, position.lng]} icon={droneIcon} />}
         {targetEstimate && (
           <Marker
@@ -661,23 +669,38 @@ export function MapView({
         {position && (
           <LiveTrackingControl
             position={position}
-            home={HOME_REFERENCE}
+            home={home}
             target={targetEstimate?.center ?? null}
             maxFlightRadiusM={maxFlightRadiusM}
           />
         )}
-        <RoiLayer
-          home={HOME_REFERENCE}
-          homeRadiusM={maxFlightRadiusM}
-          onPanelHeightChange={setRoiPanelHeight}
-        />
-        <PatrolLayer home={HOME_REFERENCE} homeRadiusM={maxFlightRadiusM} />
+        {geometryReady && (
+          <>
+            <RoiLayer
+              home={home}
+              homeRadiusM={maxFlightRadiusM}
+              onPanelHeightChange={setRoiPanelHeight}
+            />
+            {/* Patrol region geometry must be generated from this session's
+                confirmed home (services/patrol_regions.py generates the
+                backend's copy from the same home — see
+                adapters/dji/flight_bridge.py's session_home /
+                realtime_server.py's _session_home) — not the static
+                HOME_REFERENCE default, or the rendered polygons/region IDs
+                would point at different real-world places than the backend
+                patrol planner actually flies against. */}
+            <PatrolLayer home={home} homeRadiusM={maxFlightRadiusM} />
+          </>
+        )}
         <FlightParametersLayer
           config={{ maxFlightRadiusM, cruiseAltitudeM }}
           pending={operatingConfigPending}
           topOffsetPx={roiPanelHeight}
         />
         {!position && <div className={styles.awaitingFix}>Acquiring GPS fix…</div>}
+        {position && !geometryReady && (
+          <div className={styles.awaitingFix}>Confirming operational area…</div>
+        )}
       </MapContainer>
     </div>
   );

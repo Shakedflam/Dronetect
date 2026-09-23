@@ -7,6 +7,7 @@ the underlying pure autonomy modules -- no real sockets are needed to
 exercise the bridge's own logic.
 """
 
+import asyncio
 import json
 import math
 
@@ -14,13 +15,14 @@ import pytest
 
 from adapters.dji.android_link import AndroidLink
 from adapters.dji.flight_bridge import BridgeConfig, DjiFlightBridge, TickOutcome
-from adapters.dji.local_protocol import AndroidRcState, AndroidTelemetry, build_android_telemetry_message
+from adapters.dji.local_protocol import AndroidRcState, AndroidTelemetry, build_android_rc_state_message, build_android_telemetry_message
 from adapters.simulator.client import SimulatorRealtimeClient
 from config.shared_config import OperatingConfig
 from controllers.autonomous_drone.flight_logic import FlightState
 from realtime_server.protocol import encode_message
+from realtime_server.protocol import validate_telemetry_message
 from services.commands import CommandName
-from services.gps import DEFAULT_HOME, LocalPosition, destination_point, local_meters_to_wgs84
+from services.gps import DEFAULT_HOME, LocalPosition, Wgs84Point, destination_point, local_meters_to_wgs84, wgs84_distance_m
 
 # Real-world-scale, matching config/shared_config.py's own default_operating_
 # config (radius) with the altitude already used throughout this file's
@@ -47,6 +49,11 @@ def _make_bridge(now: list[float], *, operating_config: OperatingConfig | None =
 
 
 def _feed_telemetry(bridge: DjiFlightBridge, now: list[float], **overrides) -> None:
+    # is_flying=False by default: session_home (and therefore any position at
+    # all -- see DjiFlightBridge._maybe_establish_session_home) is only ever
+    # captured from a telemetry sample explicitly reporting the aircraft as
+    # grounded, so most fixtures here need "grounded, complete telemetry" as
+    # their baseline. Tests exercising airborne/unknown telemetry override it.
     defaults = dict(
         timestamp=now[0],
         lat=DEFAULT_HOME.lat,
@@ -57,6 +64,7 @@ def _feed_telemetry(bridge: DjiFlightBridge, now: list[float], **overrides) -> N
         battery_percent=90.0,
         gimbal_pitch_deg=0.0,
         flight_mode="GPS_ATTI",
+        is_flying=False,
     )
     defaults.update(overrides)
     bridge.android_link._connection = object()
@@ -67,10 +75,218 @@ def _feed_telemetry(bridge: DjiFlightBridge, now: list[float], **overrides) -> N
     bridge.android_link._telemetry_received_monotonic = now[0]
 
 
+def _feed_ground_rc(bridge: DjiFlightBridge, now: list[float], **overrides) -> None:
+    defaults = dict(timestamp=now[0], connected=True, forward=0.0, right=0.0,
+                    up=0.0, yaw_rate=0.0, aircraft_connected=True, is_flying=False)
+    defaults.update(overrides)
+    bridge.android_link._handle_message(json.dumps(
+        build_android_rc_state_message(AndroidRcState(**defaults))))
+
+
 def _queue_command(bridge: DjiFlightBridge, command: str, params: dict | None = None, command_id: str = "cmd-1") -> None:
     bridge.realtime_link._commands.put(
         {"type": "command", "commandId": command_id, "command": command, "params": params or {}}
     )
+
+
+def test_phase1_uses_measured_dji_state_and_never_sends_aircraft_commands(monkeypatch):
+    monkeypatch.setenv("DRONTECT_DJI_PHASE1_TELEMETRY_ONLY", "1")
+    now = [100.0]
+    bridge = _make_bridge(now)
+    _feed_telemetry(bridge, now, heading_deg=97.8, speed_mps=0.3,
+                    battery_percent=64.0, gimbal_pitch_deg=-15.0, is_flying=False)
+    _queue_command(bridge, CommandName.START_PATROL.value)
+    outcome = asyncio.run(bridge.run_tick_once())
+    message = bridge.build_telemetry_message(outcome)
+    assert validate_telemetry_message(message)["source"] == "dji"
+    assert outcome.has_position
+    assert bridge.logic.state is FlightState.IDLE
+    assert message["data"]["gps"] == {"lat": DEFAULT_HOME.lat, "lng": DEFAULT_HOME.lng}
+    assert message["data"]["headingDeg"] == 97.8
+    assert message["data"]["speedMps"] == 0.3
+    assert message["data"]["state"] == "LANDED"
+    assert math.isclose(bridge._last_yaw, math.radians(90 - 97.8))
+    assert math.isclose(bridge.camera_gimbal.pitch, math.radians(15))
+    assert not bridge.realtime_link.drain_commands()
+
+
+def test_phase2_sends_only_one_gimbal_or_rth_action_and_never_setpoints(monkeypatch):
+    monkeypatch.setenv("DRONTECT_DJI_PHASE1_TELEMETRY_ONLY", "1")
+    monkeypatch.setenv("DRONTECT_DJI_PHASE2_ACTIONS", "1")
+    now = [100.0]
+    bridge = _make_bridge(now)
+    bridge.realtime_link._mark_connected()
+
+    class RecordingConnection:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, raw):
+            self.messages.append(json.loads(raw))
+
+    connection = RecordingConnection()
+    _feed_telemetry(bridge, now, gimbal_pitch_deg=-15.0, is_flying=False)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())  # establishes the hardware session
+
+    _queue_command(bridge, CommandName.CAMERA_TILT_UP.value)
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, gimbal_pitch_deg=-15.0, is_flying=False)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert [message["type"] for message in connection.messages] == ["dji_gimbal_command"]
+    assert connection.messages[0]["ttlMs"] == bridge.config.gimbal_command_ttl_ms
+
+    _queue_command(bridge, CommandName.RETURN_HOME.value)
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, gimbal_pitch_deg=-15.0, is_flying=False)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert [message["type"] for message in connection.messages] == ["dji_gimbal_command", "dji_rth"]
+    assert connection.messages[1]["seq"] > connection.messages[0]["seq"]
+
+    _queue_command(bridge, CommandName.START_PATROL.value)
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, gimbal_pitch_deg=-15.0, is_flying=False)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert len(connection.messages) == 2
+
+
+def test_phase3_emits_only_zero_setpoints_while_grounded_configured_and_connected(monkeypatch):
+    monkeypatch.setenv("DRONTECT_DJI_PHASE3_ZERO_STICK", "1")
+    now = [100.0]
+    bridge = _make_bridge(now)
+    bridge.realtime_link._mark_connected()
+
+    class RecordingConnection:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, raw):
+            self.messages.append(json.loads(raw))
+
+    connection = RecordingConnection()
+    _feed_telemetry(bridge, now, is_flying=False)
+    _feed_ground_rc(bridge, now)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert bridge.phase1_telemetry_only
+    assert [m["type"] for m in connection.messages] == ["dji_setpoint"]
+    command = connection.messages[0]
+    assert command["velocity"] == {"x": 0.0, "y": 0.0, "z": 0.0}
+    assert command["sessionId"] == bridge.android_link._session_id
+    _queue_command(bridge, CommandName.START_PATROL.value)
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, is_flying=False)
+    _feed_ground_rc(bridge, now)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert bridge.logic.state is FlightState.IDLE
+    assert all(m["velocity"] == {"x": 0.0, "y": 0.0, "z": 0.0} for m in connection.messages)
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, is_flying=True)
+    _feed_ground_rc(bridge, now, is_flying=True)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert len(connection.messages) == 2
+    bridge.realtime_link._mark_disconnected()
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, is_flying=False)
+    _feed_ground_rc(bridge, now)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert len(connection.messages) == 2
+
+
+def test_phase3_zero_heartbeat_survives_gps_gap_but_not_ground_safety_gap(monkeypatch):
+    monkeypatch.setenv("DRONTECT_DJI_PHASE3_ZERO_STICK", "1")
+    now = [100.0]
+    bridge = _make_bridge(now)
+    bridge.realtime_link._mark_connected()
+
+    class RecordingConnection:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, raw):
+            self.messages.append(json.loads(raw))
+
+    connection = RecordingConnection()
+    _feed_telemetry(bridge, now)
+    _feed_ground_rc(bridge, now)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert len(connection.messages) == 1
+
+    now[0] += 1.5  # GPS/position is stale, but grounded RC safety is current.
+    _feed_ground_rc(bridge, now)
+    outcome = asyncio.run(bridge.run_tick_once())
+    assert not outcome.has_position
+    assert len(connection.messages) == 2
+    assert all(message["velocity"] == {"x": 0.0, "y": 0.0, "z": 0.0}
+               for message in connection.messages)
+
+    now[0] += 0.05
+    _feed_ground_rc(bridge, now, right=0.1)
+    asyncio.run(bridge.run_tick_once())
+    assert len(connection.messages) == 2
+
+    now[0] += 0.05
+    _feed_ground_rc(bridge, now, is_flying=True)
+    asyncio.run(bridge.run_tick_once())
+    assert len(connection.messages) == 2
+
+    now[0] += 1.1  # Even a last-known safe state cannot keep control alive.
+    asyncio.run(bridge.run_tick_once())
+    assert len(connection.messages) == 2
+
+
+def test_phase2_applies_ui_operating_config_before_hardware_gps(monkeypatch):
+    monkeypatch.setenv("DRONTECT_DJI_PHASE1_TELEMETRY_ONLY", "1")
+    monkeypatch.setenv("DRONTECT_DJI_PHASE2_ACTIONS", "1")
+    now = [100.0]
+    bridge = _make_bridge(now, operating_config=None)
+    bridge.realtime_link._mark_connected()
+    _queue_command(bridge, CommandName.SET_OPERATING_CONFIG.value,
+        {"maxFlightRadiusM": 20.0, "cruiseAltitudeM": 1.5}, command_id="ui-config")
+
+    outcome = asyncio.run(bridge.run_tick_once())
+
+    assert not outcome.has_position
+    assert bridge.is_configured_for_flight
+    assert bridge.operating_config == OperatingConfig(20.0, 1.5)
+    assert bridge.logic.config.takeoff_altitude == 1.5
+    result = bridge.realtime_link._control_outgoing.get_nowait()
+    assert result["commandId"] == "ui-config"
+    assert result["accepted"] is True
+    assert result["pending"] is False
+
+
+def test_phase2_flag_cannot_select_legacy_setpoint_path(monkeypatch):
+    monkeypatch.setenv("DRONTECT_DJI_PHASE1_TELEMETRY_ONLY", "0")
+    monkeypatch.setenv("DRONTECT_DJI_PHASE2_ACTIONS", "1")
+    bridge = _make_bridge([100.0], operating_config=None)
+    assert bridge.phase1_telemetry_only
+    assert bridge.phase2_actions
+
+
+def test_phase2_hardware_reconnect_drops_actions_but_preserves_config_sync(monkeypatch):
+    monkeypatch.setenv("DRONTECT_DJI_PHASE1_TELEMETRY_ONLY", "1")
+    monkeypatch.setenv("DRONTECT_DJI_PHASE2_ACTIONS", "1")
+    now = [100.0]
+    bridge = _make_bridge(now, operating_config=None)
+    bridge.realtime_link._mark_connected()
+    _feed_telemetry(bridge, now, gimbal_pitch_deg=-15.0)
+    _queue_command(bridge, CommandName.CAMERA_TILT_UP.value, command_id="old-action")
+    _queue_command(bridge, CommandName.SET_OPERATING_CONFIG.value,
+        {"maxFlightRadiusM": 20.0, "cruiseAltitudeM": 1.5}, command_id="sync")
+
+    bridge.tick(0.05, now=now[0])
+
+    assert bridge.is_configured_for_flight
+    assert bridge.realtime_link._control_outgoing.get_nowait()["commandId"] == "sync"
+    assert bridge._pending_phase2_actions == []
 
 
 def _make_airborne(bridge: DjiFlightBridge, now: list[float]) -> None:
@@ -681,3 +897,175 @@ def test_set_operating_config_is_deferred_while_target_tracking():
     assert bridge.operating_config.cruise_altitude_m == 15.0
     assert bridge._pending_operating_config is not None
     assert bridge._pending_operating_config.cruise_altitude_m == 25.0
+
+
+# -- real-DJI session-home lifecycle -----------------------------------------
+# The aircraft-session lifecycle this bridge uses: one DjiFlightBridge process
+# lifetime is one session. session_home is captured exactly once, from the
+# first Android telemetry sample that is both a complete GPS fix and
+# explicitly grounded (is_flying is False, never on None/unknown or True); it
+# never resets on an AndroidLink reconnect (a hardware-link auth/replay
+# -protection concept -- see android_link.py's session_generation -- that is
+# deliberately unrelated to where home is), and it never persists across a
+# process restart, so a restart mid-flight cannot silently adopt an airborne
+# position as home. See DjiFlightBridge._maybe_establish_session_home.
+
+# Deliberately far from DEFAULT_HOME (Tel Aviv) so any test that accidentally
+# still computes geometry against DEFAULT_HOME fails loudly.
+FAR_AWAY_FIX = Wgs84Point(lat=35.6762, lng=139.6503)  # Tokyo
+
+
+def test_session_home_captured_from_first_grounded_fix_and_used_for_position():
+    now = [0.0]
+    bridge = _make_bridge(now)
+    assert bridge.session_home is None
+
+    _feed_telemetry(bridge, now, lat=FAR_AWAY_FIX.lat, lng=FAR_AWAY_FIX.lng, is_flying=False)
+    outcome = bridge.tick(0.05, now=now[0])
+
+    assert bridge.session_home == FAR_AWAY_FIX
+    # Reported relative to the far-away fix (near the local origin), not the
+    # thousands of kilometers away DEFAULT_HOME would put it at.
+    assert outcome.has_position is True
+    assert abs(outcome.position[0]) < 5.0
+    assert abs(outcome.position[1]) < 5.0
+
+
+def test_session_home_fails_closed_on_airborne_or_unknown_first_fix():
+    now = [0.0]
+    bridge = _make_bridge(now)
+
+    _feed_telemetry(bridge, now, lat=FAR_AWAY_FIX.lat, lng=FAR_AWAY_FIX.lng, is_flying=True)
+    outcome = bridge.tick(0.05, now=now[0])
+    assert bridge.session_home is None
+    assert outcome.has_position is False
+
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, lat=FAR_AWAY_FIX.lat, lng=FAR_AWAY_FIX.lng, is_flying=None)
+    outcome = bridge.tick(0.05, now=now[0])
+    assert bridge.session_home is None
+    assert outcome.has_position is False
+
+    # Only an explicitly-grounded sample establishes it.
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, lat=FAR_AWAY_FIX.lat, lng=FAR_AWAY_FIX.lng, is_flying=False)
+    outcome = bridge.tick(0.05, now=now[0])
+    assert bridge.session_home == FAR_AWAY_FIX
+    assert outcome.has_position is True
+
+
+def test_session_home_survives_a_transient_android_link_reconnect():
+    now = [0.0]
+    bridge = _make_bridge(now)
+    _feed_telemetry(bridge, now, lat=FAR_AWAY_FIX.lat, lng=FAR_AWAY_FIX.lng, is_flying=False)
+    bridge.tick(0.05, now=now[0])
+    assert bridge.session_home == FAR_AWAY_FIX
+
+    # A network blip: AndroidLink disconnects and reconnects (bumping
+    # session_generation, which resets local-frame kinematic state) without
+    # the bridge process restarting.
+    bridge.android_link._connection = None
+    bridge.android_link._mark_disconnected()
+    now[0] += 0.1
+    _feed_telemetry(bridge, now, lat=FAR_AWAY_FIX.lat, lng=FAR_AWAY_FIX.lng, is_flying=False)
+    bridge.tick(0.05, now=now[0])
+
+    assert bridge.session_home == FAR_AWAY_FIX
+
+
+def test_new_bridge_process_starts_a_genuinely_new_session():
+    """A new DjiFlightBridge instance -- what a process restart is -- has no
+    session_home and no leftover patrol priorities."""
+    now = [0.0]
+    first = _make_bridge(now)
+    _feed_telemetry(first, now, lat=FAR_AWAY_FIX.lat, lng=FAR_AWAY_FIX.lng, is_flying=False)
+    first.tick(0.05, now=now[0])
+    first.patrol_regions.set_priority(first.patrol_regions.regions[0].id, 1)
+    assert first.session_home == FAR_AWAY_FIX
+
+    second = _make_bridge(now)
+    assert second.session_home is None
+    assert all(region.priority is None for region in second.patrol_regions.regions)
+
+
+def test_patrol_and_roi_geometry_use_session_home_not_default_home():
+    now = [0.0]
+    bridge = _make_bridge(now)
+    _feed_telemetry(bridge, now, lat=FAR_AWAY_FIX.lat, lng=FAR_AWAY_FIX.lng, is_flying=False)
+    bridge.tick(0.05, now=now[0])
+    assert bridge.session_home == FAR_AWAY_FIX
+
+    region = bridge.patrol_regions.regions[0]
+    assert wgs84_distance_m(region.center, FAR_AWAY_FIX) < wgs84_distance_m(region.center, DEFAULT_HOME)
+
+    _make_airborne(bridge, now)
+    assert bridge._target_patrol_region_id is not None
+    target = bridge.logic.target
+    assert target is not None
+    # A small local-meters displacement from the (0,0)-ish local origin at
+    # the far-away home -- not thousands of km off, which is what using
+    # DEFAULT_HOME's frame here would produce.
+    assert math.hypot(target[0], target[1]) < 10_000.0
+
+    roi_point = destination_point(FAR_AWAY_FIX, 100.0, 0.0)
+    _queue_command(
+        bridge, CommandName.SET_ROI.value,
+        {"center": {"lat": roi_point.lat, "lon": roi_point.lng}, "radiusM": 20.0},
+    )
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, lat=FAR_AWAY_FIX.lat, lng=FAR_AWAY_FIX.lng)
+    outcome = bridge.tick(0.05, now=now[0])
+    assert outcome.state in {FlightState.TRANSITING_TO_ROI.value, FlightState.TAKING_OFF.value}
+
+
+def test_operating_config_change_keeps_patrol_geometry_anchored_to_session_home():
+    now = [0.0]
+    bridge = _make_bridge(now)
+    _feed_telemetry(bridge, now, lat=FAR_AWAY_FIX.lat, lng=FAR_AWAY_FIX.lng, is_flying=False)
+    bridge.tick(0.05, now=now[0])
+    assert bridge.session_home == FAR_AWAY_FIX
+
+    _queue_command(
+        bridge, CommandName.SET_OPERATING_CONFIG.value,
+        {"maxFlightRadiusM": 500.0, "cruiseAltitudeM": 25.0}, command_id="config-far",
+    )
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, lat=FAR_AWAY_FIX.lat, lng=FAR_AWAY_FIX.lng, is_flying=False)
+    bridge.tick(0.05, now=now[0])
+
+    assert bridge.operating_config.max_flight_radius_m == 500.0
+    region = bridge.patrol_regions.regions[0]
+    assert wgs84_distance_m(region.center, FAR_AWAY_FIX) < wgs84_distance_m(region.center, DEFAULT_HOME)
+
+
+def test_phase2_rth_still_reachable_before_session_home_is_established(monkeypatch):
+    """send_rth must stay reachable even while session_home is unset (e.g. a
+    bridge restart that comes back up mid-flight, so the first telemetry
+    sample reports is_flying=True) -- a degraded/unconfirmed state is exactly
+    when a go-home request matters most."""
+    monkeypatch.setenv("DRONTECT_DJI_PHASE1_TELEMETRY_ONLY", "1")
+    monkeypatch.setenv("DRONTECT_DJI_PHASE2_ACTIONS", "1")
+    now = [100.0]
+    bridge = _make_bridge(now)
+    bridge.realtime_link._mark_connected()
+
+    class RecordingConnection:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, raw):
+            self.messages.append(json.loads(raw))
+
+    connection = RecordingConnection()
+    _feed_telemetry(bridge, now, is_flying=True)  # airborne on first contact
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert bridge.session_home is None
+
+    _queue_command(bridge, CommandName.RETURN_HOME.value)
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, is_flying=True)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+
+    assert [m["type"] for m in connection.messages] == ["dji_rth"]

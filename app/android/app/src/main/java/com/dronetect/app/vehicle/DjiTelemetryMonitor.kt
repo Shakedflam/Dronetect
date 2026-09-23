@@ -8,9 +8,10 @@ import dji.sdk.keyvalue.key.BatteryKey
 import dji.sdk.keyvalue.key.DJIKey
 import dji.sdk.keyvalue.key.FlightControllerKey
 import dji.sdk.keyvalue.key.KeyTools
+import dji.sdk.keyvalue.key.GimbalKey
+import dji.sdk.keyvalue.key.RemoteControllerKey
 import dji.sdk.keyvalue.value.common.ComponentIndexType
 import dji.sdk.keyvalue.value.common.LocationCoordinate3D
-import dji.sdk.keyvalue.value.flightcontroller.GPSSignalLevel
 import dji.v5.manager.KeyManager
 import java.util.Locale
 
@@ -22,8 +23,18 @@ data class DjiTelemetrySnapshot(
     val headingDegrees: Double? = null,
     val batteryPercent: Int? = null,
     val gpsSatelliteCount: Int? = null,
-    val gpsSignalLevel: GPSSignalLevel? = null,
+    val gpsSignalLevel: String? = null,
     val isFlying: Boolean? = null,
+    val aircraftConnected: Boolean? = null,
+    val speedMetersPerSecond: Double? = null,
+    val flightMode: String? = null,
+    val goHomeState: String? = null,
+    val gimbalPitchDegrees: Double? = null,
+    val rcConnected: Boolean? = null,
+    val rcLeftHorizontal: Int? = null,
+    val rcLeftVertical: Int? = null,
+    val rcRightHorizontal: Int? = null,
+    val rcRightVertical: Int? = null,
 )
 
 /** Owns only listenable, non-settable DJI telemetry keys. */
@@ -96,10 +107,46 @@ class DjiTelemetryMonitor(private val onSnapshotChanged: (DjiTelemetrySnapshot) 
             update { copy(gpsSatelliteCount = count?.takeIf { it >= 0 }) }
         }
         listen("gps_signal", gpsSignalLevelKey) { level ->
-            update { copy(gpsSignalLevel = level) }
+            update { copy(gpsSignalLevel = level?.name) }
         }
         listen("flight_state", isFlyingKey) { flying ->
             update { copy(isFlying = flying) }
+        }
+        listen("aircraft_connection", KeyTools.createKey(FlightControllerKey.KeyConnection)) { connected ->
+            update { copy(aircraftConnected = connected) }
+        }
+        listen("velocity", KeyTools.createKey(FlightControllerKey.KeyAircraftVelocity)) { velocity ->
+            val x = velocity?.x
+            val y = velocity?.y
+            val z = velocity?.z
+            val speed = if (x != null && y != null && z != null &&
+                x.isFinite() && y.isFinite() && z.isFinite()) Math.hypot(Math.hypot(x, y), z) else null
+            update { copy(speedMetersPerSecond = speed) }
+        }
+        listen("flight_mode", KeyTools.createKey(FlightControllerKey.KeyFlightMode)) { mode ->
+            update { copy(flightMode = mode?.name) }
+        }
+        listen("go_home_state", KeyTools.createKey(FlightControllerKey.KeyGoHomeStatus)) { state ->
+            update { copy(goHomeState = state?.name) }
+        }
+        val main = ComponentIndexType.LEFT_OR_MAIN
+        listen("gimbal_attitude", KeyTools.createKey(GimbalKey.KeyGimbalAttitude, main)) { attitude ->
+            update { copy(gimbalPitchDegrees = attitude?.pitch?.takeIf(Double::isFinite)) }
+        }
+        listen("rc_connection", KeyTools.createKey(RemoteControllerKey.KeyConnection)) { connected ->
+            update { copy(rcConnected = connected) }
+        }
+        listen("rc_left_horizontal", KeyTools.createKey(RemoteControllerKey.KeyStickLeftHorizontal)) { value ->
+            update { copy(rcLeftHorizontal = value?.takeIf { it in -660..660 }) }
+        }
+        listen("rc_left_vertical", KeyTools.createKey(RemoteControllerKey.KeyStickLeftVertical)) { value ->
+            update { copy(rcLeftVertical = value?.takeIf { it in -660..660 }) }
+        }
+        listen("rc_right_horizontal", KeyTools.createKey(RemoteControllerKey.KeyStickRightHorizontal)) { value ->
+            update { copy(rcRightHorizontal = value?.takeIf { it in -660..660 }) }
+        }
+        listen("rc_right_vertical", KeyTools.createKey(RemoteControllerKey.KeyStickRightVertical)) { value ->
+            update { copy(rcRightVertical = value?.takeIf { it in -660..660 }) }
         }
     }
 

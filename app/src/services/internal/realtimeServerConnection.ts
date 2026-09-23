@@ -64,6 +64,14 @@ export interface MissionStatusMessage {
   manualControlActive: boolean;
   /** Which stick the aircraft is flying. 'rc' means a bound remote controller. */
   manualInputSource: ManualInputSource;
+  /**
+   * The confirmed real-DJI session home, captured server-side once from the
+   * first grounded DJI telemetry sample -- null for simulator/browser mode
+   * and until a real DJI session confirms one. This is the home patrol/ROI
+   * geometry must use once real-DJI, not the static HOME_REFERENCE fallback
+   * -- see locationService.ts's subscribeHome/subscribeGeometryReady.
+   */
+  sessionHome: { lat: number; lng: number } | null;
   activeRoi: { center: { lat: number; lon: number }; radiusM: number } | null;
   patrol: {
     priorities: Array<{ regionId: string; rank: number }>;
@@ -294,6 +302,10 @@ function isMissionStatusMessage(value: unknown): value is MissionStatusMessage {
   if (typeof message.pursuitBlocked !== 'boolean') return false;
   if (typeof message.manualControlActive !== 'boolean') return false;
   if (message.manualInputSource !== 'tablet' && message.manualInputSource !== 'rc') return false;
+  if (message.sessionHome !== null && message.sessionHome !== undefined) {
+    const home = message.sessionHome as Record<string, unknown>;
+    if (typeof home !== 'object' || typeof home.lat !== 'number' || typeof home.lng !== 'number') return false;
+  }
   if (message.activeRoi !== null) {
     if (typeof message.activeRoi !== 'object') return false;
     const roi = message.activeRoi as Record<string, unknown>;

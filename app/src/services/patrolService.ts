@@ -1,11 +1,20 @@
+import type { Coordinates } from '../types/drone';
 import type { PatrolAreaType, PatrolConfig, PatrolRegion } from '../types/patrol';
 import type { Unsubscribe } from './internal/unsubscribe';
 import { generatePatrolRegions } from '../utils/patrolGeometry';
 import { HOME_RADIUS_METERS, HOME_REFERENCE } from '../config/mapConfig';
+import { locationService } from './locationService';
 import { realtimeServerConnection } from './internal/realtimeServerConnection';
 
-/** Geometry is rebuilt atomically after an accepted operating-config update. */
-let patrolRegions: readonly PatrolRegion[] = generatePatrolRegions(HOME_REFERENCE, HOME_RADIUS_METERS);
+// Regenerated atomically whenever either input changes: an accepted
+// operating-config radius update (setMaxFlightRadius), or this session's
+// home resolving to the backend-confirmed real-DJI one (see
+// locationService.ts's subscribeHome) instead of the static HOME_REFERENCE
+// fallback — otherwise polygons/region centers would stay anchored to
+// HOME_REFERENCE even once the backend confirms a real session home.
+let currentHome: Coordinates = HOME_REFERENCE;
+let currentRadiusM: number = HOME_RADIUS_METERS;
+let patrolRegions: readonly PatrolRegion[] = generatePatrolRegions(currentHome, currentRadiusM);
 
 /**
  * Abstraction over "how are patrol regions currently prioritized".
@@ -77,6 +86,12 @@ function createInMemoryPatrolService(): PatrolService {
       });
   }
 
+  locationService.subscribeHome((home) => {
+    currentHome = home;
+    patrolRegions = generatePatrolRegions(currentHome, currentRadiusM);
+    notify();
+  });
+
   realtimeServerConnection.subscribeMissionStatus((status) => {
     authoritativePriorityOrder = status.patrol.priorities
       .slice()
@@ -138,8 +153,8 @@ function createInMemoryPatrolService(): PatrolService {
       if (!Number.isFinite(radiusM) || radiusM <= 0) {
         throw new Error('Maximum flight radius must be a positive number');
       }
-      const replacement = generatePatrolRegions(HOME_REFERENCE, radiusM);
-      patrolRegions = replacement;
+      currentRadiusM = radiusM;
+      patrolRegions = generatePatrolRegions(currentHome, currentRadiusM);
       notify();
     },
   };

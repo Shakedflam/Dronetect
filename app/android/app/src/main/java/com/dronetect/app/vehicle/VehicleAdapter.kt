@@ -11,7 +11,10 @@ interface VehicleAdapter {
 
     fun stop()
 
-    fun handleCommand(command: VehicleCommand): CommandResult
+    fun handleCommand(command: VehicleCommand, complete: (CommandResult) -> Unit)
+
+    /** Invalidate asynchronous command work from a socket that is no longer live. */
+    fun onControlLinkLost()
 
     fun telemetrySnapshot(): VehicleTelemetry?
 
@@ -47,6 +50,7 @@ data class VehicleTelemetry(
     val aircraftSafetyRthActive: Boolean = false,
     val aircraftSafetyRthReason: String? = null,
     val manualInputSource: String = "rc",
+    val pursuitBlocked: Boolean = false,
 )
 
 data class VehicleVideoFrame(

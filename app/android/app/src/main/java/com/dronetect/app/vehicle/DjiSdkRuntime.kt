@@ -2,6 +2,7 @@ package com.dronetect.app.vehicle
 
 import android.content.Context
 import android.util.Log
+import com.dronetect.app.BuildConfig
 import dji.v5.common.error.IDJIError
 import dji.v5.common.register.DJISDKInitEvent
 import dji.v5.manager.SDKManager
@@ -31,6 +32,10 @@ object DjiSdkRuntime {
     )
     private val telemetryMonitor = DjiTelemetryMonitor { publishTelemetry(it) }
     private val videoIngest = DjiVideoIngestService()
+    private val droneRealtime by lazy {
+        DroneRealtimeClient("wss://api.dronetect.tech",
+            BuildConfig.DRONTECT_DJI_BRIDGE_TOKEN, ::telemetryState)
+    }
 
     fun telemetrySnapshot(): DjiTelemetrySnapshot = telemetryMonitor.snapshot()
 
@@ -67,6 +72,11 @@ object DjiSdkRuntime {
                 object : SDKManagerCallback {
                     override fun onRegisterSuccess() {
                         Log.i(TAG, "registration=success")
+                        try {
+                            droneRealtime.start()
+                        } catch (error: Exception) {
+                            Log.e(TAG, "drone_ws=start_failed type=${error.javaClass.simpleName}")
+                        }
                     }
 
                     override fun onRegisterFailure(error: IDJIError) {
@@ -83,6 +93,7 @@ object DjiSdkRuntime {
                         telemetryMonitor.stop("product_disconnected")
                         videoIngest.stop("product_disconnected")
                         publishTelemetry()
+                        droneRealtime.onAircraftChanged()
                         Log.i(TAG, "product=disconnected productId=$productId")
                     }
 
@@ -97,9 +108,10 @@ object DjiSdkRuntime {
                     override fun onProductChanged(productId: Int) {
                         Log.i(TAG, "product=changed productId=$productId")
                         if (productConnected.get()) {
+                            publishTelemetry(DjiTelemetrySnapshot())
+                            droneRealtime.onAircraftChanged()
                             telemetryMonitor.restart(productId)
                             videoIngest.restart(productId)
-                            publishTelemetry(DjiTelemetrySnapshot())
                         }
                     }
 

@@ -58,7 +58,8 @@ def test_telemetry_rejects_wrong_type():
 
 
 def test_rc_state_round_trips():
-    state = AndroidRcState(timestamp=1.0, connected=True, forward=0.5, right=-0.25, up=0.0, yaw_rate=0.1)
+    state = AndroidRcState(timestamp=1.0, connected=True, forward=0.5, right=-0.25,
+                           up=0.0, yaw_rate=0.1, aircraft_connected=True, is_flying=False)
     message = build_android_rc_state_message(state)
     assert message["type"] == "dji_rc_state"
     assert validate_android_rc_state_message(message) == state

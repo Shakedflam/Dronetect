@@ -16,6 +16,10 @@ def djiApiKey = localProperties.getProperty('DJI_API_KEY')
 if (!djiApiKey?.trim()) {
     throw new GradleException('DJI_API_KEY must be set in app/android/local.properties')
 }
+def djiBridgeToken = localProperties.getProperty('DRONTECT_DJI_BRIDGE_TOKEN', '').trim()
+if (djiBridgeToken && !(djiBridgeToken ==~ /[A-Fa-f0-9]{64}/)) {
+    throw new GradleException('DRONTECT_DJI_BRIDGE_TOKEN must be 64 hex characters in app/android/local.properties')
+}
 
 // The native video-ingest client must reach the same backend the packaged
 // WebView UI is built against, so it reads the SAME app/.env.android value
@@ -71,6 +75,7 @@ android {
             DJI_API_KEY: djiApiKey
         ]
         buildConfigField "String", "DRONTECT_REALTIME_WS_ORIGIN", "\"${realtimeOrigin}\""
+        buildConfigField "String", "DRONTECT_DJI_BRIDGE_TOKEN", "\"${djiBridgeToken}\""
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -117,6 +122,8 @@ dependencies {
     implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
     implementation project(':capacitor-android')
     testImplementation "junit:junit:$junitVersion"
+    testImplementation "org.json:json:20240303"
+    testImplementation "com.squareup.okhttp3:mockwebserver:3.14.9"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')

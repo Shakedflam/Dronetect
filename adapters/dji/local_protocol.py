@@ -1,10 +1,8 @@
-"""Local wire protocol between the DJI flight bridge and the Android DJI layer.
+"""Hardware wire protocol between the DJI flight bridge and Android.
 
 This is deliberately a *separate* protocol from realtime_server's tablet/drone
 facing one (`realtime_server/protocol.py`). It never leaves the aircraft's own
-local link -- the bridge process and the Android app are expected to be on the
-same device or the same LAN/hotspot, not routed through the cloud realtime
-server. Keeping it separate means:
+hardware link over authenticated WSS. Keeping it separate means:
 
 - realtime_server, the tablet app, and vision_server never need to know this
   protocol exists.
@@ -19,7 +17,7 @@ Message shapes, Android -> bridge:
       cycle, so it is the message the bridge's fail-safe logic (see
       android_link.py) treats as the "is this link still trustworthy" signal.
     - MESSAGE_TYPE_RC_STATE: whether the RC-N3's physical sticks are live and
-      what they're commanding, matching manual_input.RemoteController.
+      what they're commanding, plus aircraft-connected/grounded safety facts.
     - MESSAGE_TYPE_GIMBAL_STATE: confirmation of the gimbal's actual pitch,
       independent of the continuous telemetry.gimbalPitchDeg feed FlightLogic
       consumes -- useful for detecting a stalled/limited gimbal.
@@ -105,8 +103,9 @@ class AndroidTelemetry:
     heading_deg: float
     speed_mps: float
     battery_percent: float
-    gimbal_pitch_deg: float
+    gimbal_pitch_deg: float | None
     flight_mode: str
+    is_flying: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +116,8 @@ class AndroidRcState:
     right: float
     up: float
     yaw_rate: float
+    aircraft_connected: bool | None = None
+    is_flying: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,8 +175,9 @@ def validate_android_telemetry_message(message: dict[str, Any]) -> AndroidTeleme
         heading_deg=_required_number(message, "headingDeg"),
         speed_mps=_required_number(message, "speedMps"),
         battery_percent=_required_number(message, "batteryPercent"),
-        gimbal_pitch_deg=_required_number(message, "gimbalPitchDeg"),
+        gimbal_pitch_deg=_optional_number(message, "gimbalPitchDeg"),
         flight_mode=_optional_string(message, "flightMode") or "",
+        is_flying=_optional_bool(message, "isFlying"),
     )
 
 
@@ -190,6 +192,7 @@ def build_android_telemetry_message(telemetry: AndroidTelemetry) -> dict[str, An
         "batteryPercent": telemetry.battery_percent,
         "gimbalPitchDeg": telemetry.gimbal_pitch_deg,
         "flightMode": telemetry.flight_mode,
+        "isFlying": telemetry.is_flying,
     }
 
 
@@ -209,6 +212,8 @@ def validate_android_rc_state_message(message: dict[str, Any]) -> AndroidRcState
         right=values["right"],
         up=values["up"],
         yaw_rate=values["yawRate"],
+        aircraft_connected=_optional_bool(message, "aircraftConnected"),
+        is_flying=_optional_bool(message, "isFlying"),
     )
 
 
@@ -217,6 +222,8 @@ def build_android_rc_state_message(state: AndroidRcState) -> dict[str, Any]:
         "type": MESSAGE_TYPE_RC_STATE,
         "timestamp": state.timestamp,
         "connected": state.connected,
+        "aircraftConnected": state.aircraft_connected,
+        "isFlying": state.is_flying,
         "stick": {
             "forward": state.forward,
             "right": state.right,
@@ -334,6 +341,19 @@ def _required_number(message: dict[str, Any], key: str) -> float:
             details={"field": key},
         )
     return float(value)
+
+
+def _optional_number(message: dict[str, Any], key: str) -> float | None:
+    if message.get(key) is None:
+        return None
+    return _required_number(message, key)
+
+
+def _optional_bool(message: dict[str, Any], key: str) -> bool | None:
+    value = message.get(key)
+    if value is None or isinstance(value, bool):
+        return value
+    raise LocalProtocolError("validation_error", f"Optional boolean field '{key}' is invalid.")
 
 
 def _required_int(message: dict[str, Any], key: str) -> int:

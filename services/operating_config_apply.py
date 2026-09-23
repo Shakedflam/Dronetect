@@ -13,6 +13,7 @@ import math
 from typing import TYPE_CHECKING
 
 from config.shared_config import OperatingConfig
+from services.gps import DEFAULT_HOME, Wgs84Point
 from services.no_fly_router import NoFlyRouteUnavailable, NoFlyRouter
 from services.patrol_planner import PatrolPlanner
 from services.patrol_regions import PatrolAreaType, PatrolRegionStore
@@ -64,9 +65,16 @@ def plan_operating_config_transition(
     no_fly_router: NoFlyRouter,
     reposition_destination: Position | None = None,
     reposition_resume_state: str | None = None,
+    home: Wgs84Point = DEFAULT_HOME,
 ) -> OperatingConfigTransition:
     """Decide what to swap in for `candidate`, and whether the radius change
     requires flying to a new position before resuming patrol/ROI.
+
+    `home` is the geographic origin the rebuilt PatrolRegionStore's polygons
+    are generated around -- callers flying a real aircraft away from
+    DEFAULT_HOME (services/gps.py) must pass their session's confirmed home
+    here, or the rebuilt regions silently drift back to it on every
+    operating-config change.
 
     While patrolling the open grid, that position is the current local
     (x, y) multiplied by `candidate.max_flight_radius_m /
@@ -89,7 +97,7 @@ def plan_operating_config_transition(
         for region in patrol_regions.regions
         if region.area_type is not PatrolAreaType.PATROL
     ]
-    store = PatrolRegionStore(home_radius_m=candidate.max_flight_radius_m)
+    store = PatrolRegionStore(home=home, home_radius_m=candidate.max_flight_radius_m)
     store.replace_area_types(area_types)
     store.replace_priorities(priorities)
     planner = PatrolPlanner(

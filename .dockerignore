@@ -14,8 +14,6 @@ artifacts/
 docs/
 tests/
 tools/
-controllers/
-adapters/
 
 *.pt
 models/

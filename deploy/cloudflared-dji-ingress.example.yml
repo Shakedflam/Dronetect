@@ -1,0 +1,9 @@
+# Insert these rules before the existing catch-all ingress rule in the
+# Cloudflare Tunnel configuration on the EC2 host. Keep existing video paths.
+ingress:
+  - hostname: api.dronetect.tech
+    path: /dji/bridge
+    service: http://127.0.0.1:8790
+  - hostname: api.dronetect.tech
+    service: http://127.0.0.1:8765
+  - service: http_status:404

@@ -36,6 +36,8 @@ class SimulatorRealtimeClient:
         url: str | None = None,
         *,
         clock: Callable[[], float] = time.monotonic,
+        telemetry_max_age_s: float | None = None,
+        clear_inbound_on_connect: bool = False,
     ) -> None:
         self.url = url or os.getenv("DRONTECT_SIMULATOR_WS_URL", DEFAULT_SERVER_URL)
         self._outgoing: Queue[dict[str, Any]] = Queue(maxsize=10)
@@ -45,6 +47,8 @@ class SimulatorRealtimeClient:
         self._stop = Event()
         self._thread: Thread | None = None
         self._clock = clock
+        self._telemetry_max_age_s = telemetry_max_age_s
+        self._clear_inbound_on_connect = clear_inbound_on_connect
         self._connected = Event()
         self._ever_connected = Event()
         self._connection_state_lock = Lock()
@@ -142,6 +146,9 @@ class SimulatorRealtimeClient:
                     await asyncio.sleep(RECONNECT_DELAY_S)
 
     def _mark_connected(self) -> None:
+        if self._clear_inbound_on_connect:
+            self.drain_commands()
+            self.drain_detections()
         with self._connection_state_lock:
             self._disconnected_at = None
         self._ever_connected.set()
@@ -188,5 +195,8 @@ class SimulatorRealtimeClient:
                     QUEUE_TIMEOUT_S,
                 )
             except Empty:
+                continue
+            if (self._telemetry_max_age_s is not None and
+                time.time() - telemetry.get("timestamp", 0) > self._telemetry_max_age_s):
                 continue
             await websocket.send(encode_message(telemetry))

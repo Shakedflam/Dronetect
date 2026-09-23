@@ -5,6 +5,7 @@ import pytest
 from config.shared_config import OperatingConfig
 from controllers.autonomous_drone.pursuit import PursuitConfig
 from controllers.autonomous_drone.roi_patrol import RoiPatrolConfig
+from services.gps import DEFAULT_HOME, Wgs84Point, wgs84_distance_m
 from services.no_fly_router import NoFlyRouteUnavailable, NoFlyRouter
 from services.operating_config_apply import plan_operating_config_transition
 from services.patrol_planner import PatrolPlanner
@@ -24,8 +25,9 @@ def _plan(
     no_fly_router=None,
     reposition_destination=None,
     reposition_resume_state=None,
+    home=DEFAULT_HOME,
 ):
-    patrol_regions = PatrolRegionStore(home_radius_m=old_radius)
+    patrol_regions = PatrolRegionStore(home=home, home_radius_m=old_radius)
     return plan_operating_config_transition(
         reposition_destination=reposition_destination,
         reposition_resume_state=reposition_resume_state,
@@ -40,7 +42,26 @@ def _plan(
         pursuit_config=PursuitConfig(geofence_radius_m=old_radius),
         roi_config=RoiPatrolConfig(max_flight_radius_m=old_radius),
         no_fly_router=no_fly_router or NoFlyRouter(),
+        home=home,
     )
+
+
+def test_home_defaults_to_default_home_unchanged_for_simulator_callers():
+    """autonomous_drone.py (the simulator caller) never passes `home` --
+    confirms the new parameter is purely additive and simulator geometry is
+    unaffected."""
+    transition = _plan(current_flight_state="PATROLLING", old_radius=300.0, new_radius=150.0)
+    assert transition.store.regions[0].center == PatrolRegionStore(home_radius_m=150.0).regions[0].center
+
+
+def test_explicit_home_rehomes_the_rebuilt_store():
+    """A real-DJI caller (adapters/dji/flight_bridge.py) passes its session's
+    confirmed home; the rebuilt store's region geometry must be generated
+    around *that* home, not silently fall back to DEFAULT_HOME."""
+    far_away_home = Wgs84Point(lat=35.6762, lng=139.6503)  # Tokyo
+    transition = _plan(current_flight_state="PATROLLING", home=far_away_home)
+    region = transition.store.regions[0]
+    assert wgs84_distance_m(region.center, far_away_home) < wgs84_distance_m(region.center, DEFAULT_HOME)
 
 
 def test_radius_change_while_patrolling_triggers_reposition_and_discards_progress():

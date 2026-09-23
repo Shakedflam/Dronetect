@@ -8,6 +8,8 @@ socket. One end-to-end test exercises the actual local WebSocket server.
 
 import asyncio
 import json
+import time
+from dataclasses import replace
 
 import pytest
 from websockets.asyncio.client import connect
@@ -93,6 +95,57 @@ def test_send_setpoint_succeeds_with_fresh_telemetry():
     assert len(sent_messages) == 1
     assert sent_messages[0]["type"] == "dji_setpoint"
     assert sent_messages[0]["velocity"] == {"x": 1.0, "y": 2.0, "z": -0.5}
+    assert sent_messages[0]["sessionId"] == link._session_id
+    assert sent_messages[0]["seq"] > 0
+
+
+def test_zero_ground_setpoint_uses_fresh_rc_safety_not_gps():
+    now = [10.0]
+    link = _connected_link(now)
+    safe = AndroidRcState(timestamp=time.time(), connected=True,
+                          forward=0.0, right=0.0, up=0.0, yaw_rate=0.0,
+                          aircraft_connected=True, is_flying=False)
+    link._handle_message(json.dumps(build_android_rc_state_message(safe)))
+    assert link.latest_telemetry is None
+    assert asyncio.run(link.send_zero_ground_test_setpoint(
+        ttl_ms=250, safety_timeout_s=1.0))
+    assert json.loads(link._connection.sent_raw[0])["velocity"] == {
+        "x": 0.0, "y": 0.0, "z": 0.0}
+    assert not asyncio.run(link.send_setpoint(
+        velocity_x_mps=1.0, velocity_y_mps=0.0, velocity_z_mps=0.0,
+        yaw_deg=0.0, ttl_ms=250, telemetry_timeout_s=1.0))
+
+    for unsafe in (replace(safe, right=0.1), replace(safe, connected=False),
+                   replace(safe, aircraft_connected=False),
+                   replace(safe, is_flying=True), replace(safe, is_flying=None)):
+        link._handle_message(json.dumps(build_android_rc_state_message(unsafe)))
+        assert not asyncio.run(link.send_zero_ground_test_setpoint(
+            ttl_ms=250, safety_timeout_s=1.0))
+    link._handle_message(json.dumps(build_android_rc_state_message(safe)))
+    now[0] += 1.1
+    assert not asyncio.run(link.send_zero_ground_test_setpoint(
+        ttl_ms=250, safety_timeout_s=1.0))
+
+
+def test_authenticated_clock_probe_echoes_tablet_timestamp_and_server_receive_time():
+    link = AndroidLink(auth_token="a" * 64)
+    link._connection = _FakeConnection()
+    link._mark_connected()
+    probe = time.time()
+    response = link._handle_message(json.dumps({
+        "type": "dji_clock_probe", "sessionId": link._session_id,
+        "seq": 1, "timestamp": probe,
+    }))
+    assert response is not None
+    assert response["type"] == "dji_clock_sync"
+    assert response["sessionId"] == link._session_id
+    assert response["probeTimestamp"] == probe
+    assert abs(response["serverReceivedAt"] - time.time()) < 1.0
+    assert link._last_sequence == 1
+    assert link._handle_message(json.dumps({
+        "type": "dji_clock_probe", "sessionId": "b" * 32,
+        "seq": 2, "timestamp": time.time(),
+    })) is None
 
 
 def test_send_rth_ignores_telemetry_freshness():
@@ -185,6 +238,64 @@ def test_handle_message_updates_rc_and_gimbal_state():
     assert link.latest_gimbal_state == AndroidGimbalState(2.0, -30.0)
 
 
+def test_authenticated_session_rejects_stale_and_wrong_session_and_clears_on_disconnect():
+    link = AndroidLink(auth_token="a" * 64)
+    link._connection = _FakeConnection()
+    link._mark_connected()
+    message = build_android_telemetry_message(
+        AndroidTelemetry(time.time(), 32.0, 34.8, 15.0, 90.0, 0.0, 64.0, None, "GPS_ATTI")
+    )
+    message.update(sessionId=link._session_id, seq=1)
+    link._handle_message(json.dumps(message))
+    assert link.latest_telemetry is not None
+    old_session = link._session_id
+    link._connection = None
+    link._mark_disconnected()
+    assert link.latest_telemetry is None
+    link._connection = _FakeConnection()
+    link._mark_connected()
+    assert link._session_id != old_session
+    link._handle_message(json.dumps(message))
+    assert link.latest_telemetry is None
+    message.update(sessionId=link._session_id, timestamp=time.time() - 10)
+    link._handle_message(json.dumps(message))
+    assert link.latest_telemetry is None
+    message["timestamp"] = time.time()
+    link._handle_message(json.dumps(message))
+    assert link.latest_telemetry is not None
+    message["gps"] = {"lat": 33.0, "lng": 35.0}
+    link._handle_message(json.dumps(message))
+    assert link.latest_telemetry.lat == 32.0  # duplicate sequence refused
+
+
+def test_remote_socket_requires_bearer_token_and_exact_path():
+    async def scenario():
+        link = AndroidLink(host="127.0.0.1", port=0, auth_token="a" * 64)
+        task = asyncio.create_task(link.serve_forever())
+        try:
+            for _ in range(50):
+                if link._server is not None:
+                    break
+                await asyncio.sleep(0.01)
+            port = link._server.sockets[0].getsockname()[1]
+            async with connect(f"ws://127.0.0.1:{port}/dji/bridge") as unauthenticated:
+                await unauthenticated.wait_closed()
+                assert not link.connected
+            async with connect(f"ws://127.0.0.1:{port}/wrong",
+                               additional_headers={"Authorization": "Bearer " + "a" * 64}) as wrong_path:
+                await wrong_path.wait_closed()
+                assert not link.connected
+            async with connect(f"ws://127.0.0.1:{port}/dji/bridge",
+                               additional_headers={"Authorization": "Bearer " + "a" * 64}) as android:
+                hello = json.loads(await android.recv())
+                assert hello["type"] == "dji_hello"
+                assert len(hello["sessionId"]) == 32
+                assert link.connected
+        finally:
+            task.cancel()
+    asyncio.run(scenario())
+
+
 # -- end-to-end over a real local socket -------------------------------------
 
 
@@ -212,6 +323,61 @@ def test_android_telemetry_reaches_the_link_over_a_real_socket():
 
                 assert link.latest_telemetry == telemetry
                 assert link.connected is True
+        finally:
+            server_task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_zero_setpoints_keep_50ms_cadence_with_concurrent_uplink():
+    """Telemetry and clock replies must not queue local downlink for seconds."""
+    async def scenario():
+        link = AndroidLink(host="127.0.0.1", port=0, auth_token="a" * 64)
+        server_task = asyncio.create_task(link.serve_forever())
+        try:
+            for _ in range(50):
+                if link._server is not None:
+                    break
+                await asyncio.sleep(0.01)
+            port = link._server.sockets[0].getsockname()[1]
+            async with connect(f"ws://127.0.0.1:{port}/dji/bridge",
+                               additional_headers={"Authorization": "Bearer " + "a" * 64}) as android:
+                session = json.loads(await android.recv())["sessionId"]
+                telemetry = build_android_telemetry_message(
+                    AndroidTelemetry(time.time(), 32.0, 34.8, 0.0, 90.0, 0.0, 64.0, 0.0, "GPS"))
+                telemetry.update(sessionId=session, seq=1, timestamp=time.time())
+                await android.send(json.dumps(telemetry))
+                for _ in range(50):
+                    if link.latest_telemetry is not None:
+                        break
+                    await asyncio.sleep(0.01)
+                assert link.latest_telemetry is not None
+
+                async def uplink():
+                    for seq in range(2, 12):
+                        message = {"type": "dji_clock_probe", "sessionId": session,
+                                   "seq": seq, "timestamp": time.time()}
+                        await android.send(json.dumps(message))
+                        await asyncio.sleep(0.05)
+
+                async def downlink():
+                    for _ in range(10):
+                        assert await link.send_setpoint(
+                            velocity_x_mps=0.0, velocity_y_mps=0.0,
+                            velocity_z_mps=0.0, yaw_deg=90.0, ttl_ms=250,
+                            telemetry_timeout_s=1.0)
+                        await asyncio.sleep(0.05)
+
+                sender = asyncio.create_task(downlink())
+                producer = asyncio.create_task(uplink())
+                ages_ms = []
+                while len(ages_ms) < 10:
+                    message = json.loads(await asyncio.wait_for(android.recv(), 2.0))
+                    if message["type"] == "dji_setpoint":
+                        ages_ms.append((time.time() - message["issuedAt"]) * 1000)
+                await sender
+                await producer
+                assert max(ages_ms) < 250
         finally:
             server_task.cancel()
 

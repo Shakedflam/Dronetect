@@ -1189,6 +1189,163 @@ def test_operating_config_pending_resets_on_drone_disconnect():
     asyncio.run(scenario())
 
 
+# -- real-DJI session-home lifecycle -----------------------------------------
+# Mirrors adapters/dji/flight_bridge.py's own session_home rule, computed
+# independently here from whatever telemetry this server receives (via the
+# AWS bridge, or a tablet connecting directly as role=drone -- see
+# DroneWireProtocol.kt): captured once, from the first source="dji" telemetry
+# sample reporting state=="LANDED" (grounded), and never moved again for this
+# process's lifetime. See RealtimeServer._session_home / _effective_home.
+
+FAR_AWAY_FIX = {"lat": 35.6762, "lng": 139.6503}  # Tokyo -- nowhere near DEFAULT_HOME
+
+
+def _dji_telemetry(*, lat, lng, state="LANDED", **overrides):
+    data = dict(
+        gps={"lat": lat, "lng": lng},
+        altitudeM=10.0,
+        headingDeg=0.0,
+        speedMps=0.0,
+        batteryPercent=90.0,
+        state=state,
+        targetPatrolRegionId=None,
+        aircraftSafetyRthActive=False,
+        aircraftSafetyRthReason=None,
+        targetFollowDiagnostics=None,
+        operatingConfigPending=False,
+        pursuitBlocked=False,
+        manualControlActive=False,
+        manualInputSource="tablet",
+    )
+    data.update(overrides)
+    return {"type": "telemetry", "timestamp": 1.0, "source": "dji", "data": data}
+
+
+def test_dji_session_home_is_used_for_set_roi_validation_and_reported_to_tablets():
+    async def scenario():
+        realtime_server = RealtimeServer()
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            base_url = f"ws://127.0.0.1:{port}/ws"
+            async with (
+                connect(f"{base_url}?role=drone") as drone,
+                connect(f"{base_url}?role=tablet") as tablet,
+            ):
+                initial = await _receive_initial_mission_state(tablet)
+                assert initial["sessionHome"] is None
+
+                # A DEFAULT_HOME-centered ROI is still accepted before any
+                # real-DJI session home is confirmed (simulator behavior).
+                await tablet.send(
+                    encode_message({
+                        "type": "command", "commandId": "roi-before",
+                        "command": "set_roi",
+                        "params": {
+                            "center": {"lat": DEFAULT_HOME.lat, "lon": DEFAULT_HOME.lng},
+                            "radiusM": 50.0,
+                        },
+                    })
+                )
+                await asyncio.wait_for(drone.recv(), 1.0)  # forwarded
+                await asyncio.wait_for(tablet.recv(), 1.0)  # command_ack
+                await asyncio.wait_for(tablet.recv(), 1.0)  # mission_status
+                await tablet.send(encode_message({
+                    "type": "command", "commandId": "clear-before",
+                    "command": "clear_roi", "params": {},
+                }))
+                await asyncio.wait_for(drone.recv(), 1.0)
+                await asyncio.wait_for(tablet.recv(), 1.0)
+                await asyncio.wait_for(tablet.recv(), 1.0)
+
+                await drone.send(encode_message(
+                    _dji_telemetry(lat=FAR_AWAY_FIX["lat"], lng=FAR_AWAY_FIX["lng"])
+                ))
+                status = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                await asyncio.wait_for(tablet.recv(), 1.0)  # telemetry echo
+                assert status["sessionHome"] == pytest.approx(FAR_AWAY_FIX)
+                assert realtime_server._session_home is not None
+
+                # Now a DEFAULT_HOME-centered ROI is rejected -- home moved.
+                await tablet.send(
+                    encode_message({
+                        "type": "command", "commandId": "roi-default-rejected",
+                        "command": "set_roi",
+                        "params": {
+                            "center": {"lat": DEFAULT_HOME.lat, "lon": DEFAULT_HOME.lng},
+                            "radiusM": 50.0,
+                        },
+                    })
+                )
+                error = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                assert error["type"] == "error"
+                assert error["code"] == "invalid_params"
+
+                # ...but an ROI near the far-away confirmed home is accepted.
+                await tablet.send(
+                    encode_message({
+                        "type": "command", "commandId": "roi-far-accepted",
+                        "command": "set_roi",
+                        "params": {
+                            "center": {"lat": FAR_AWAY_FIX["lat"], "lon": FAR_AWAY_FIX["lng"]},
+                            "radiusM": 50.0,
+                        },
+                    })
+                )
+                forwarded = json.loads(await asyncio.wait_for(drone.recv(), 1.0))
+                assert forwarded["command"] == "set_roi"
+
+    asyncio.run(scenario())
+
+
+def test_simulator_telemetry_never_captures_a_session_home():
+    async def scenario():
+        realtime_server = RealtimeServer()
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            async with connect(f"ws://127.0.0.1:{port}/ws?role=drone") as simulator:
+                await simulator.send(encode_message(
+                    build_simulator_telemetry(
+                        position_local=LocalPosition(0.0, 0.0, 0.0),
+                        heading_deg=0.0,
+                        speed_mps=0.0,
+                        state="LANDED",
+                    )
+                ))
+                await asyncio.sleep(0.05)
+                assert realtime_server._session_home is None
+
+    asyncio.run(scenario())
+
+
+def test_dji_session_home_survives_a_transient_drone_reconnect():
+    async def scenario():
+        realtime_server = RealtimeServer()
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            base_url = f"ws://127.0.0.1:{port}/ws"
+            async with connect(f"{base_url}?role=drone") as drone:
+                await drone.send(encode_message(
+                    _dji_telemetry(lat=FAR_AWAY_FIX["lat"], lng=FAR_AWAY_FIX["lng"])
+                ))
+                await asyncio.sleep(0.05)
+            assert realtime_server._session_home is not None
+            assert realtime_server._session_home.lat == pytest.approx(FAR_AWAY_FIX["lat"])
+            assert realtime_server._session_home.lng == pytest.approx(FAR_AWAY_FIX["lng"])
+
+            # Transient reconnect: a new role=drone connection (e.g. the AWS
+            # bridge's WS link to this server blipped) must not re-anchor.
+            async with connect(f"{base_url}?role=drone") as drone:
+                await drone.send(encode_message(
+                    _dji_telemetry(lat=DEFAULT_HOME.lat, lng=DEFAULT_HOME.lng)
+                ))
+                await asyncio.sleep(0.05)
+
+            assert realtime_server._session_home.lat == pytest.approx(FAR_AWAY_FIX["lat"])
+            assert realtime_server._session_home.lng == pytest.approx(FAR_AWAY_FIX["lng"])
+
+    asyncio.run(scenario())
+
+
 async def _wait_for(predicate):
     while not predicate():
         await asyncio.sleep(0.01)

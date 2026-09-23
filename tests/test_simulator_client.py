@@ -43,6 +43,20 @@ def test_connection_loss_timeout_must_be_positive():
         client.connection_lost_for(0.0)
 
 
+def test_dji_opt_in_discards_previous_socket_commands_before_config_sync():
+    client = SimulatorRealtimeClient(clear_inbound_on_connect=True)
+    client._commands.put({"command": "camera_tilt_up"})
+    client._mark_connected()
+    assert client.drain_commands() == []
+    client._commands.put({"command": "set_operating_config"})
+    assert client.drain_commands() == [{"command": "set_operating_config"}]
+
+    simulator = SimulatorRealtimeClient()
+    simulator._commands.put({"command": "start_patrol"})
+    simulator._mark_connected()
+    assert simulator.drain_commands() == [{"command": "start_patrol"}]
+
+
 def test_detection_messages_are_received_separately_from_commands():
     message = {
         "type": "detections",

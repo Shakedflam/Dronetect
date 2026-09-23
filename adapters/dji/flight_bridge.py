@@ -1,4 +1,4 @@
-"""Local flight-bridge process for a real DJI aircraft.
+"""AWS flight-bridge process for a real DJI aircraft.
 
 Runs the existing pure-Python autonomy stack (flight_logic / pursuit /
 roi_patrol / target_decisions / manual_input / patrol_planner /
@@ -15,28 +15,25 @@ architecture analysis for the full picture):
                               | role=drone, same protocol the Webots
                               | controller already speaks
                               v
-                     DjiFlightBridge (this module -- runs locally,
-                     e.g. on a companion laptop on the same LAN/hotspot
-                     as the tablet, NOT in the cloud: the tight per-tick
-                     control loop cannot tolerate cloud round-trip
-                     latency the way event-driven mission commands can)
+                     DjiFlightBridge (this module -- runs in AWS)
                               ^
-                              | local-only protocol, see local_protocol.py
+                              | authenticated WSS hardware protocol
                               | (telemetry/RC/gimbal state up, velocity+yaw
                               | + gimbal setpoints + RTH down)
                               v
-                       Android DJI app (NOT implemented yet -- out of
-                       scope for this change) <--DJI Mobile SDK V5--> RC-N3
+                       Android DJI app <--DJI Mobile SDK V5--> RC-N3
                               --OcuSync--> Mini 4 Pro
 
 What this module does:
     - Connects to realtime_server as role=drone (via SimulatorRealtimeClient,
       reused unmodified -- its WS transport is already source-agnostic) and
       receives the existing mission commands.
-    - Runs a local WebSocket server (AndroidLink) for the future Android app.
+    - Runs a loopback-bound WebSocket server (AndroidLink) reached via the
+      Cloudflare Tunnel's /dji/bridge route.
     - Drives flight_logic.FlightLogic's tick using position/yaw sourced from
       Android telemetry instead of Webots GPS/IMU devices, and sends the
-      resulting velocity/yaw/gimbal setpoints to Android instead of
+      resulting velocity/yaw/gimbal setpoints to Android in later phases. In
+      Phase 1 it only publishes measured telemetry, instead of
       teleporting a simulated aircraft body (Supervisor.translation, in
       autonomous_drone.py) -- that Supervisor call is the *only* thing
       "flight control" meant in the simulator, since the simulation is
@@ -58,9 +55,9 @@ Real-flight configuration (see DjiFlightBridge.__init__ and
 _apply_operating_config): FlightConfig()'s dataclass defaults are
 SIMULATOR-SCALE TEST-ARENA VALUES (x_bounds/y_bounds fixed at an 8x8 m box;
 takeoff_altitude/z_bounds only become real-world-scale once an
-OperatingConfig is applied). DjiFlightBridge refuses to run flight_logic at
-all -- no command dispatch beyond SET_OPERATING_CONFIG itself, no
-FlightLogic.update(), no kinematic advancement -- until an OperatingConfig
+OperatingConfig is applied). Outside telemetry-only Phase 1, DjiFlightBridge
+refuses to run flight_logic at all -- no command dispatch beyond
+SET_OPERATING_CONFIG, no FlightLogic.update(), no kinematic advancement -- until an OperatingConfig
 (the existing config/shared_config.py structure, with its existing
 legal-maximum validation) has been applied, either passed explicitly to the
 constructor or delivered by a SET_OPERATING_CONFIG command at runtime. There
@@ -90,11 +87,8 @@ bridge's normal dotted imports. The one field left as a genuine per-caller
 override is `camera_horizontal_fov_rad` (a hardware property, not tuning --
 see DjiFlightBridge's docstring).
 
-Deliberately still deferred (see the parity-gap-closing conversation for the
-full reasoning):
-    - Android DJI Mobile SDK V5 integration itself. Nothing in this package
-      makes a DJI SDK call; that stays entirely on the Android side, which
-      does not exist yet.
+Phase 2 keeps setpoints disabled while allowing one-shot gimbal and RTH
+actions through the existing Android hardware link.
 """
 
 from __future__ import annotations
@@ -304,13 +298,46 @@ class DjiFlightBridge:
         bridge_config: BridgeConfig | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        phase2_requested = os.getenv("DRONTECT_DJI_PHASE2_ACTIONS") == "1"
+        self.phase3_zero_stick = os.getenv("DRONTECT_DJI_PHASE3_ZERO_STICK") == "1"
+        # Authenticated AWS hardware links default to the read-only path;
+        # requesting Phase 2 can never select the legacy setpoint path.
+        self.phase1_telemetry_only = phase2_requested or self.phase3_zero_stick or os.getenv(
+            "DRONTECT_DJI_PHASE1_TELEMETRY_ONLY",
+            "1" if os.getenv("DRONTECT_DJI_BRIDGE_TOKEN") else "0",
+        ) == "1"
+        self.phase2_actions = phase2_requested
         self.realtime_link = realtime_link or SimulatorRealtimeClient(
-            url=os.getenv("DRONTECT_DJI_REALTIME_WS_URL", DEFAULT_REALTIME_WS_URL)
+            url=os.getenv("DRONTECT_DJI_REALTIME_WS_URL", DEFAULT_REALTIME_WS_URL),
+            telemetry_max_age_s=2.0 if self.phase1_telemetry_only else None,
+            clear_inbound_on_connect=self.phase1_telemetry_only,
         )
         self.android_link = android_link or AndroidLink(
             host=os.getenv("DRONTECT_DJI_LOCAL_HOST", DEFAULT_HOST),
             port=int(os.getenv("DRONTECT_DJI_LOCAL_PORT", str(DEFAULT_PORT))),
+            auth_token=os.getenv("DRONTECT_DJI_BRIDGE_TOKEN") or None,
         )
+        self._observed_session_generation = self.android_link.session_generation
+        # Captured exactly once, from the first Android telemetry sample that
+        # both reports a complete GPS fix and explicitly reports the aircraft
+        # as grounded (telemetry.is_flying is False -- never on None/unknown
+        # or True). This is the aircraft-session lifecycle this bridge uses:
+        # one DjiFlightBridge process lifetime is one session. It never
+        # resets on an AndroidLink reconnect (session_generation changing) --
+        # that is a hardware-link auth/replay-protection concept, deliberately
+        # unrelated to where "home" is -- so a transient network blip can
+        # never re-anchor home, and it never persists across a process
+        # restart (there is no on-disk state at all), so a restart mid-flight
+        # cannot silently adopt an airborne position as the new home either.
+        # All real-flight geometry (GPS<->local meters, PatrolRegionStore,
+        # patrol polygons/waypoints, coverage planning, no-fly geometry, ROI
+        # conversion, operating-config rebuilds) is refused/frozen -- via the
+        # existing `_last_position is None` gate -- until this is set.
+        self.session_home: Wgs84Point | None = None
+        self._last_phase1_publish = 0.0
+        self._last_phase3_cadence_log = 0.0
+        self._pending_phase2_actions: list[tuple[str, float | str]] = []
+        self._phase2_realtime_connected = False
         self.config = bridge_config or BridgeConfig()
         self.manual_flight_config = manual_flight_config or build_manual_flight_config()
         self._clock = clock
@@ -388,18 +415,93 @@ class DjiFlightBridge:
         dt = max(0.0, dt)
         self._elapsed_time += dt
 
+        if self.phase1_telemetry_only:
+            self.realtime_link.drain_detections()
+            connected = self.realtime_link.connected
+            if not connected:
+                self._pending_phase2_actions.clear()
+                self.realtime_link.drain_commands()
+            self._phase2_realtime_connected = connected
+            session_changed = self._observed_session_generation != self.android_link.session_generation
+            if session_changed:
+                self._observed_session_generation = self.android_link.session_generation
+                self._last_position = None
+                self._last_yaw = 0.0
+                self.logic.home = None
+                self.logic.target = None
+                self._pending_phase2_actions.clear()
+            telemetry = self.android_link.latest_telemetry
+            fresh = telemetry is not None and self.android_link.is_telemetry_fresh(
+                self.config.android_telemetry_timeout_s, now)
+            if fresh:
+                assert telemetry is not None
+                self._maybe_establish_session_home(telemetry)
+                if self.session_home is not None:
+                    position, yaw = self._position_from_telemetry(telemetry)
+                    self._last_position, self._last_yaw = position, yaw
+                    if telemetry.gimbal_pitch_deg is not None:
+                        self.camera_gimbal.set_pitch(math.radians(-telemetry.gimbal_pitch_deg))
+                    if self.logic.home is None:
+                        self.logic.initialize_home(position)
+            for message in self.realtime_link.drain_commands():
+                if not connected:
+                    continue
+                command = message.get("command")
+                if command == CommandName.SET_OPERATING_CONFIG.value:
+                    # Configuration is valid before GPS/hardware is ready. The
+                    # same neutral local position is used at startup while IDLE.
+                    self._safe_dispatch_command(message, self._last_position or (0.0, 0.0, 0.0))
+                    continue
+                if not self.phase2_actions or session_changed or not fresh:
+                    continue
+                if command in {CommandName.CAMERA_TILT_UP.value, CommandName.CAMERA_TILT_DOWN.value}:
+                    assert telemetry is not None
+                    if telemetry.gimbal_pitch_deg is None:
+                        continue
+                    if command == CommandName.CAMERA_TILT_UP.value:
+                        self.camera_gimbal.tilt_up()
+                    else:
+                        self.camera_gimbal.tilt_down()
+                    self._pending_phase2_actions.append(("gimbal", -math.degrees(self.camera_gimbal.pitch)))
+                elif command == CommandName.RETURN_HOME.value:
+                    self._pending_phase2_actions.clear()
+                    self._pending_phase2_actions.append(("rth", "operator_return_home"))
+            if not fresh:
+                self._pending_phase2_actions.clear()
+                return TickOutcome(has_position=False)
+            if self.session_home is None:
+                # No confirmed geographic origin yet -- freeze position/
+                # geometry, but do NOT drop already-queued phase2 actions:
+                # send_rth in particular must stay reachable even before
+                # session_home is established (run_tick_once flushes these
+                # regardless of has_position -- see its own comment).
+                return TickOutcome(has_position=False)
+            assert telemetry is not None
+            position, yaw = self._last_position, self._last_yaw
+            assert position is not None
+            self.logic.update(position, dt, yaw=yaw, camera_pitch=self.camera_gimbal.pitch)
+            observed_state = ("RETURNING_HOME" if telemetry.flight_mode == "GO_HOME" else
+                "LANDED" if telemetry.is_flying is False else
+                "MANUAL" if telemetry.is_flying is True else "UNKNOWN")
+            return TickOutcome(has_position=True, position=position, yaw_rad=yaw,
+                speed_mps=telemetry.speed_mps, battery_percent=telemetry.battery_percent,
+                state=observed_state, gimbal_pitch_rad=self.camera_gimbal.pitch)
+
         telemetry = self.android_link.latest_telemetry
         fresh = telemetry is not None and self.android_link.is_telemetry_fresh(
             self.config.android_telemetry_timeout_s, now
         )
         if fresh:
             assert telemetry is not None
-            position, yaw = self._position_from_telemetry(telemetry)
-            self._last_position = position
-            self._last_yaw = yaw
-            self.camera_gimbal.set_pitch(math.radians(telemetry.gimbal_pitch_deg))
-            if self.logic.home is None:
-                self.logic.initialize_home(position)
+            self._maybe_establish_session_home(telemetry)
+            if self.session_home is not None:
+                position, yaw = self._position_from_telemetry(telemetry)
+                self._last_position = position
+                self._last_yaw = yaw
+                if telemetry.gimbal_pitch_deg is not None:
+                    self.camera_gimbal.set_pitch(math.radians(-telemetry.gimbal_pitch_deg))
+                if self.logic.home is None:
+                    self.logic.initialize_home(position)
 
         self._enforce_realtime_connection_loss_failsafe()
         self._enforce_android_connection_loss_failsafe(now)
@@ -473,14 +575,53 @@ class DjiFlightBridge:
             target_patrol_region_id=self._target_patrol_region_id,
         )
 
+    def _maybe_establish_session_home(self, telemetry) -> None:
+        """Capture session_home once, from the first grounded, complete fix.
+
+        `telemetry.is_flying` is only ever None on a message this bridge
+        never sees in real operation -- DjiTelemetryMapper.kt (the Android
+        side) refuses to emit telemetry at all unless isFlying is a real
+        boolean -- so gating on `is False` rather than `is not True` is not a
+        practical availability risk; it is what keeps a restart mid-flight
+        (telemetry.is_flying is True on the first sample after the process
+        comes back up) from ever adopting an airborne position as home.
+        """
+        if self.session_home is not None or telemetry.is_flying is not False:
+            return
+        self.session_home = Wgs84Point(lat=telemetry.lat, lng=telemetry.lng)
+        self._rebuild_patrol_geometry_for_home(self.session_home)
+
+    def _rebuild_patrol_geometry_for_home(self, home: Wgs84Point) -> None:
+        """Re-anchor patrol_regions/patrol_planner on `home`, preserving
+        whatever priorities/area-type overrides were already set -- the same
+        store-swap pattern _apply_operating_config uses for a radius change."""
+        priorities = [
+            (region.id, region.priority)
+            for region in self.patrol_regions.regions
+            if region.priority is not None
+        ]
+        area_types = [
+            (region.id, region.area_type)
+            for region in self.patrol_regions.regions
+            if region.area_type is not PatrolAreaType.PATROL
+        ]
+        store = PatrolRegionStore(home=home, home_radius_m=self.logic.pursuit.config.geofence_radius_m)
+        store.replace_area_types(area_types)
+        store.replace_priorities(priorities)
+        self.patrol_regions = store
+        self.patrol_planner = PatrolPlanner(
+            store=store, scorer=self.patrol_planner.scorer, started_at=self.patrol_planner.started_at,
+        )
+
     def _position_from_telemetry(self, telemetry) -> tuple[Position, float]:
+        assert self.session_home is not None
         local = wgs84_to_local_meters(
             Wgs84Point(lat=telemetry.lat, lng=telemetry.lng),
-            DEFAULT_HOME,
+            self.session_home,
             altitude_m=telemetry.altitude_m,
         )
         position: Position = (local.x, local.y, local.z)
-        yaw = math.radians(telemetry.heading_deg)
+        yaw = math.radians(90.0 - telemetry.heading_deg)
         return position, yaw
 
     def _update_manual_stick(self) -> None:
@@ -607,9 +748,10 @@ class DjiFlightBridge:
             self._pause_patrol_coverage(position)
             params = message["params"]
             center = params["center"]
+            assert self.session_home is not None  # SET_ROI is only reachable once _last_position exists
             local_center = wgs84_to_local_meters(
                 Wgs84Point(lat=center["lat"], lng=center["lon"]),
-                DEFAULT_HOME,
+                self.session_home,
                 altitude_m=self.logic.config.takeoff_altitude,
             )
             self.logic.request_roi(position, (local_center.x, local_center.y), params["radiusM"])
@@ -733,9 +875,10 @@ class DjiFlightBridge:
         if exit_point is not None:
             return (exit_point[0], exit_point[1], self.logic.config.takeoff_altitude)
 
-        current = local_meters_to_wgs84(LocalPosition(x=position[0], y=position[1], z=position[2]), DEFAULT_HOME)
+        assert self.session_home is not None  # _next_patrol_waypoint only runs once _last_position exists
+        current = local_meters_to_wgs84(LocalPosition(x=position[0], y=position[1], z=position[2]), self.session_home)
         no_fly_polygons = [
-            patrol_region_polygon_points(region)
+            patrol_region_polygon_points(region, self.session_home)
             for region in self.patrol_regions.regions
             if region.area_type is PatrolAreaType.NO_FLY
         ]
@@ -768,11 +911,14 @@ class DjiFlightBridge:
     def _coverage_route_waypoints(
         self, position: Position, region: PatrolRegion, no_fly_polygons: list[tuple[Wgs84Point, ...]]
     ) -> tuple[list[Position], float]:
+        assert self.session_home is not None  # _coverage_route_waypoints only runs once _last_position exists
         coverage = self.polygon_coverage_planner.plan(
-            patrol_region_polygon_points(region), no_fly_polygons=no_fly_polygons, outward_from=DEFAULT_HOME
+            patrol_region_polygon_points(region, self.session_home),
+            no_fly_polygons=no_fly_polygons,
+            outward_from=self.session_home,
         )
         local_coverage = [
-            wgs84_to_local_meters(waypoint, DEFAULT_HOME, altitude_m=self.logic.config.takeoff_altitude)
+            wgs84_to_local_meters(waypoint, self.session_home, altitude_m=self.logic.config.takeoff_altitude)
             for waypoint in coverage
         ]
         first_coverage = local_coverage[0]
@@ -1011,6 +1157,11 @@ class DjiFlightBridge:
             return
 
         self._apply_operating_config(candidate, position)
+        print(
+            "DJI flight bridge: operating_config=applied "
+            f"radiusM={candidate.max_flight_radius_m:.1f} "
+            f"altitudeM={candidate.cruise_altitude_m:.1f}"
+        )
         self.realtime_link.publish_control_message(operating_config_result(command_id, accepted=True, pending=False))
 
     def _apply_operating_config(self, candidate: OperatingConfig, position: Position) -> None:
@@ -1030,6 +1181,7 @@ class DjiFlightBridge:
             reposition_resume_state=(
                 self.logic.reposition_resume_state.value if self.logic.reposition_resume_state is not None else None
             ),
+            home=self.session_home if self.session_home is not None else DEFAULT_HOME,
         )
         altitude_changed = not math.isclose(self.logic.config.takeoff_altitude, candidate.cruise_altitude_m, rel_tol=1e-9)
         radius_changed = not math.isclose(old_max_flight_radius_m, candidate.max_flight_radius_m, rel_tol=1e-9)
@@ -1176,19 +1328,21 @@ class DjiFlightBridge:
 
     def build_telemetry_message(self, outcome: TickOutcome) -> dict[str, Any]:
         assert outcome.has_position and outcome.position is not None and outcome.yaw_rad is not None
+        measured = self.android_link.latest_telemetry if self.phase1_telemetry_only else None
         local = LocalPosition(x=outcome.position[0], y=outcome.position[1], z=outcome.position[2])
-        gps = local_meters_to_wgs84(local)
-        heading_deg = (math.degrees(outcome.yaw_rad) + 360.0) % 360.0
+        assert self.session_home is not None  # outcome.has_position implies session_home is set
+        gps = local_meters_to_wgs84(local, self.session_home)
+        heading_deg = (90.0 - math.degrees(outcome.yaw_rad)) % 360.0
         return {
             "type": "telemetry",
             "timestamp": time.time(),
             "source": DJI_TELEMETRY_SOURCE,
             "data": {
-                "gps": {"lat": gps.lat, "lng": gps.lng},
-                "altitudeM": outcome.position[2],
-                "headingDeg": heading_deg,
-                "speedMps": outcome.speed_mps,
-                "batteryPercent": outcome.battery_percent if outcome.battery_percent is not None else 0.0,
+                "gps": {"lat": measured.lat if measured else gps.lat, "lng": measured.lng if measured else gps.lng},
+                "altitudeM": measured.altitude_m if measured else outcome.position[2],
+                "headingDeg": measured.heading_deg if measured else heading_deg,
+                "speedMps": measured.speed_mps if measured else outcome.speed_mps,
+                "batteryPercent": measured.battery_percent if measured else (outcome.battery_percent if outcome.battery_percent is not None else 0.0),
                 "state": outcome.state,
                 "targetPatrolRegionId": outcome.target_patrol_region_id,
                 "aircraftSafetyRthActive": outcome.safety_rth_active,
@@ -1209,11 +1363,54 @@ class DjiFlightBridge:
         AndroidLink's own freshness gate -- see android_link.py) and
         publishing telemetry to realtime_server."""
         outcome = self.tick(self.config.tick_interval_s)
+        if self.phase3_zero_stick:
+            now = self._clock()
+            if now - self._last_phase3_cadence_log >= 5.0:
+                self._last_phase3_cadence_log = now
+                telemetry_age = self.android_link.telemetry_age_s(now)
+                print("DJI bridge: setpoint_source "
+                      f"position={outcome.has_position} configured={self.is_configured_for_flight} "
+                      f"realtime={self.realtime_link.connected} "
+                      f"telemetryAgeMs={None if telemetry_age is None else round(telemetry_age * 1000)} "
+                      f"groundSafety={self.android_link.is_zero_ground_safety_fresh(self.config.android_telemetry_timeout_s, now)}")
+
+        if self.phase1_telemetry_only and self.phase2_actions and self._pending_phase2_actions:
+            # Flushed regardless of outcome.has_position: gimbal/RTH actions
+            # queued this tick require fresh Android telemetry (enforced in
+            # tick() itself) but not a confirmed session_home -- send_rth in
+            # particular must stay reachable even before home is established
+            # (see AndroidLink's own docstring on send_rth never being gated
+            # on freshness for the same reason).
+            for action, value in self._pending_phase2_actions:
+                if action == "gimbal":
+                    await self.android_link.send_gimbal_command(
+                        pitch_deg=float(value), ttl_ms=self.config.gimbal_command_ttl_ms)
+                elif action == "rth":
+                    await self.android_link.send_rth(reason=str(value))
+            self._pending_phase2_actions.clear()
+
+        if (self.phase1_telemetry_only and self.phase3_zero_stick and
+                self.is_configured_for_flight and self.realtime_link.connected and
+                self.android_link.is_zero_ground_safety_fresh(self.config.android_telemetry_timeout_s)):
+            # Ground-test heartbeat needs fresh connected/grounded/centered RC
+            # state, not GPS position. This path can only construct zero motion.
+            await self.android_link.send_zero_ground_test_setpoint(
+                ttl_ms=self.config.setpoint_ttl_ms,
+                safety_timeout_s=self.config.android_telemetry_timeout_s,
+            )
+
         if not outcome.has_position:
             return outcome
 
+        if self.phase1_telemetry_only:
+            now = self._clock()
+            if now - self._last_phase1_publish >= 0.5:
+                self.realtime_link.publish_telemetry(self.build_telemetry_message(outcome))
+                self._last_phase1_publish = now
+            return outcome
+
         assert outcome.position is not None and outcome.yaw_rad is not None
-        yaw_deg = (math.degrees(outcome.yaw_rad) + 360.0) % 360.0
+        yaw_deg = (90.0 - math.degrees(outcome.yaw_rad)) % 360.0
         await self.android_link.send_setpoint(
             velocity_x_mps=outcome.velocity_x_mps,
             velocity_y_mps=outcome.velocity_y_mps,
@@ -1223,7 +1420,7 @@ class DjiFlightBridge:
             telemetry_timeout_s=self.config.android_telemetry_timeout_s,
         )
         await self.android_link.send_gimbal_command(
-            pitch_deg=math.degrees(outcome.gimbal_pitch_rad), ttl_ms=self.config.gimbal_command_ttl_ms
+            pitch_deg=-math.degrees(outcome.gimbal_pitch_rad), ttl_ms=self.config.gimbal_command_ttl_ms
         )
         if outcome.safety_rth_active and outcome.state in {FlightState.RETURNING_HOME.value, FlightState.LANDING.value}:
             await self.android_link.send_rth(reason=outcome.safety_rth_reason or "safety_rth")
@@ -1272,6 +1469,14 @@ def load_real_drone_operating_config() -> OperatingConfig | None:
 def main() -> None:
     operating_config = load_real_drone_operating_config()
     bridge = DjiFlightBridge(operating_config=operating_config)
+    if bridge.phase1_telemetry_only and not os.getenv("DRONTECT_DJI_BRIDGE_TOKEN"):
+        raise RealFlightConfigurationError("DRONTECT_DJI_BRIDGE_TOKEN is required for the hardware link")
+    print(
+        "DJI flight bridge mode="
+        + ("zero_stick_ground_test" if bridge.phase3_zero_stick else
+           "gimbal_rth_only" if bridge.phase2_actions else
+           "telemetry_only" if bridge.phase1_telemetry_only else "legacy")
+    )
     if operating_config is None:
         print(
             "DJI flight bridge starting UNCONFIGURED: no DRONTECT_DJI_MAX_FLIGHT_RADIUS_M/"

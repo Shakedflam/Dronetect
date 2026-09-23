@@ -43,7 +43,7 @@ class DjiTelemetryPlugin : Plugin() {
         put("headingDeg", snapshot.headingDegrees ?: JSONObject.NULL)
         put("batteryPercent", snapshot.batteryPercent ?: JSONObject.NULL)
         put("gpsSatellites", snapshot.gpsSatelliteCount ?: JSONObject.NULL)
-        put("gpsSignal", snapshot.gpsSignalLevel?.name ?: JSONObject.NULL)
+        put("gpsSignal", snapshot.gpsSignalLevel ?: JSONObject.NULL)
         put("isFlying", snapshot.isFlying ?: JSONObject.NULL)
         put("groundState", when (snapshot.isFlying) {
             true -> "airborne"
