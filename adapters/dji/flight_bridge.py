@@ -225,6 +225,13 @@ class BridgeConfig:
     mission_return_timeout_s: float = DEFAULT_MISSION_RETURN_TIMEOUT_S
     patrol_lane_spacing_m: float = DEFAULT_PATROL_LANE_SPACING_M
     tick_interval_s: float = 0.05  # 20 Hz
+    # How long phase1_telemetry_only keeps reporting the last-drained
+    # detection in targetFollowDiagnostics after a tick drains none -- purely
+    # so the map dot doesn't flicker between this ~20 Hz tick and
+    # run_tick_once's ~0.5 s telemetry-publish throttle. Mirrors the same
+    # monotonic-clock freshness pattern as android_telemetry_timeout_s, just
+    # for display bookkeeping rather than a safety gate.
+    target_follow_diagnostics_ttl_s: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +259,21 @@ class TickOutcome:
     manual_input_source: str = "tablet"
     pursuit_blocked: bool = False
     target_patrol_region_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Phase1DetectionSnapshot:
+    """Read-only bookkeeping for phase1_telemetry_only's targetFollow
+    Diagnostics telemetry -- see DjiFlightBridge._update_phase1_detection_
+    diagnostics (writer, called from tick()) and _build_phase1_target_
+    follow_diagnostics (sole reader, called from build_telemetry_message).
+    Nothing else touches this: it carries a raw detection dict straight from
+    the vision pipeline for display purposes only, never FlightLogic state."""
+
+    detection: dict[str, Any]
+    frame_width: int
+    frame_height: int
+    captured_at: float
 
 
 class DjiFlightBridge:
@@ -337,6 +359,10 @@ class DjiFlightBridge:
         self._last_phase1_publish = 0.0
         self._last_phase3_cadence_log = 0.0
         self._pending_phase2_actions: list[tuple[str, float | str]] = []
+        # phase1_telemetry_only's targetFollowDiagnostics display state --
+        # see _Phase1DetectionSnapshot's docstring. Read only by
+        # _build_phase1_target_follow_diagnostics; never by flight logic.
+        self._phase1_detection_snapshot: _Phase1DetectionSnapshot | None = None
         self._phase2_realtime_connected = False
         self.config = bridge_config or BridgeConfig()
         self.manual_flight_config = manual_flight_config or build_manual_flight_config()
@@ -416,7 +442,18 @@ class DjiFlightBridge:
         self._elapsed_time += dt
 
         if self.phase1_telemetry_only:
-            self.realtime_link.drain_detections()
+            # Read-only telemetry-display bookkeeping only -- see
+            # _Phase1DetectionSnapshot's docstring. This never calls
+            # FlightLogic.observe_detections/would_intercept/update or
+            # touches any mission/patrol/ROI state; the drained messages are
+            # still fully discarded as far as flight control is concerned.
+            # Drained (and the session-changed check below) before the
+            # bookkeeping update itself runs, so a detection arriving on the
+            # very same tick a new Android session is first observed (e.g.
+            # the first tick after connect, which is always "session
+            # changed") is still this tick's current data, not something a
+            # stale-session reset discards out from under it.
+            detections_drained = self.realtime_link.drain_detections()
             connected = self.realtime_link.connected
             if not connected:
                 self._pending_phase2_actions.clear()
@@ -430,6 +467,8 @@ class DjiFlightBridge:
                 self.logic.home = None
                 self.logic.target = None
                 self._pending_phase2_actions.clear()
+                self._phase1_detection_snapshot = None
+            self._update_phase1_detection_diagnostics(detections_drained, now)
             telemetry = self.android_link.latest_telemetry
             fresh = telemetry is not None and self.android_link.is_telemetry_fresh(
                 self.config.android_telemetry_timeout_s, now)
@@ -1325,6 +1364,117 @@ class DjiFlightBridge:
             self.logic.request_return_home()
 
     # -- outbound telemetry -------------------------------------------------
+    # phase1_telemetry_only's targetFollowDiagnostics: a pure, read-only
+    # *display* computation over whatever raw detection the vision pipeline
+    # last sent -- zero coupling to FlightLogic/pursuit/mission state. These
+    # two methods are the entire feature: _update_phase1_detection_
+    # diagnostics is called once per tick from tick() (phase1 branch only)
+    # and only ever writes self._phase1_detection_snapshot;
+    # _build_phase1_target_follow_diagnostics is called once per publish from
+    # build_telemetry_message and only ever reads it. Neither calls
+    # self.logic.observe_detections/would_intercept/update, and neither is
+    # reachable from the legacy (non-phase1) tick() path at all.
+
+    def _update_phase1_detection_diagnostics(self, messages: list[dict[str, Any]], now: float) -> None:
+        """Record which raw detection (if any) build_telemetry_message
+        should report this publish, with a short TTL so the ~0.5 s telemetry
+        -publish throttle in run_tick_once doesn't create visible flicker
+        between this ~20 Hz tick draining a detection and the next drained
+        one. `messages` is exactly what self.realtime_link.drain_detections()
+        returned this tick -- already fully consumed/discarded as far as
+        flight control is concerned; this is bookkeeping on top, not a
+        second consumer of anything stateful.
+
+        Selection: prefer a detection with trackState == "confirmed" (first
+        one found, scanning drained messages in order); otherwise the first
+        detection present in any drained message. If nothing was drained
+        this tick, the previous snapshot is kept until it exceeds
+        config.target_follow_diagnostics_ttl_s, then cleared.
+        """
+        all_detections: list[tuple[dict[str, Any], int, int]] = [
+            (detection, message.get("frameWidth"), message.get("frameHeight"))
+            for message in messages
+            for detection in (message.get("detections") or [])
+        ]
+        if all_detections:
+            confirmed = next(
+                (item for item in all_detections if item[0].get("trackState") == "confirmed"), None
+            )
+            detection, frame_width, frame_height = confirmed or all_detections[0]
+            self._phase1_detection_snapshot = _Phase1DetectionSnapshot(
+                detection=detection, frame_width=frame_width, frame_height=frame_height, captured_at=now,
+            )
+            return
+        snapshot = self._phase1_detection_snapshot
+        if snapshot is not None and now - snapshot.captured_at > self.config.target_follow_diagnostics_ttl_s:
+            self._phase1_detection_snapshot = None
+
+    def _build_phase1_target_follow_diagnostics(self, outcome: TickOutcome) -> dict[str, Any] | None:
+        """Build the targetFollowDiagnostics wire object from self.
+        _phase1_detection_snapshot, or None if there is nothing fresh to
+        report. `flightState` reuses outcome.state -- the same observed
+        RETURNING_HOME/LANDED/MANUAL/UNKNOWN string tick() already computes
+        from measured telemetry -- rather than any FlightLogic state name,
+        since no autonomous target tracking is actually happening in
+        phase1. boundingBoxScale/boundingBoxAreaRatio/imageCenterError/
+        estimatedImageVelocity mirror flight_logic.py's own
+        target_follow_diagnostics() math/conventions, computed fresh here
+        from the raw detection rather than by importing any pursuit
+        internals. `pursuit`/`targetDecision` are omitted entirely -- both
+        are optional in the wire schema, and fabricating either would
+        falsely claim autonomous pursuit is in progress on a real aircraft
+        that is only being observed, never flown, in this mode.
+        """
+        snapshot = self._phase1_detection_snapshot
+        if snapshot is None:
+            return None
+        detection = snapshot.detection
+        frame_width = snapshot.frame_width or 1
+        frame_height = snapshot.frame_height or 1
+        box = detection.get("box") or [0.0, 0.0, 0.0, 0.0]
+        x1, y1, x2, y2 = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+        center_x = (x1 + x2) / (2.0 * frame_width)
+        center_y = (y1 + y2) / (2.0 * frame_height)
+        area_ratio = max(0.0, x2 - x1) * max(0.0, y2 - y1) / (frame_width * frame_height)
+        box_scale = math.sqrt(max(0.0, area_ratio))
+        velocity = detection.get("velocityPxPerSec") or {}
+        velocity_x = float(velocity.get("x", 0.0)) / frame_width
+        velocity_y = float(velocity.get("y", 0.0)) / frame_height
+        velocity_magnitude = math.hypot(velocity_x, velocity_y)
+        velocity_direction_deg = (
+            math.degrees(math.atan2(velocity_y, velocity_x)) if velocity_magnitude > 1e-9 else None
+        )
+        return {
+            "flightState": outcome.state,
+            "trackerId": detection.get("trackId"),
+            "detectionConfidence": detection.get("confidence"),
+            "imageCenterError": {"x": center_x - 0.5, "y": center_y - 0.5},
+            # No cross-frame confirmation/hit-counting runs in phase1 (that
+            # would be tracking state this read-only display path must not
+            # keep) -- a currently-reported detection is shown as already
+            # "confirmed" for HUD cosmetics only; MapView.tsx's map dot does
+            # not read this field at all.
+            "confirmation": {"hits": 1, "requiredHits": 1, "progress": 1.0},
+            "estimatedImageVelocity": {
+                "x": velocity_x,
+                "y": velocity_y,
+                "magnitude": velocity_magnitude,
+                "directionDeg": velocity_direction_deg,
+            },
+            "boundingBoxScale": box_scale,
+            "boundingBoxAreaRatio": area_ratio,
+            # Not meaningful without an active pursuit standoff target --
+            # phase1 never runs pursuit.
+            "standoffError": 0.0,
+            "estimatedTargetDistanceM": None,
+            "estimatedTargetElevationDeg": None,
+            "estimatedTargetHeightDifferenceM": None,
+            "altitudeMatchingActive": False,
+            "targetLostDurationS": 0.0,
+            "patrolInterrupted": False,
+            "patrolResumeState": None,
+            "patrolResumeStatus": "inactive",
+        }
 
     def build_telemetry_message(self, outcome: TickOutcome) -> dict[str, Any]:
         assert outcome.has_position and outcome.position is not None and outcome.yaw_rad is not None
@@ -1347,7 +1497,9 @@ class DjiFlightBridge:
                 "targetPatrolRegionId": outcome.target_patrol_region_id,
                 "aircraftSafetyRthActive": outcome.safety_rth_active,
                 "aircraftSafetyRthReason": outcome.safety_rth_reason,
-                "targetFollowDiagnostics": None,
+                "targetFollowDiagnostics": (
+                    self._build_phase1_target_follow_diagnostics(outcome) if self.phase1_telemetry_only else None
+                ),
                 "operatingConfigPending": self._pending_operating_config is not None,
                 "pursuitBlocked": outcome.pursuit_blocked,
                 "manualControlActive": outcome.manual_control_active,
