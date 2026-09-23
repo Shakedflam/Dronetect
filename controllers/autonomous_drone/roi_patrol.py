@@ -33,6 +33,12 @@ class RoiPatrolPlan(Protocol):
 
     def next_waypoint(self) -> Position: ...
 
+    # True once every waypoint of the current route has been handed out once.
+    # Only consulted when FlightConfig.roi_single_cycle is set, so continuous
+    # planners stay unaffected.
+    @property
+    def cycle_complete(self) -> bool: ...
+
     def entry_target(self, center: tuple[float, float], altitude_m: float) -> Position: ...
 
     def contains(self, position: Position) -> bool: ...
@@ -104,6 +110,7 @@ class LawnMowerRoiPatrolPlanner:
         self.config = config or RoiPatrolConfig()
         self._waypoints: tuple[Position, ...] = ()
         self._next_index = 0
+        self._delivered = 0
         self._allowed_area: Polygon | None = None
 
     @property
@@ -210,6 +217,7 @@ class LawnMowerRoiPatrolPlanner:
         )
         first = self._waypoints[closest_index]
         self._next_index = (closest_index + 1) % len(self._waypoints)
+        self._delivered = 1
         return first
 
     def entry_target(
@@ -242,7 +250,15 @@ class LawnMowerRoiPatrolPlanner:
             raise RuntimeError("ROI patrol planner must be reset before use")
         waypoint = self._waypoints[self._next_index]
         self._next_index = (self._next_index + 1) % len(self._waypoints)
+        self._delivered += 1
         return waypoint
+
+    @property
+    def cycle_complete(self) -> bool:
+        """Every waypoint has been handed out once, so reaching the current
+        target closes one full lawn-mower cycle. The cursor still wraps: only
+        FlightConfig.roi_single_cycle decides whether to act on this."""
+        return bool(self._waypoints) and self._delivered >= len(self._waypoints)
 
     def retarget_altitude(self, new_altitude_m: float) -> None:
         """Rewrite every waypoint's Z in place, preserving XY order and the cursor."""
@@ -253,6 +269,7 @@ class LawnMowerRoiPatrolPlanner:
     def clear(self) -> None:
         self._waypoints = ()
         self._next_index = 0
+        self._delivered = 0
         self._allowed_area = None
 
     def snapshot(self) -> RoiPatrolProgress:

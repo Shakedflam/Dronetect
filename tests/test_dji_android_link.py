@@ -127,6 +127,35 @@ def test_zero_ground_setpoint_uses_fresh_rc_safety_not_gps():
         ttl_ms=250, safety_timeout_s=1.0))
 
 
+def test_phase4_pulse_requires_fresh_stable_airborne_telemetry_and_centered_rc():
+    now = [10.0]
+    link = _connected_link(now)
+    telemetry = AndroidTelemetry(
+        timestamp=time.time(), lat=32.0, lng=34.0, altitude_m=3.0,
+        heading_deg=0.0, speed_mps=0.0, battery_percent=80.0,
+        gimbal_pitch_deg=0.0, flight_mode="GPS_NORMAL", is_flying=True,
+    )
+    rc = AndroidRcState(
+        timestamp=time.time(), connected=True, forward=0.0, right=0.0,
+        up=0.0, yaw_rate=0.0, aircraft_connected=True, is_flying=True,
+    )
+    link._handle_message(json.dumps(build_android_telemetry_message(telemetry)))
+    link._handle_message(json.dumps(build_android_rc_state_message(rc)))
+    assert link.phase4_airborne_safety_rejection(1.0) is None
+    assert asyncio.run(link.send_phase4_vertical_pulse_setpoint(
+        vertical_mps=0.30, ttl_ms=250, safety_timeout_s=1.0))
+    assert json.loads(link._connection.sent_raw[0])["velocity"] == {
+        "x": 0.0, "y": 0.0, "z": 0.30}
+    assert not asyncio.run(link.send_phase4_vertical_pulse_setpoint(
+        vertical_mps=-0.30, ttl_ms=250, safety_timeout_s=1.0))
+    link._handle_message(json.dumps(build_android_rc_state_message(replace(rc, up=0.1))))
+    assert link.phase4_airborne_safety_rejection(1.0) == "rc_stick_moved_up_0.100"
+    assert not asyncio.run(link.send_phase4_vertical_pulse_setpoint(
+        vertical_mps=0.30, ttl_ms=250, safety_timeout_s=1.0))
+    now[0] += 1.1
+    assert link.phase4_airborne_safety_rejection(1.0) == "telemetry_stale"
+
+
 def test_authenticated_clock_probe_echoes_tablet_timestamp_and_server_receive_time():
     link = AndroidLink(auth_token="a" * 64)
     link._connection = _FakeConnection()

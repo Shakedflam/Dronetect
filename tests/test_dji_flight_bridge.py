@@ -382,6 +382,255 @@ def test_phase3_zero_heartbeat_survives_gps_gap_but_not_ground_safety_gap(monkey
     assert len(connection.messages) == 2
 
 
+def test_phase4_isolated_one_shot_pulse_never_uses_flight_logic_output(monkeypatch, capsys):
+    monkeypatch.setenv("DRONTECT_DJI_PHASE4_VERTICAL_PULSE", "1")
+    monkeypatch.delenv("DRONTECT_DJI_PHASE3_ZERO_STICK", raising=False)
+    now = [100.0]
+    bridge = _make_bridge(now)
+    bridge.realtime_link._mark_connected()
+
+    class RecordingConnection:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, raw):
+            self.messages.append(json.loads(raw))
+
+    connection = RecordingConnection()
+    # Establish session home on the ground without sending any Phase 4 command.
+    _feed_telemetry(bridge, now, is_flying=False, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert connection.messages == []
+
+    _queue_command(bridge, CommandName.START_PATROL.value)
+    for step in range(200):
+        now[0] = 101.0 + step * 0.05
+        _feed_telemetry(
+            bridge, now, is_flying=True, altitude_m=3.0, speed_mps=0.0,
+            battery_percent=80.0, flight_mode="GPS_NORMAL",
+        )
+        _feed_ground_rc(bridge, now, is_flying=True)
+        bridge.android_link._connection = connection
+        asyncio.run(bridge.run_tick_once())
+
+    setpoints = [message for message in connection.messages
+                 if message["type"] == "dji_setpoint"]
+    assert setpoints
+    assert all(message["velocity"]["x"] == 0.0 for message in setpoints)
+    assert all(message["velocity"]["y"] == 0.0 for message in setpoints)
+    assert all(message["yawDeg"] == 0.0 for message in setpoints)
+    assert {message["velocity"]["z"] for message in setpoints} == {0.0, 0.30}
+    # AWS keeps requesting the pulse while Android acquires authority. Android,
+    # not network timing, owns the non-extendable actuator deadline and the
+    # startAltitudeM + 1.0 m cutoff that normally ends the climb first.
+    assert sum(message["velocity"]["z"] == 0.30 for message in setpoints) <= 140
+    assert bridge._phase4_complete
+    assert bridge.logic.state is FlightState.IDLE
+    output = capsys.readouterr().out
+    assert "phase4_pulse=waiting reason=stable_hover_dwell" in output
+    assert "phase4_pulse=started verticalMps=0.30 maxPulseMs=5000" in output
+    assert "phase4_setpoint=transmitted verticalMps=0.30 ttlMs=250" in output
+    assert "phase4_setpoint=transmitted verticalMps=0.0 reason=settle" in output
+    assert "phase4_pulse=complete zeroSettleMs=1000" in output
+
+    count = len(setpoints)
+    now[0] += 0.05
+    _feed_telemetry(
+        bridge, now, is_flying=True, altitude_m=3.0, speed_mps=0.0,
+        battery_percent=80.0, flight_mode="GPS_NORMAL",
+    )
+    _feed_ground_rc(bridge, now, is_flying=True)
+    asyncio.run(bridge.run_tick_once())
+    assert len([message for message in connection.messages
+                if message["type"] == "dji_setpoint"]) == count
+
+
+def test_phase3_and_phase4_cannot_be_enabled_together(monkeypatch):
+    monkeypatch.setenv("DRONTECT_DJI_PHASE3_ZERO_STICK", "1")
+    monkeypatch.setenv("DRONTECT_DJI_PHASE4_VERTICAL_PULSE", "1")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _make_bridge([0.0])
+
+
+def test_phase4_aborted_attempt_rearms_only_after_fresh_stable_hover(monkeypatch, capsys):
+    monkeypatch.setenv("DRONTECT_DJI_PHASE4_VERTICAL_PULSE", "1")
+    monkeypatch.delenv("DRONTECT_DJI_PHASE3_ZERO_STICK", raising=False)
+    now = [100.0]
+    bridge = _make_bridge(now)
+    bridge.realtime_link._mark_connected()
+
+    class RecordingConnection:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, raw):
+            self.messages.append(json.loads(raw))
+
+    connection = RecordingConnection()
+    _feed_telemetry(bridge, now, is_flying=False, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+
+    # First valid dwell starts attempt one.
+    now[0] = 101.0
+    _feed_telemetry(bridge, now, is_flying=True, altitude_m=3.0,
+                    speed_mps=0.0, battery_percent=80.0, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now, is_flying=True)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    now[0] = 103.01
+    _feed_telemetry(bridge, now, is_flying=True, altitude_m=3.0,
+                    speed_mps=0.0, battery_percent=80.0, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now, is_flying=True)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    first_count = len(connection.messages)
+    assert first_count == 1
+
+    # Manual RC movement aborts it and clears the old attempt timestamps.
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, is_flying=True, altitude_m=3.0,
+                    speed_mps=0.0, battery_percent=80.0, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now, is_flying=True, up=0.1)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert bridge._phase4_started_at is None
+    assert bridge._phase4_safe_since is None
+    assert not bridge._phase4_complete
+
+    # Centering the RC is not enough by itself: a complete new dwell is required.
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, is_flying=True, altitude_m=3.0,
+                    speed_mps=0.0, battery_percent=80.0, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now, is_flying=True)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert len(connection.messages) == first_count
+    now[0] += 1.99
+    _feed_telemetry(bridge, now, is_flying=True, altitude_m=3.0,
+                    speed_mps=0.0, battery_percent=80.0, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now, is_flying=True)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert len(connection.messages) == first_count
+    now[0] += 0.02
+    _feed_telemetry(bridge, now, is_flying=True, altitude_m=3.0,
+                    speed_mps=0.0, battery_percent=80.0, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now, is_flying=True)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert len(connection.messages) == first_count + 1
+    assert connection.messages[-1]["velocity"] == {"x": 0.0, "y": 0.0, "z": 0.30}
+    output = capsys.readouterr().out
+    assert "phase4_pulse=aborted reason=airborne_guard detail=rc_stick_moved_up_0.100" in output
+    assert output.count("phase4_pulse=started") == 2
+
+
+def test_phase4_hardware_reconnect_discards_old_state_and_requires_new_dwell(monkeypatch):
+    monkeypatch.setenv("DRONTECT_DJI_PHASE4_VERTICAL_PULSE", "1")
+    monkeypatch.delenv("DRONTECT_DJI_PHASE3_ZERO_STICK", raising=False)
+    now = [100.0]
+    bridge = _make_bridge(now)
+    bridge.realtime_link._mark_connected()
+
+    class RecordingConnection:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, raw):
+            self.messages.append(json.loads(raw))
+
+    old_connection = RecordingConnection()
+    _feed_telemetry(bridge, now, is_flying=False, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now)
+    bridge.android_link._connection = old_connection
+    asyncio.run(bridge.run_tick_once())
+    old_session = bridge.android_link._session_id
+
+    # Model any prior terminal attempt state, then establish a new authenticated
+    # hardware session. AndroidLink clears all old observations and sequence state.
+    bridge._phase4_complete = True
+    bridge._phase4_started_at = 50.0
+    bridge._phase4_safe_since = 48.0
+    bridge.android_link._connection = None
+    bridge.android_link._mark_disconnected()
+    now[0] += 1.0
+    new_connection = RecordingConnection()
+    bridge.android_link._connection = new_connection
+    bridge.android_link._mark_connected()
+    assert bridge.android_link._session_id != old_session
+
+    # The reconnect alone cannot replay or emit anything: observations are empty.
+    asyncio.run(bridge.run_tick_once())
+    assert new_connection.messages == []
+    assert not bridge._phase4_complete
+    assert bridge._phase4_started_at is None
+
+    # Fresh airborne facts start a brand-new dwell, not an immediate pulse.
+    _feed_telemetry(bridge, now, is_flying=True, altitude_m=3.0,
+                    speed_mps=0.0, battery_percent=80.0, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now, is_flying=True)
+    bridge.android_link._connection = new_connection
+    asyncio.run(bridge.run_tick_once())
+    assert new_connection.messages == []
+    now[0] += 2.01
+    _feed_telemetry(bridge, now, is_flying=True, altitude_m=3.0,
+                    speed_mps=0.0, battery_percent=80.0, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now, is_flying=True)
+    bridge.android_link._connection = new_connection
+    asyncio.run(bridge.run_tick_once())
+    assert len(new_connection.messages) == 1
+    assert new_connection.messages[0]["sessionId"] == bridge.android_link._session_id
+    assert new_connection.messages[0]["velocity"] == {"x": 0.0, "y": 0.0, "z": 0.30}
+
+
+def test_phase4_moved_rc_never_starts_until_centered_for_full_dwell(monkeypatch):
+    monkeypatch.setenv("DRONTECT_DJI_PHASE4_VERTICAL_PULSE", "1")
+    monkeypatch.delenv("DRONTECT_DJI_PHASE3_ZERO_STICK", raising=False)
+    now = [100.0]
+    bridge = _make_bridge(now)
+    bridge.realtime_link._mark_connected()
+
+    class RecordingConnection:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, raw):
+            self.messages.append(json.loads(raw))
+
+    connection = RecordingConnection()
+    _feed_telemetry(bridge, now, is_flying=False, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    for timestamp in (101.0, 104.0, 108.0):
+        now[0] = timestamp
+        _feed_telemetry(bridge, now, is_flying=True, altitude_m=3.0,
+                        speed_mps=0.0, battery_percent=80.0, flight_mode="GPS_NORMAL")
+        _feed_ground_rc(bridge, now, is_flying=True, up=0.1)
+        bridge.android_link._connection = connection
+        asyncio.run(bridge.run_tick_once())
+    assert connection.messages == []
+    assert bridge._phase4_safe_since is None
+
+    now[0] = 109.0
+    _feed_telemetry(bridge, now, is_flying=True, altitude_m=3.0,
+                    speed_mps=0.0, battery_percent=80.0, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now, is_flying=True)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    now[0] = 111.01
+    _feed_telemetry(bridge, now, is_flying=True, altitude_m=3.0,
+                    speed_mps=0.0, battery_percent=80.0, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now, is_flying=True)
+    bridge.android_link._connection = connection
+    asyncio.run(bridge.run_tick_once())
+    assert len(connection.messages) == 1
+
+
 def test_phase2_applies_ui_operating_config_before_hardware_gps(monkeypatch):
     monkeypatch.setenv("DRONTECT_DJI_PHASE1_TELEMETRY_ONLY", "1")
     monkeypatch.setenv("DRONTECT_DJI_PHASE2_ACTIONS", "1")
@@ -536,6 +785,44 @@ def test_set_roi_transitions_flight_state_toward_the_roi():
     outcome = bridge.tick(0.05, now=now[0])
 
     assert outcome.state in {FlightState.TRANSITING_TO_ROI.value, FlightState.TAKING_OFF.value}
+
+
+def test_manually_flown_idle_session_reaches_roi_patrol_from_one_set_roi():
+    """The real-demo path: the operator takes off manually, so FlightLogic is
+    still IDLE when the ROI arrives. It must transit and start covering."""
+    now = [0.0]
+    bridge = _make_bridge(now)
+    cruise = bridge.logic.config.takeoff_altitude
+    _feed_telemetry(bridge, now, altitude_m=cruise)
+    bridge.tick(0.05, now=now[0])
+    assert bridge.logic.state is FlightState.IDLE
+
+    roi_point = destination_point(DEFAULT_HOME, 60.0, 0.0)
+    _queue_command(
+        bridge,
+        CommandName.SET_ROI.value,
+        {"center": {"lat": roi_point.lat, "lon": roi_point.lng}, "radiusM": 20.0},
+    )
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, altitude_m=cruise)
+    outcome = bridge.tick(0.05, now=now[0])
+    assert outcome.state == FlightState.TRANSITING_TO_ROI.value
+
+    # Fly the aircraft onto whatever target the logic is steering toward until
+    # it reports it is inside the ROI and covering it.
+    for _ in range(200):
+        target = bridge.logic.target
+        assert target is not None
+        local = local_meters_to_wgs84(
+            LocalPosition(x=target[0], y=target[1], z=target[2]), bridge.session_home
+        )
+        now[0] += 0.05
+        _feed_telemetry(bridge, now, lat=local.lat, lng=local.lng, altitude_m=target[2])
+        outcome = bridge.tick(0.05, now=now[0])
+        if outcome.state == FlightState.ROI_PATROL.value:
+            break
+
+    assert outcome.state == FlightState.ROI_PATROL.value
 
 
 def test_return_home_sets_safety_rth_when_safety_reason_present():

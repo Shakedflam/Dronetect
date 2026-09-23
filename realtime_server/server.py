@@ -73,7 +73,11 @@ DJI_TELEMETRY_SOURCE = "dji"
 # one grounded/airborne signal common to *every* path telemetry can reach
 # this server through (the AWS bridge, or a tablet connecting directly as
 # role=drone), so it's what session-home capture keys off here.
-DJI_GROUNDED_STATE = "LANDED"
+# Both of FlightLogic's on-ground states. IDLE is the one a fresh session
+# actually reports: LANDED is only reached after an *autonomous* landing, so a
+# manually flown session never leaves IDLE and would never confirm a session
+# home. flight_bridge.py's kinematic step already treats the pair identically.
+DJI_GROUNDED_STATES = frozenset({"IDLE", "LANDED"})
 
 
 class RealtimeServer:
@@ -398,7 +402,7 @@ class RealtimeServer:
         if (
             self._session_home is None
             and telemetry.get("source") == DJI_TELEMETRY_SOURCE
-            and data["state"] == DJI_GROUNDED_STATE
+            and data["state"] in DJI_GROUNDED_STATES
         ):
             # First grounded real-DJI fix, from whichever path it arrived
             # through (the AWS bridge or a tablet connecting directly) --

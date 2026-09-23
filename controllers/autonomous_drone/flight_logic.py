@@ -75,6 +75,9 @@ MANUAL_ALLOWED_STATES = frozenset({
 class FlightConfig:
     idle_duration: float = 1.0
     takeoff_altitude: float = 2.5
+    # Real-demo only: stop after one complete lawn-mower cycle instead of
+    # wrapping forever. Default False keeps simulator/general ROI continuous.
+    roi_single_cycle: bool = False
     x_bounds: tuple[float, float] = (-8.0, 8.0)
     y_bounds: tuple[float, float] = (-8.0, 8.0)
     z_bounds: tuple[float, float] = (2.5, 5.0)
@@ -382,6 +385,7 @@ class FlightLogic:
         # control that actually gates it, so it must be explicit state rather
         # than something inferred from whatever the aircraft is doing.
         self._pursuit_blocked = False
+        self._roi_coverage_complete = False
         # Manual takeover. While engaged the autopilot picks no waypoints at
         # all; the operator's stick is the only thing moving the aircraft, and
         # a centered stick is a hover.
@@ -477,7 +481,13 @@ class FlightLogic:
                 # Recover to the nearest point in the clipped ROI/home area.
                 self.target = self._roi_center_target()
             elif self.target is None or self._has_reached(position, self.target):
-                self.target = self.roi_patrol_planner.next_waypoint()
+                if (
+                    self.config.roi_single_cycle
+                    and self.roi_patrol_planner.cycle_complete
+                ):
+                    self._complete_roi_coverage(position)
+                else:
+                    self.target = self.roi_patrol_planner.next_waypoint()
 
         elif self.state is FlightState.PATROLLING:
             if self.target is None or self._has_reached(position, self.target):
@@ -2101,6 +2111,20 @@ class FlightLogic:
             raise RuntimeError("Cannot start ROI patrol without an ROI")
         self.state = FlightState.ROI_PATROL
         self.target = self._roi_first_waypoint
+
+    def _complete_roi_coverage(self, position: Position) -> None:
+        """One full cycle done: hold station exactly as clear_roi() does, so
+        RTH and manual takeover both stay available from HOLDING. The ROI
+        geometry is kept so the operator can still see where it was."""
+        self.state = FlightState.HOLDING
+        self.target = position
+        self._roi_coverage_complete = True
+
+    def consume_roi_coverage_complete(self) -> bool:
+        """One-shot read so the caller logs the event exactly once."""
+        completed = self._roi_coverage_complete
+        self._roi_coverage_complete = False
+        return completed
 
     def _roi_center_target(self) -> Position:
         if self._roi_center is None:

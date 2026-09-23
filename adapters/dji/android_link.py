@@ -253,6 +253,61 @@ class AndroidLink:
                 all(abs(axis) <= 33 / 660 for axis in
                     (state.forward, state.right, state.up, state.yaw_rate)))
 
+    def is_phase4_airborne_safety_fresh(self, timeout_s: float, now: float | None = None) -> bool:
+        """Strict bridge-side gate for the isolated Phase 4 climb pulse."""
+        return self.phase4_airborne_safety_rejection(timeout_s, now) is None
+
+    def phase4_airborne_safety_rejection(
+        self, timeout_s: float, now: float | None = None,
+    ) -> str | None:
+        """Return the exact Phase 4 guard failure, or None when safe.
+
+        This is diagnostic detail for the existing gate, not a second policy:
+        is_phase4_airborne_safety_fresh delegates here so the two cannot drift.
+        """
+        telemetry = self._latest_telemetry
+        rc = self._latest_rc_state
+        if not self.connected:
+            return "hardware_disconnected"
+        if telemetry is None or self._telemetry_received_monotonic is None:
+            return "telemetry_unavailable"
+        if rc is None or self._rc_received_monotonic is None:
+            return "rc_state_unavailable"
+        current = self._clock() if now is None else now
+        telemetry_age = current - self._telemetry_received_monotonic
+        rc_age = current - self._rc_received_monotonic
+        if not 0.0 <= telemetry_age <= timeout_s:
+            return "telemetry_stale"
+        if not 0.0 <= rc_age <= timeout_s:
+            return "rc_state_stale"
+        if telemetry.is_flying is not True:
+            return "telemetry_not_airborne"
+        if rc.is_flying is not True:
+            return "rc_state_not_airborne"
+        if not rc.connected:
+            return "rc_disconnected"
+        if rc.aircraft_connected is not True:
+            return "aircraft_disconnected"
+        if telemetry.battery_percent < 30.0:
+            return "battery_below_30"
+        if not 2.0 <= telemetry.altitude_m <= 7.0:
+            return "altitude_outside_2_to_7_m"
+        if telemetry.speed_mps > 1.0:
+            return "speed_above_1_mps"
+        if telemetry.flight_mode not in {"GPS_NORMAL", "VIRTUAL_STICK"}:
+            return f"flight_mode_{telemetry.flight_mode or 'unavailable'}"
+        axes = {
+            "forward": rc.forward,
+            "right": rc.right,
+            "up": rc.up,
+            "yaw_rate": rc.yaw_rate,
+        }
+        moved = next(((name, value) for name, value in axes.items()
+                      if abs(value) > 33 / 660), None)
+        if moved is not None:
+            return f"rc_stick_moved_{moved[0]}_{moved[1]:.3f}"
+        return None
+
     # -- outbound (bridge -> Android) -----------------------------------------
 
     async def send_setpoint(
@@ -280,6 +335,17 @@ class AndroidLink:
         return await self._send_setpoint(
             velocity_x_mps=0.0, velocity_y_mps=0.0,
             velocity_z_mps=0.0, yaw_deg=0.0, ttl_ms=ttl_ms)
+
+    async def send_phase4_vertical_pulse_setpoint(
+        self, *, vertical_mps: float, ttl_ms: int, safety_timeout_s: float,
+    ) -> bool:
+        if vertical_mps not in {0.0, 0.30}:
+            return False
+        if not self.is_phase4_airborne_safety_fresh(safety_timeout_s):
+            return False
+        return await self._send_setpoint(
+            velocity_x_mps=0.0, velocity_y_mps=0.0,
+            velocity_z_mps=vertical_mps, yaw_deg=0.0, ttl_ms=ttl_ms)
 
     async def _send_setpoint(
         self, *, velocity_x_mps: float, velocity_y_mps: float,

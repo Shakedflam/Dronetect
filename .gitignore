@@ -109,3 +109,16 @@ dronetect-fresh-log.txt
 dji-video-test.txt
 dronetect-wss-test.txt
 dronetect-crash.txt
+phase4-android.txt
+
+# Stray zero-byte files left behind when a docker build log gets redirected by
+# an unquoted shell word (buildkit prints these tokens). Safe to delete.
+=
+CACHED
+\[auth\]
+\[internal\]
+exporting
+naming
+resolve
+transferring
+unpacking

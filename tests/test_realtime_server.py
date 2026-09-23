@@ -1194,8 +1194,9 @@ def test_operating_config_pending_resets_on_drone_disconnect():
 # independently here from whatever telemetry this server receives (via the
 # AWS bridge, or a tablet connecting directly as role=drone -- see
 # DroneWireProtocol.kt): captured once, from the first source="dji" telemetry
-# sample reporting state=="LANDED" (grounded), and never moved again for this
-# process's lifetime. See RealtimeServer._session_home / _effective_home.
+# sample reporting an on-ground state -- IDLE or LANDED -- and never moved
+# again for this process's lifetime. See RealtimeServer._session_home /
+# _effective_home.
 
 FAR_AWAY_FIX = {"lat": 35.6762, "lng": 139.6503}  # Tokyo -- nowhere near DEFAULT_HOME
 
@@ -1219,6 +1220,36 @@ def _dji_telemetry(*, lat, lng, state="LANDED", **overrides):
     )
     data.update(overrides)
     return {"type": "telemetry", "timestamp": 1.0, "source": "dji", "data": data}
+
+
+def test_manually_flown_dji_session_confirms_home_from_idle_state():
+    """A manual takeoff never puts FlightLogic in LANDED: it stays IDLE for the
+    whole session. Requiring LANDED left sessionHome null forever, which kept
+    the tablet's geometry (and therefore the ROI control) permanently gated."""
+
+    async def scenario():
+        realtime_server = RealtimeServer()
+        async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            base_url = f"ws://127.0.0.1:{port}/ws"
+            async with (
+                connect(f"{base_url}?role=drone") as drone,
+                connect(f"{base_url}?role=tablet") as tablet,
+            ):
+                initial = await _receive_initial_mission_state(tablet)
+                assert initial["sessionHome"] is None
+
+                await drone.send(encode_message(_dji_telemetry(
+                    lat=FAR_AWAY_FIX["lat"], lng=FAR_AWAY_FIX["lng"],
+                    state="IDLE", altitudeM=0.0,
+                )))
+                status = json.loads(await asyncio.wait_for(tablet.recv(), 1.0))
+                await asyncio.wait_for(tablet.recv(), 1.0)  # telemetry echo
+
+                assert status["sessionHome"] == pytest.approx(FAR_AWAY_FIX)
+                assert realtime_server._session_home is not None
+
+    asyncio.run(scenario())
 
 
 def test_dji_session_home_is_used_for_set_roi_validation_and_reported_to_tablets():

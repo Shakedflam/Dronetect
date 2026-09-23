@@ -89,6 +89,9 @@ see DjiFlightBridge's docstring).
 
 Phase 2 keeps setpoints disabled while allowing one-shot gimbal and RTH
 actions through the existing Android hardware link.
+
+Phase 4 is a separate, opt-in one-shot vertical pulse. It never forwards the
+FlightLogic TickOutcome setpoint and leaves phase1_telemetry_only asserted.
 """
 
 from __future__ import annotations
@@ -148,6 +151,14 @@ ANDROID_LINK_LOSS_REASON = "android_link_lost"
 DEFAULT_PATROL_LANE_SPACING_M = 75.0
 # Matches autonomous_drone.py's DRONTECT_MISSION_RETURN_TIMEOUT_S fallback.
 DEFAULT_MISSION_RETURN_TIMEOUT_S = 10.0
+
+PHASE4_VERTICAL_SPEED_MPS = 0.30
+# Must outlast Android's local pulse window so the Android-side altitude cutoff,
+# not network timing, is what ends the climb.
+PHASE4_PULSE_SECONDS = 5.00
+PHASE4_AUTHORITY_ACQUIRE_SECONDS = 1.50
+PHASE4_ZERO_SETTLE_SECONDS = 1.00
+PHASE4_STABLE_HOVER_SECONDS = 2.00
 
 # States in which losing a command/telemetry link means "still in the air,
 # bring it home" rather than "already on the ground, nothing to do". Mirrors
@@ -219,7 +230,10 @@ class BridgeConfig:
     android_telemetry_timeout_s: float = 1.0
     android_connection_loss_rth_s: float = 3.0
     realtime_connection_loss_rth_s: float = 5.0
-    setpoint_ttl_ms: int = 250
+    # At 20 Hz this is 10 consecutive updates. 250 ms could not cover a field
+    # LTE round trip, so healthy setpoints were rejected as stale; loss of link
+    # still zeroes within one TTL and then releases authority.
+    setpoint_ttl_ms: int = 500
     gimbal_command_ttl_ms: int = 1000
     manual_stick_command_timeout_s: float = 0.5
     mission_return_timeout_s: float = DEFAULT_MISSION_RETURN_TIMEOUT_S
@@ -321,10 +335,18 @@ class DjiFlightBridge:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         phase2_requested = os.getenv("DRONTECT_DJI_PHASE2_ACTIONS") == "1"
+        # Real-demo only: one lawn-mower cycle then HOLDING. Simulator and any
+        # other FlightLogic host keep the continuous default.
+        self.roi_single_cycle = os.getenv("DRONTECT_DJI_ROI_SINGLE_CYCLE") == "1"
         self.phase3_zero_stick = os.getenv("DRONTECT_DJI_PHASE3_ZERO_STICK") == "1"
+        self.phase4_vertical_pulse = os.getenv("DRONTECT_DJI_PHASE4_VERTICAL_PULSE") == "1"
+        if self.phase3_zero_stick and self.phase4_vertical_pulse:
+            raise RealFlightConfigurationError(
+                "Phase 3 and Phase 4 are mutually exclusive; disable Phase 3 before arming Phase 4"
+            )
         # Authenticated AWS hardware links default to the read-only path;
         # requesting Phase 2 can never select the legacy setpoint path.
-        self.phase1_telemetry_only = phase2_requested or self.phase3_zero_stick or os.getenv(
+        self.phase1_telemetry_only = phase2_requested or self.phase3_zero_stick or self.phase4_vertical_pulse or os.getenv(
             "DRONTECT_DJI_PHASE1_TELEMETRY_ONLY",
             "1" if os.getenv("DRONTECT_DJI_BRIDGE_TOKEN") else "0",
         ) == "1"
@@ -358,6 +380,15 @@ class DjiFlightBridge:
         self.session_home: Wgs84Point | None = None
         self._last_phase1_publish = 0.0
         self._last_phase3_cadence_log = 0.0
+        self._last_autonomous_state_log = 0.0
+        # -inf so the very first occurrence always prints: a monotonic clock
+        # starting near zero would otherwise swallow the one that matters most.
+        self._last_home_wait_log = float("-inf")
+        self._phase4_started_at: float | None = None
+        self._phase4_safe_since: float | None = None
+        self._phase4_complete = False
+        self._phase4_nonzero_tx_logged = False
+        self._phase4_zero_tx_logged = False
         self._pending_phase2_actions: list[tuple[str, float | str]] = []
         # phase1_telemetry_only's targetFollowDiagnostics display state --
         # see _Phase1DetectionSnapshot's docstring. Read only by
@@ -402,6 +433,9 @@ class DjiFlightBridge:
             roi_patrol_planner=LawnMowerRoiPatrolPlanner(),
             patrol_waypoint_provider=self._next_patrol_waypoint,
         )
+        if self.roi_single_cycle:
+            # Survives the operating-config replace(), which keeps other fields.
+            self.logic.config = replace(self.logic.config, roi_single_cycle=True)
         if camera_horizontal_fov_rad is not None:
             self.logic.pursuit.config = replace(
                 self.logic.pursuit.config, horizontal_fov_rad=camera_horizontal_fov_rad
@@ -433,6 +467,14 @@ class DjiFlightBridge:
     @property
     def is_configured_for_flight(self) -> bool:
         return self.operating_config is not None
+
+    def _reset_phase4_attempt(self) -> None:
+        """Discard one Phase 4 attempt and require a fresh stable-hover dwell."""
+        self._phase4_started_at = None
+        self._phase4_safe_since = None
+        self._phase4_complete = False
+        self._phase4_nonzero_tx_logged = False
+        self._phase4_zero_tx_logged = False
 
     # -- one control cycle, synchronous and unit-testable ---------------------
 
@@ -468,6 +510,10 @@ class DjiFlightBridge:
                 self.logic.target = None
                 self._pending_phase2_actions.clear()
                 self._phase1_detection_snapshot = None
+                if self.phase4_vertical_pulse:
+                    self._reset_phase4_attempt()
+                    print("DJI bridge: phase4_pulse=rearmed reason=hardware_session_changed "
+                          f"generation={self.android_link.session_generation}")
             self._update_phase1_detection_diagnostics(detections_drained, now)
             telemetry = self.android_link.latest_telemetry
             fresh = telemetry is not None and self.android_link.is_telemetry_fresh(
@@ -583,6 +629,9 @@ class DjiFlightBridge:
         state_before_detection = self.logic.state
         self._update_manual_stick()
         self.logic.update(position, dt, yaw=yaw, camera_pitch=self.camera_gimbal.pitch)
+        if self.logic.consume_roi_coverage_complete():
+            print(f"DJI bridge: roi_coverage=complete roi={self._active_roi_id} "
+                  f"state={self.logic.state.value}")
         self._coordinate_mission_resume(position, state_before_detection)
         self._consume_pending_operating_config(position)
         step = self._apply_kinematic_flight(position, yaw, dt)
@@ -625,9 +674,23 @@ class DjiFlightBridge:
         (telemetry.is_flying is True on the first sample after the process
         comes back up) from ever adopting an airborne position as home.
         """
-        if self.session_home is not None or telemetry.is_flying is not False:
+        if self.session_home is not None:
+            return
+        if telemetry.is_flying is not False:
+            # Adopting an airborne position as home would silently corrupt every
+            # ROI/patrol/radius geometry, so it stays refused -- but without a
+            # home the bridge produces no setpoints at all and the aircraft just
+            # sits there, so say so instead of stalling quietly.
+            now = self._clock()
+            if now - self._last_home_wait_log >= 5.0:
+                self._last_home_wait_log = now
+                print("DJI bridge: session_home=waiting reason=aircraft_not_grounded "
+                      "detail=no_setpoints_until_a_grounded_fix_is_seen "
+                      f"isFlying={telemetry.is_flying}")
             return
         self.session_home = Wgs84Point(lat=telemetry.lat, lng=telemetry.lng)
+        print(f"DJI bridge: session_home=established lat={telemetry.lat:.6f} "
+              f"lng={telemetry.lng:.6f}")
         self._rebuild_patrol_geometry_for_home(self.session_home)
 
     def _rebuild_patrol_geometry_for_home(self, home: Wgs84Point) -> None:
@@ -1526,6 +1589,50 @@ class DjiFlightBridge:
                       f"telemetryAgeMs={None if telemetry_age is None else round(telemetry_age * 1000)} "
                       f"groundSafety={self.android_link.is_zero_ground_safety_fresh(self.config.android_telemetry_timeout_s, now)}")
 
+        if self.phase4_vertical_pulse and not self._phase4_complete:
+            now = self._clock()
+            guard_reason = self.android_link.phase4_airborne_safety_rejection(
+                self.config.android_telemetry_timeout_s, now)
+            safe = guard_reason is None
+            if self._phase4_started_at is None:
+                eligible = self.is_configured_for_flight and self.realtime_link.connected and safe
+                if not eligible:
+                    self._phase4_safe_since = None
+                elif self._phase4_safe_since is None:
+                    self._phase4_safe_since = now
+                    print("DJI bridge: phase4_pulse=waiting reason=stable_hover_dwell")
+                elif now - self._phase4_safe_since >= PHASE4_STABLE_HOVER_SECONDS:
+                    self._phase4_started_at = now
+                    print("DJI bridge: phase4_pulse=started verticalMps=0.30 "
+                          f"maxPulseMs={int(PHASE4_PULSE_SECONDS * 1000)}")
+            else:
+                elapsed = now - self._phase4_started_at
+                if not safe:
+                    print("DJI bridge: phase4_pulse=aborted reason=airborne_guard "
+                          f"detail={guard_reason}")
+                    self._reset_phase4_attempt()
+                elif elapsed >= (PHASE4_AUTHORITY_ACQUIRE_SECONDS + PHASE4_PULSE_SECONDS +
+                                 PHASE4_ZERO_SETTLE_SECONDS):
+                    self._phase4_complete = True
+                    print("DJI bridge: phase4_pulse=complete zeroSettleMs=1000")
+
+            if self._phase4_started_at is not None and not self._phase4_complete:
+                elapsed = now - self._phase4_started_at
+                vertical_mps = (PHASE4_VERTICAL_SPEED_MPS
+                                if elapsed < PHASE4_AUTHORITY_ACQUIRE_SECONDS + PHASE4_PULSE_SECONDS
+                                else 0.0)
+                sent = await self.android_link.send_phase4_vertical_pulse_setpoint(
+                    vertical_mps=vertical_mps,
+                    ttl_ms=self.config.setpoint_ttl_ms,
+                    safety_timeout_s=self.config.android_telemetry_timeout_s,
+                )
+                if sent and vertical_mps != 0.0 and not self._phase4_nonzero_tx_logged:
+                    self._phase4_nonzero_tx_logged = True
+                    print("DJI bridge: phase4_setpoint=transmitted verticalMps=0.30 ttlMs=250")
+                elif sent and vertical_mps == 0.0 and not self._phase4_zero_tx_logged:
+                    self._phase4_zero_tx_logged = True
+                    print("DJI bridge: phase4_setpoint=transmitted verticalMps=0.0 reason=settle")
+
         if self.phase1_telemetry_only and self.phase2_actions and self._pending_phase2_actions:
             # Flushed regardless of outcome.has_position: gimbal/RTH actions
             # queued this tick require fresh Android telemetry (enforced in
@@ -1563,6 +1670,16 @@ class DjiFlightBridge:
 
         assert outcome.position is not None and outcome.yaw_rad is not None
         yaw_deg = (90.0 - math.degrees(outcome.yaw_rad)) % 360.0
+        now_log = self._clock()
+        if now_log - self._last_autonomous_state_log >= 1.0:
+            self._last_autonomous_state_log = now_log
+            print(f"DJI bridge: autonomous_state state={outcome.state} "
+                  f"roi={self._active_roi_id} "
+                  f"velEast={outcome.velocity_x_mps:.2f} velNorth={outcome.velocity_y_mps:.2f} "
+                  f"velUp={outcome.velocity_z_mps:.2f} yawDeg={yaw_deg:.1f} "
+                  f"altM={outcome.position[2]:.1f} "
+                  f"pursuitBlocked={outcome.pursuit_blocked} "
+                  f"manual={outcome.manual_control_active}")
         await self.android_link.send_setpoint(
             velocity_x_mps=outcome.velocity_x_mps,
             velocity_y_mps=outcome.velocity_y_mps,
@@ -1625,7 +1742,8 @@ def main() -> None:
         raise RealFlightConfigurationError("DRONTECT_DJI_BRIDGE_TOKEN is required for the hardware link")
     print(
         "DJI flight bridge mode="
-        + ("zero_stick_ground_test" if bridge.phase3_zero_stick else
+        + ("phase4_vertical_pulse" if bridge.phase4_vertical_pulse else
+           "zero_stick_ground_test" if bridge.phase3_zero_stick else
            "gimbal_rth_only" if bridge.phase2_actions else
            "telemetry_only" if bridge.phase1_telemetry_only else "legacy")
     )

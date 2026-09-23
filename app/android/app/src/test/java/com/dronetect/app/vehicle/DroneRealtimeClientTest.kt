@@ -14,6 +14,72 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DroneRealtimeClientTest {
+    @Test fun phase4PulseNeedsApkOptInAndUsesOnlyDedicatedControllerEntryPoint() {
+        val server = MockWebServer()
+        val session = "b".repeat(32)
+        val accepted = CountDownLatch(1)
+        val staleAborted = CountDownLatch(1)
+        val acceptedVertical = CopyOnWriteArrayList<Double>()
+        val stick = object : ZeroStickControl {
+            override fun newSession() = Unit
+            override fun acceptZero(
+                snapshot: DjiTelemetrySnapshot, deadlineMs: Long, nowMs: Long,
+            ): Boolean = false
+            override fun acceptPhase4Pulse(
+                snapshot: DjiTelemetrySnapshot, verticalMps: Double,
+                deadlineMs: Long, nowMs: Long,
+            ): Boolean {
+                acceptedVertical.add(verticalMps)
+                accepted.countDown()
+                return true
+            }
+            override fun tick(snapshot: DjiTelemetrySnapshot, nowMs: Long) = Unit
+            override fun stop(reason: String) {
+                if (reason == "stale_or_invalid_setpoint") staleAborted.countDown()
+            }
+        }
+        server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                webSocket.send("""{"type":"dji_hello","sessionId":"$session"}""")
+            }
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                val probe = JSONObject(text)
+                if (probe.optString("type") != "dji_clock_probe") return
+                val now = System.currentTimeMillis() / 1000.0
+                webSocket.send(JSONObject().put("type", "dji_clock_sync")
+                    .put("sessionId", session).put("probeTimestamp", probe.getDouble("timestamp"))
+                    .put("serverReceivedAt", now).toString())
+                webSocket.send(JSONObject().put("type", "dji_setpoint")
+                    .put("sessionId", session).put("seq", 1).put("issuedAt", now)
+                    .put("ttlMs", 250).put("velocity", JSONObject()
+                        .put("x", 0.0).put("y", 0.0).put("z", 0.30))
+                    .put("yawDeg", 0.0).toString())
+                webSocket.send(JSONObject().put("type", "dji_setpoint")
+                    .put("sessionId", session).put("seq", 2).put("issuedAt", now - 5.0)
+                    .put("ttlMs", 250).put("velocity", JSONObject()
+                        .put("x", 0.0).put("y", 0.0).put("z", 0.30))
+                    .put("yawDeg", 0.0).toString())
+            }
+        }))
+        server.start()
+        val snapshot = DjiTelemetrySnapshot(aircraftConnected = true, isFlying = true)
+        val logs = CopyOnWriteArrayList<String>()
+        val client = DroneRealtimeClient(
+            "ws://127.0.0.1:${server.port}", "a".repeat(64),
+            { DjiTelemetryState("connected", snapshot, System.currentTimeMillis()) },
+            log = { logs.add(it) }, zeroStickControl = stick, phase4PulseEnabled = true,
+            autonomousEnabled = false,
+        )
+        try {
+            client.start()
+            assertTrue(accepted.await(5, TimeUnit.SECONDS))
+            assertTrue(staleAborted.await(5, TimeUnit.SECONDS))
+            assertEquals(listOf(0.30), acceptedVertical.toList())
+            assertTrue(logs.any { it.contains("phase4_setpoint=received") &&
+                it.contains("requestedVerticalMps=0.3") && it.contains("remainingTtlMs=") })
+        } finally { client.stop(); server.shutdown() }
+    }
+
     @Test fun sendsGroundSafetyStateWithoutGpsPosition() {
         val server = MockWebServer()
         val received = CountDownLatch(1)
@@ -100,7 +166,7 @@ class DroneRealtimeClientTest {
             log = {
                 logs.add(it)
                 if (it.contains("nonzero_or_invalid_ground_test")) rejectedNonzero.countDown()
-            }, zeroStickControl = stick)
+            }, zeroStickControl = stick, autonomousEnabled = false)
         try {
             client.start()
             assertTrue(accepted.await(5, TimeUnit.SECONDS))
@@ -159,7 +225,7 @@ class DroneRealtimeClientTest {
             rcRightHorizontal = 0, rcRightVertical = 0)
         val client = DroneRealtimeClient("ws://127.0.0.1:${server.port}", "a".repeat(64),
             { DjiTelemetryState("connected", snapshot, System.currentTimeMillis()) },
-            log = {}, zeroStickControl = stick)
+            log = {}, zeroStickControl = stick, autonomousEnabled = false)
         try {
             client.start()
             assertTrue(accepted.await(5, TimeUnit.SECONDS))
@@ -253,6 +319,64 @@ class DroneRealtimeClientTest {
             val request = server.takeRequest(1, TimeUnit.SECONDS)!!
             assertEquals("/dji/bridge", request.path)
             assertEquals("Bearer $token", request.getHeader("Authorization"))
+        } finally { client.stop(); server.shutdown() }
+    }
+
+    /**
+     * The real-demo path: an ROI setpoint carries non-zero horizontal velocity
+     * and a heading, which the Phase-3/4 envelope rejects outright. Pins the
+     * autonomous routing so it cannot regress unnoticed the way it did when
+     * these tests silently inherited the flag from local.properties.
+     */
+    @Test fun autonomousModeRoutesFullVelocityAndHeadingSetpointsToTheController() {
+        val server = MockWebServer()
+        val session = "c".repeat(32)
+        val accepted = CountDownLatch(1)
+        val seen = CopyOnWriteArrayList<List<Double>>()
+        val stick = object : ZeroStickControl {
+            override fun newSession() = Unit
+            override fun acceptZero(snapshot: DjiTelemetrySnapshot, deadlineMs: Long, nowMs: Long) = false
+            override fun acceptAutonomous(
+                snapshot: DjiTelemetrySnapshot, eastMps: Double, northMps: Double, upMps: Double,
+                headingDeg: Double, deadlineMs: Long, nowMs: Long,
+            ): Boolean {
+                seen.add(listOf(eastMps, northMps, upMps, headingDeg))
+                accepted.countDown()
+                return true
+            }
+            override fun tick(snapshot: DjiTelemetrySnapshot, nowMs: Long) = Unit
+            override fun stop(reason: String) = Unit
+        }
+        server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                webSocket.send("""{"type":"dji_hello","sessionId":"$session"}""")
+            }
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                val probe = JSONObject(text)
+                if (probe.optString("type") != "dji_clock_probe") return
+                val tabletTime = probe.getDouble("timestamp")
+                val awsTime = tabletTime
+                webSocket.send(JSONObject().put("type", "dji_clock_sync")
+                    .put("sessionId", session).put("probeTimestamp", tabletTime)
+                    .put("serverReceivedAt", awsTime).toString())
+                webSocket.send(JSONObject().put("type", "dji_setpoint")
+                    .put("sessionId", session).put("seq", 1).put("issuedAt", awsTime)
+                    .put("ttlMs", 500).put("velocity", JSONObject()
+                        .put("x", 1.2).put("y", -0.8).put("z", 0.4))
+                    .put("yawDeg", 270.0).toString())
+            }
+        }))
+        server.start()
+        val snapshot = DjiTelemetrySnapshot(aircraftConnected = true, isFlying = true)
+        val client = DroneRealtimeClient("ws://127.0.0.1:${server.port}", "a".repeat(64),
+            { DjiTelemetryState("connected", snapshot, System.currentTimeMillis()) },
+            log = {}, zeroStickControl = stick, autonomousEnabled = true)
+        try {
+            client.start()
+            assertTrue(accepted.await(5, TimeUnit.SECONDS))
+            // ENU east/north/up and the compass heading arrive unaltered; the
+            // clamp and ENU->DJI mapping happen inside the controller.
+            assertEquals(listOf(1.2, -0.8, 0.4, 270.0), seen.first())
         } finally { client.stop(); server.shutdown() }
     }
 }

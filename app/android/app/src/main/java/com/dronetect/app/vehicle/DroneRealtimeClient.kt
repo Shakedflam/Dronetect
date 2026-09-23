@@ -1,6 +1,7 @@
 package com.dronetect.app.vehicle
 
 import android.util.Log
+import com.dronetect.app.BuildConfig
 import java.net.URI
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
@@ -25,14 +26,25 @@ class DroneRealtimeClient(
         .pingInterval(5, TimeUnit.SECONDS)
         .build(),
     zeroStickControl: ZeroStickControl? = null,
+    private val phase4PulseEnabled: Boolean =
+        BuildConfig.DRONTECT_DJI_PHASE4_VERTICAL_PULSE_ENABLED,
+    private val autonomousEnabled: Boolean =
+        BuildConfig.DRONTECT_DJI_AUTONOMOUS_ENABLED,
 ) {
     private val url = endpoint(realtimeOrigin)
+    private val controlMode = when {
+        autonomousEnabled -> "autonomous_flight_logic"
+        phase4PulseEnabled -> "phase4_vertical_pulse"
+        else -> "zero_stick_ground_test"
+    }
     private val worker = Executors.newSingleThreadScheduledExecutor { task ->
         Thread(task, "dronetect-dji-bridge").apply { isDaemon = true }
     }
     private var zeroStick: ZeroStickControl? = zeroStickControl
     private fun stick(): ZeroStickControl = zeroStick ?: DjiZeroStickControl(
         dispatch = { worker.execute(it) }, log = log,
+        phase4PulseEnabled = phase4PulseEnabled,
+        autonomousEnabled = autonomousEnabled,
     ).also { zeroStick = it }
     private var running = false
     private var ticker: ScheduledFuture<*>? = null
@@ -52,6 +64,7 @@ class DroneRealtimeClient(
     private var lastExpiredLogMs = 0L
     private var lastClockSyncLogMs = 0L
     private var lastClockRoundTripMs = 0L
+    private var phase4SetpointReceivedLogged = false
     private var lastSetpointReceivedElapsedMs = 0L
     private var pendingProbeTimestamp: Double? = null
     private var lastProbeElapsedMs = 0L
@@ -68,7 +81,7 @@ class DroneRealtimeClient(
             }
             running = true
             adapter.start()
-            log("bridge=starting mode=zero_stick_ground_test")
+            log("bridge=starting mode=$controlMode")
             ticker = worker.scheduleWithFixedDelay({ tickSafely() }, 0, 100, TimeUnit.MILLISECONDS)
         }
     }
@@ -153,7 +166,7 @@ class DroneRealtimeClient(
             if (!send(telemetry)) { disconnect("send_failed"); return }
             if (now - lastLogMs >= 5_000) {
                 lastLogMs = now
-                log("bridge=telemetry_sent gps=valid mode=zero_stick_ground_test")
+                log("bridge=telemetry_sent gps=valid mode=$controlMode")
             }
         }
         val rc = snapshot.rcConnected
@@ -204,15 +217,19 @@ class DroneRealtimeClient(
                                 lastClockRoundTripMs = 0L
                                 lastSetpointReceivedElapsedMs = 0L
                                 lastZeroRejectReason = null
+                                phase4SetpointReceivedLogged = false
                                 zeroStick?.newSession()
-                                log("bridge=connected mode=zero_stick_ground_test")
+                                log("bridge=connected mode=$controlMode")
                             }
                         } else if (message.optString("type") == "dji_clock_sync") {
                             receiveClockSync(message)
                         } else {
                             receiveAction(message, receivedElapsedMs)
                         }
-                    } catch (_: Exception) { log("bridge=message_ignored reason=invalid_json") }
+                    } catch (_: Exception) {
+                        log("bridge=message_ignored reason=invalid_json")
+                        if (phase4PulseEnabled) zeroStick?.stop("invalid_message")
+                    }
                 }
             }
             override fun onFailure(webSocket: WebSocket, error: Throwable, response: Response?) {
@@ -255,6 +272,9 @@ class DroneRealtimeClient(
         val seq = (message.opt("seq") as? Number)?.toLong()
         if (message.optString("sessionId") != session || seq == null || seq <= downlinkSequence) {
             log("bridge_action=rejected name=$name reason=wrong_session_or_replay")
+            if (phase4PulseEnabled && name == "dji_setpoint") {
+                zeroStick?.stop("wrong_session_or_replay")
+            }
             return
         }
         downlinkSequence = seq
@@ -267,17 +287,25 @@ class DroneRealtimeClient(
         val issuedAt = (message.opt("issuedAt") as? Number)?.toDouble()
         val ttlMs = (message.opt("ttlMs") as? Number)?.toInt()
         val processingElapsedMs = System.nanoTime() / 1_000_000L
-        val serverNowUpperBoundMs = if (name == "dji_setpoint") {
+        // S_receive plus monotonic time since the probe left counts one whole
+        // uplink transit, so every age was inflated by ~RTT and healthy field
+        // commands expired. Half the measured round trip removes that bias
+        // without weakening the staleness test itself.
+        val serverNowEstimateMs = if (name == "dji_setpoint") {
             clockServerReceivedAtMs?.takeIf {
                 processingElapsedMs - lastClockSyncElapsedMs <= 5_000L
             }?.plus(processingElapsedMs - syncProbeSentElapsedMs)
+                ?.minus(lastClockRoundTripMs / 2.0)
         } else System.currentTimeMillis().toDouble()
-        if (serverNowUpperBoundMs == null) {
+        if (serverNowEstimateMs == null) {
             log("bridge_action=rejected name=$name reason=clock_sync_unavailable")
+            if (phase4PulseEnabled && name == "dji_setpoint") {
+                zeroStick?.stop("clock_sync_unavailable")
+            }
             return
         }
         val ageMs = if (issuedAt == null) Double.POSITIVE_INFINITY else
-            serverNowUpperBoundMs - issuedAt * 1_000.0
+            serverNowEstimateMs - issuedAt * 1_000.0
         val maximumTtl = when (name) {
             "dji_rth" -> 1_500
             "dji_setpoint" -> 500
@@ -293,6 +321,9 @@ class DroneRealtimeClient(
                 val syncAgeMs = processingElapsedMs - lastClockSyncElapsedMs
                 log("bridge_action=rejected name=$name reason=expired_or_invalid seq=$seq ageMs=${ageMs.toLong()} ttlMs=$ttlMs rxGapMs=$receiveGapMs queueDelayMs=$queueDelayMs ageAtReceiveMs=${ageAtReceiveMs.toLong()} syncRttMs=$lastClockRoundTripMs syncAgeMs=$syncAgeMs")
             }
+            if (phase4PulseEnabled && name == "dji_setpoint") {
+                zeroStick?.stop("stale_or_invalid_setpoint")
+            }
             return
         }
         if (name == "dji_setpoint") {
@@ -301,9 +332,40 @@ class DroneRealtimeClient(
             val y = (velocity?.opt("y") as? Number)?.toDouble()
             val z = (velocity?.opt("z") as? Number)?.toDouble()
             val heading = (message.opt("yawDeg") as? Number)?.toDouble()
+            if (autonomousEnabled) {
+                val invalid = autonomousCommandRejection(x, y, z, heading)
+                if (invalid != null || x == null || y == null || z == null || heading == null) {
+                    val reason = invalid ?: "command_incomplete"
+                    log("bridge_action=rejected name=dji_setpoint reason=$reason")
+                    zeroStick?.stop(reason)
+                    return
+                }
+                val remainingMs = (ttlMs - ageMs).toLong().coerceIn(0L, ttlMs.toLong())
+                val nowMs = System.nanoTime() / 1_000_000L
+                val snapshot = state().snapshot
+                val controller = stick()
+                val deadline = nowMs + remainingMs
+                if (controller.acceptAutonomous(snapshot, x, y, z, heading, deadline, nowMs)) {
+                    lastZeroRejectReason = null
+                    if (nowMs - lastSetpointLogMs >= 5_000L) {
+                        lastSetpointLogMs = nowMs
+                        log("bridge_action=accepted name=dji_setpoint mode=autonomous_flight_logic")
+                    }
+                } else {
+                    val reason = controller.autonomousRejectionReason(
+                        snapshot, x, y, z, heading, deadline, nowMs) ?: "unknown"
+                    if (reason != lastZeroRejectReason || nowMs - lastZeroRejectLogMs >= 2_000L) {
+                        lastZeroRejectReason = reason
+                        lastZeroRejectLogMs = nowMs
+                        log("bridge_action=rejected name=dji_setpoint reason=$reason")
+                    }
+                }
+                return
+            }
             if (x == null || y == null || z == null || heading == null ||
                 !x.isFinite() || !y.isFinite() || !z.isFinite() || !heading.isFinite() ||
-                x != 0.0 || y != 0.0 || z != 0.0 || heading !in 0.0..360.0) {
+                x != 0.0 || y != 0.0 || heading !in 0.0..360.0 ||
+                (z != 0.0 && (!phase4PulseEnabled || z != PHASE4_VERTICAL_SPEED_MPS))) {
                 log("bridge_action=rejected name=dji_setpoint reason=nonzero_or_invalid_ground_test")
                 zeroStick?.stop("nonzero_setpoint")
                 return
@@ -311,11 +373,36 @@ class DroneRealtimeClient(
             // Even an allowed slightly-future AWS timestamp cannot extend the local lease.
             val remainingMs = (ttlMs - ageMs).toLong().coerceIn(0L, ttlMs.toLong())
             val nowMs = System.nanoTime() / 1_000_000L
-            val groundSnapshot = state().snapshot
+            val snapshot = state().snapshot
             val controller = stick()
-            if (!controller.acceptZero(groundSnapshot, nowMs + remainingMs, nowMs)) {
-                val reason = controller.rejectionReason(groundSnapshot, nowMs + remainingMs, nowMs)
-                    ?: "unknown"
+            val phase4 = phase4PulseEnabled && snapshot.isFlying == true
+            if (phase4 && heading != 0.0) {
+                log("bridge_action=rejected name=dji_setpoint reason=phase4_yaw_must_be_zero")
+                controller.stop("phase4_yaw_nonzero")
+                return
+            }
+            if (z != 0.0 && !phase4) {
+                log("bridge_action=rejected name=dji_setpoint reason=phase4_not_airborne")
+                controller.stop("phase4_not_airborne")
+                return
+            }
+            if (phase4 && z != 0.0 && !phase4SetpointReceivedLogged) {
+                phase4SetpointReceivedLogged = true
+                log("phase4_setpoint=received seq=$seq requestedVerticalMps=$z remainingTtlMs=$remainingMs")
+            }
+            val accepted = if (phase4) {
+                controller.acceptPhase4Pulse(snapshot, z, nowMs + remainingMs, nowMs)
+            } else if (z == 0.0) {
+                controller.acceptZero(snapshot, nowMs + remainingMs, nowMs)
+            } else false
+            if (!accepted) {
+                val reason = if (phase4) {
+                    controller.phase4RejectionReason(snapshot, z, nowMs + remainingMs, nowMs)
+                } else if (z != 0.0 && !phase4PulseEnabled) {
+                    "phase4_apk_opt_in_disabled"
+                } else {
+                    controller.rejectionReason(snapshot, nowMs + remainingMs, nowMs)
+                } ?: "unknown"
                 if (reason != lastZeroRejectReason || nowMs - lastZeroRejectLogMs >= 2_000L) {
                     lastZeroRejectReason = reason
                     lastZeroRejectLogMs = nowMs
@@ -324,7 +411,7 @@ class DroneRealtimeClient(
             } else if (nowMs - lastSetpointLogMs >= 5_000L) {
                 lastZeroRejectReason = null
                 lastSetpointLogMs = nowMs
-                log("bridge_action=accepted name=dji_setpoint mode=zero_only")
+                log("bridge_action=accepted name=dji_setpoint mode=${if (phase4) "phase4_vertical_pulse" else "zero_only"}")
             } else {
                 lastZeroRejectReason = null
             }
@@ -369,6 +456,7 @@ class DroneRealtimeClient(
     }
 
     companion object {
+        const val PHASE4_VERTICAL_SPEED_MPS = 0.30
         private val VALID_GPS_LEVELS = setOf("LEVEL_2", "LEVEL_3", "LEVEL_4", "LEVEL_5")
         fun endpoint(origin: String): String {
             val parsed = URI(origin.trim())
