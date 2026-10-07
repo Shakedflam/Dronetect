@@ -1533,8 +1533,9 @@ def test_roi_state_without_a_plan_degrades_instead_of_raising():
 
     logic.update(POSITION, 0.1)
 
-    assert logic.state is FlightState.PATROLLING
-    assert logic.target is not None
+    # Holds where it is rather than starting an area patrol nobody asked for.
+    assert logic.state is FlightState.HOLDING
+    assert logic.target == POSITION
 
 
 @pytest.mark.parametrize("command,params", [

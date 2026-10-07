@@ -91,6 +91,13 @@ class FlightConfig:
     # so the reported position always trails the commanded one slightly, and a
     # gate tighter than that residual never opens at all.
     checkpoint_tolerance: float = 0.05
+    # TARGET_RETURN watchdog: if the distance to the current return waypoint
+    # has not shrunk by target_return_progress_m within target_return_stall_s,
+    # the return leg is abandoned and the interrupted mission resumes from
+    # here. A real aircraft (GPS noise, wind, a controller that overshoots)
+    # can otherwise orbit a checkpoint forever without ever "arriving".
+    target_return_stall_s: float = 10.0
+    target_return_progress_m: float = 0.5
     landing_rate: float = 0.35
     landed_height: float = 0.12
     roi_arrival_tolerance: float = 10.0
@@ -379,6 +386,8 @@ class FlightLogic:
         self._takeoff_pursuit_vertical_velocity = 0.0
         self._target_return_waypoints: deque[Position] = deque()
         self._target_return_ready = True
+        # TARGET_RETURN watchdog: (waypoint, best distance, time of best).
+        self._return_progress: tuple[Position, float, float] | None = None
         self._reposition_waypoints: deque[Position] = deque()
         self._reposition_resume_state: FlightState | None = None
         # Operator hold. Pursuit is autonomous by default; this is the one
@@ -464,13 +473,15 @@ class FlightLogic:
         ):
             # request_roi() always resets the planner before entering either
             # state, so an empty one here is an invariant violation -- a
-            # resume that never landed, or a cleared ROI. Degrade to area
-            # patrol rather than raising: an exception out of this loop does
-            # not pause the aircraft, it stops it being flown at all, and the
-            # airframe simply falls.
-            print("ROI patrol has no plan; falling back to area patrol.")
-            self.state = FlightState.PATROLLING
-            self.target = self._next_patrol_waypoint(position, completed=False)
+            # resume that never landed, or a cleared ROI. Hold station rather
+            # than raising: an exception out of this loop does not pause the
+            # aircraft, it stops it being flown at all, and the airframe simply
+            # falls. Holding (not an area patrol nobody asked for) keeps the
+            # aircraft where the operator expects it; RTH, a new ROI or a
+            # patrol are all still available from HOLDING.
+            print("ROI patrol has no plan to resume; holding position.")
+            self.state = FlightState.HOLDING
+            self.target = position
 
         elif self.state is FlightState.TRANSITING_TO_ROI:
             if self._is_inside_roi(position):
@@ -612,14 +623,22 @@ class FlightLogic:
         elif self.state is FlightState.TARGET_RETURN:
             if not self._target_return_ready:
                 self.target = position
+                self._return_progress = None
             elif (
                 self.target is not None
                 and math.dist(position, self.target) <= self.config.checkpoint_tolerance
             ):
+                self._return_progress = None
                 if self._target_return_waypoints:
                     self.target = self._target_return_waypoints.popleft()
                 else:
                     self._resume_patrol_after_target(position)
+            elif self.target is not None and self._target_return_stalled(position):
+                print("TARGET_RETURN made no progress for "
+                      f"{self.config.target_return_stall_s:.0f}s "
+                      f"(distance={math.dist(position, self.target):.1f}m); "
+                      "resuming the interrupted mission from here")
+                self.abandon_target_return(position)
 
         elif self.state is FlightState.RETURNING_HOME:
             self.target = self._home_at_cruise_altitude()
@@ -932,6 +951,34 @@ class FlightLogic:
         interrupted.
         """
         return self._drop_manual_control()
+
+    def reset_after_landing(self, position: Position) -> None:
+        """The aircraft is confirmed on the ground: end the sortie cleanly.
+
+        Whatever was flying -- takeoff, patrol, ROI, a target chase or the
+        return from one -- is over, so the next mission must start from IDLE
+        rather than inherit a stale target, queued waypoint or resume point.
+        Home, configuration and the operator's pursuit hold are kept: they
+        describe the session, not the sortie that just ended.
+        """
+        self._drop_manual_control()
+        self._clear_target_tracking()
+        self._reset_target_world_state()
+        self.pursuit.stop()
+        self._takeoff_anchor = None
+        self._queued_waypoint = None
+        self._queued_state = None
+        self._queued_mission_stale = False
+        self._roi_center = None
+        self._roi_radius = 0.0
+        self._roi_first_waypoint = None
+        self.roi_patrol_planner.clear()
+        self._roi_coverage_complete = False
+        self._reposition_waypoints.clear()
+        self._reposition_resume_state = None
+        self._landing_target_altitude = self.config.takeoff_altitude
+        self.state = FlightState.IDLE
+        self.target = self.home if self.home is not None else position
 
     def _drop_manual_control(self) -> bool:
         """End the takeover, whatever ended it.
@@ -1992,6 +2039,20 @@ class FlightLogic:
         self._target_return_waypoints.clear()
         self._target_return_ready = False
 
+    def _target_return_stalled(self, position: Position) -> bool:
+        """Whether the return leg has stopped closing on its current waypoint."""
+        assert self.target is not None
+        distance = math.dist(position, self.target)
+        progress = self._return_progress
+        if (
+            progress is None
+            or progress[0] != self.target
+            or distance < progress[1] - self.config.target_return_progress_m
+        ):
+            self._return_progress = (self.target, distance, self._elapsed_time)
+            return False
+        return self._elapsed_time - progress[2] >= self.config.target_return_stall_s
+
     def abandon_target_return(self, position: Position) -> bool:
         """Give up flying back to the checkpoint and resume the mission here.
 
@@ -2070,6 +2131,7 @@ class FlightLogic:
         self._takeoff_pursuit_vertical_velocity = 0.0
         self._target_return_waypoints.clear()
         self._target_return_ready = True
+        self._return_progress = None
         self._patrol_resume_target = None
         self._patrol_resume_checkpoint = None
         self._target_resume_state = None

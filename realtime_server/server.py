@@ -151,6 +151,9 @@ class RealtimeServer:
         )
         self._battery_percent: float | None = None
         self._low_battery = False
+        # Last flight state the drone reported, for the airborne -> grounded
+        # touchdown edge. None on a fresh drone connection.
+        self._drone_reported_state: str | None = None
         # The operator hold. Held here so a reconnecting drone is told about
         # it -- a hold that silently lapsed into "pursuing" when the link
         # blinked would be the worst possible failure for this control.
@@ -252,6 +255,7 @@ class RealtimeServer:
                 sync_task.cancel()
             if self.drone is drone:
                 self.drone = None
+                self._drone_reported_state = None
                 self._drone_config_ready = False
                 self._operating_config_pending = False
                 # Discard rather than apply on reconnect: a fresh drone
@@ -361,6 +365,19 @@ class RealtimeServer:
         )
         self._battery_percent = float(data["batteryPercent"])
         self._target_patrol_region_id = data["targetPatrolRegionId"]
+        reported_state = data["state"]
+        if (
+            self._drone_reported_state is not None
+            and self._drone_reported_state not in DJI_GROUNDED_STATES | {"UNKNOWN"}
+            and reported_state in DJI_GROUNDED_STATES
+        ):
+            # Before observe_safety, so a low battery on the landing sample
+            # cannot re-latch an RTH onto a mission that has just ended.
+            before = self.mission.state
+            self.mission.observe_touchdown()
+            print(f"realtime_server touchdown reported={self._drone_reported_state}->"
+                  f"{reported_state} mission={before.value}->{self.mission.state.value}")
+        self._drone_reported_state = reported_state
         reported_block = data.get("pursuitBlocked")
         if isinstance(reported_block, bool):
             self.pursuit_blocked = reported_block

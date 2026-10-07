@@ -1496,3 +1496,544 @@ def test_phase2_rth_still_reachable_before_session_home_is_established(monkeypat
     asyncio.run(bridge.run_tick_once())
 
     assert [m["type"] for m in connection.messages] == ["dji_rth"]
+
+
+# -- landing reset ------------------------------------------------------------
+
+from adapters.dji.flight_bridge import LANDING_CONFIRM_SECONDS  # noqa: E402
+
+
+def _airborne_tick(bridge: DjiFlightBridge, now: list[float], *, altitude_m: float = 15.0,
+                   detection: dict | None = None, dt: float = 0.05, **telemetry) -> TickOutcome:
+    now[0] += dt
+    _feed_telemetry(bridge, now, is_flying=True, altitude_m=altitude_m, flight_mode="GPS_NORMAL",
+                    **telemetry)
+    if detection is not None:
+        bridge.realtime_link._detections.put(detection)
+    return bridge.tick(dt, now=now[0])
+
+
+def _grounded_ticks(bridge: DjiFlightBridge, now: list[float], seconds: float, *,
+                    dt: float = 0.05) -> TickOutcome:
+    outcome = None
+    for _ in range(round(seconds / dt)):
+        now[0] += dt
+        _feed_telemetry(bridge, now, is_flying=False, altitude_m=0.0, flight_mode="GPS_NORMAL")
+        outcome = bridge.tick(dt, now=now[0])
+    assert outcome is not None
+    return outcome
+
+
+def _bridge_on_ground_with_home(now: list[float]) -> DjiFlightBridge:
+    bridge = _make_bridge(now)
+    # Grounded first fix -> session_home, at 0 m like a real takeoff point
+    # (pursuit's altitude-safety gate is measured above home).
+    _feed_telemetry(bridge, now, altitude_m=0.0)
+    bridge.tick(0.05, now=now[0])
+    assert bridge.session_home is not None
+    return bridge
+
+
+def _drive_bridge_into(state: FlightState, now: list[float]) -> DjiFlightBridge:
+    bridge = _bridge_on_ground_with_home(now)
+    _queue_command(bridge, CommandName.START_PATROL.value, command_id="patrol")
+    if state is FlightState.TAKING_OFF:
+        _airborne_tick(bridge, now, altitude_m=5.0)
+        assert bridge.logic.state is FlightState.TAKING_OFF
+        return bridge
+    _airborne_tick(bridge, now)
+    assert bridge.logic.state is FlightState.PATROLLING
+    if state is FlightState.PATROLLING:
+        return bridge
+    wanted = FlightState.TARGET_PURSUIT if state is FlightState.TARGET_RETURN else state
+    for _ in range(400):
+        _airborne_tick(bridge, now, detection=_confident_detection_message())
+        if bridge.logic.state is wanted:
+            break
+    assert bridge.logic.state is wanted
+    assert bridge._mission_interruption is not None
+    if state is FlightState.TARGET_RETURN:
+        # The chase carried the aircraft 30 m from the interruption point, so
+        # ending it leaves a real return leg to fly.
+        away = destination_point(DEFAULT_HOME, 30.0, 0.0)
+        _queue_command(bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": True}, command_id="hold")
+        _airborne_tick(bridge, now, lat=away.lat, lng=away.lng)
+        assert bridge.logic.state is FlightState.TARGET_RETURN
+        # Release the hold again so the landing test isolates the landing.
+        _queue_command(bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": False}, command_id="unhold")
+        _airborne_tick(bridge, now, lat=away.lat, lng=away.lng)
+        assert bridge.logic.state is FlightState.TARGET_RETURN
+    return bridge
+
+
+@pytest.mark.parametrize("state", [
+    FlightState.TAKING_OFF,
+    FlightState.PATROLLING,
+    FlightState.TARGET_ACQUISITION,
+    FlightState.TARGET_PURSUIT,
+    FlightState.TARGET_RETURN,
+])
+def test_confirmed_landing_resets_bridge_and_flight_logic_to_clean_idle(state, capsys):
+    now = [0.0]
+    bridge = _drive_bridge_into(state, now)
+    config = bridge.operating_config
+
+    outcome = _grounded_ticks(bridge, now, LANDING_CONFIRM_SECONDS + 0.2)
+
+    assert outcome.state == FlightState.IDLE.value
+    assert bridge.logic.state is FlightState.IDLE
+    assert not bridge.logic.is_target_tracking
+    assert bridge.logic.pending_mission_state is None
+    assert bridge._mission_interruption is None
+    assert bridge._active_roi_id is None
+    assert not bridge._patrol_route_waypoints
+    assert bridge._target_patrol_region_id is None
+    assert bridge._safety_rth_active is False
+    assert (outcome.velocity_x_mps, outcome.velocity_y_mps, outcome.velocity_z_mps) == (0.0, 0.0, 0.0)
+    assert bridge.operating_config is config
+    assert bridge.session_home is not None
+    assert f"landing=confirmed stateBefore={state.value} stateAfter=IDLE" in capsys.readouterr().out
+
+
+def test_brief_grounded_glitch_does_not_end_the_sortie():
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    _grounded_ticks(bridge, now, LANDING_CONFIRM_SECONDS - 0.5)
+    assert bridge.logic.state is FlightState.PATROLLING
+    _airborne_tick(bridge, now)
+    # The grounded timer restarts: another short glitch is still not a landing.
+    _grounded_ticks(bridge, now, LANDING_CONFIRM_SECONDS - 0.5)
+    assert bridge.logic.state is FlightState.PATROLLING
+
+
+def test_mission_requested_on_the_ground_before_takeoff_is_not_wiped():
+    now = [0.0]
+    bridge = _bridge_on_ground_with_home(now)
+    _queue_command(bridge, CommandName.START_PATROL.value)
+    _grounded_ticks(bridge, now, LANDING_CONFIRM_SECONDS * 3)
+    assert bridge.logic.state is FlightState.TAKING_OFF
+
+
+def test_landing_reset_preserves_pursuit_hold():
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    _queue_command(bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": True}, command_id="hold")
+    _airborne_tick(bridge, now)
+    _grounded_ticks(bridge, now, LANDING_CONFIRM_SECONDS + 0.2)
+    assert bridge.logic.state is FlightState.IDLE
+    assert bridge.logic.pursuit_blocked is True
+
+
+class _SetpointRecorder:
+    def __init__(self):
+        self.messages = []
+
+    async def send(self, raw):
+        self.messages.append(json.loads(raw))
+
+    def setpoints(self):
+        return [m for m in self.messages if m.get("type") == "dji_setpoint"]
+
+
+def _run_tick(bridge: DjiFlightBridge, now: list[float], recorder: _SetpointRecorder, *,
+              is_flying: bool, altitude_m: float) -> TickOutcome:
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, is_flying=is_flying, altitude_m=altitude_m, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now, is_flying=is_flying)
+    bridge.android_link._connection = recorder
+    return asyncio.run(bridge.run_tick_once())
+
+
+def test_no_setpoints_are_sent_while_grounded_and_a_new_sortie_starts_cleanly(capsys):
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    recorder = _SetpointRecorder()
+
+    _run_tick(bridge, now, recorder, is_flying=True, altitude_m=15.0)
+    assert recorder.setpoints(), "airborne patrol must stream setpoints"
+
+    recorder.messages.clear()
+    for _ in range(round((LANDING_CONFIRM_SECONDS + 1.0) / 0.05)):
+        _run_tick(bridge, now, recorder, is_flying=False, altitude_m=0.0)
+    assert recorder.setpoints() == []
+    assert bridge.logic.state is FlightState.IDLE
+    out = capsys.readouterr().out
+    assert out.count("setpoints=suppressed reason=grounded") == 1
+
+    # Next sortie: patrol requested on the ground, then a manual takeoff to
+    # ~5 m. Setpoints resume only once airborne, and they climb.
+    _queue_command(bridge, CommandName.START_PATROL.value, command_id="patrol-2")
+    _run_tick(bridge, now, recorder, is_flying=False, altitude_m=0.0)
+    assert bridge.logic.state is FlightState.TAKING_OFF
+    assert recorder.setpoints() == []
+    _run_tick(bridge, now, recorder, is_flying=True, altitude_m=5.0)
+    setpoints = recorder.setpoints()
+    assert setpoints and setpoints[-1]["velocity"]["z"] > 0.0
+    assert bridge.logic.state is FlightState.TAKING_OFF
+    assert bridge._mission_interruption is None
+
+
+# -- pursuit hold ---------------------------------------------------------------
+
+
+def test_pursuit_hold_is_applied_even_before_operating_config(capsys):
+    now = [0.0]
+    bridge = _make_bridge(now, operating_config=None)
+    _feed_telemetry(bridge, now)
+    bridge.tick(0.05, now=now[0])
+
+    _queue_command(bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": True}, command_id="hold")
+    _queue_command(bridge, CommandName.START_PATROL.value, command_id="patrol")
+    now[0] += 0.05
+    _feed_telemetry(bridge, now)
+    bridge.tick(0.05, now=now[0])
+
+    assert bridge.logic.pursuit_blocked is True
+    # Everything else is still refused while unconfigured.
+    assert bridge.logic.state is FlightState.IDLE
+    out = capsys.readouterr().out
+    assert "pursuit_hold=ON changed=True" in out
+    assert "command start_patrol ignored" in out
+
+    _queue_command(
+        bridge, CommandName.SET_OPERATING_CONFIG.value,
+        {"maxFlightRadiusM": 300.0, "cruiseAltitudeM": 15.0}, command_id="config",
+    )
+    now[0] += 0.05
+    _feed_telemetry(bridge, now)
+    outcome = bridge.tick(0.05, now=now[0])
+    assert outcome.pursuit_blocked is True
+    assert bridge.build_telemetry_message(outcome)["data"]["pursuitBlocked"] is True
+
+
+def test_patrol_with_pursuit_hold_keeps_patrolling_through_detections():
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    _queue_command(bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": True}, command_id="hold")
+    _airborne_tick(bridge, now)
+    region = bridge._target_patrol_region_id
+
+    for _ in range(50):
+        outcome = _airborne_tick(bridge, now, detection=_confident_detection_message())
+        assert outcome.state == FlightState.PATROLLING.value
+        assert outcome.pursuit_blocked is True
+    assert bridge._mission_interruption is None
+    assert bridge._target_patrol_region_id == region
+
+
+def test_takeoff_with_pursuit_hold_continues_climb_into_patrol():
+    now = [0.0]
+    bridge = _bridge_on_ground_with_home(now)
+    _queue_command(bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": True}, command_id="hold")
+    _queue_command(bridge, CommandName.START_PATROL.value, command_id="patrol")
+    for _ in range(20):
+        outcome = _airborne_tick(bridge, now, altitude_m=5.0, detection=_confident_detection_message())
+        assert outcome.state == FlightState.TAKING_OFF.value
+        assert outcome.velocity_z_mps > 0.0
+    outcome = _airborne_tick(bridge, now, altitude_m=15.0, detection=_confident_detection_message())
+    assert outcome.state == FlightState.PATROLLING.value
+    assert bridge._mission_interruption is None
+
+
+@pytest.mark.parametrize("state", [FlightState.TARGET_ACQUISITION, FlightState.TARGET_PURSUIT])
+def test_pursuit_hold_mid_target_resumes_the_interrupted_patrol(state):
+    now = [0.0]
+    bridge = _drive_bridge_into(state, now)
+    region = bridge._mission_interruption.active_id
+
+    _queue_command(bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": True}, command_id="hold")
+    for _ in range(200):
+        outcome = _airborne_tick(bridge, now, detection=_confident_detection_message())
+        assert outcome.state not in {
+            FlightState.TARGET_ACQUISITION.value,
+            FlightState.TARGET_FOLLOW.value,
+            FlightState.TARGET_PURSUIT.value,
+        }
+        if outcome.state == FlightState.PATROLLING.value and bridge._mission_interruption is None:
+            break
+    assert bridge.logic.state is FlightState.PATROLLING
+    assert bridge._mission_interruption is None
+    assert bridge._target_patrol_region_id == region
+
+
+def test_releasing_pursuit_hold_restores_pursuit():
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    _queue_command(bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": True}, command_id="hold")
+    _airborne_tick(bridge, now, detection=_confident_detection_message())
+    assert bridge.logic.state is FlightState.PATROLLING
+
+    _queue_command(bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": False}, command_id="unhold")
+    outcome = _airborne_tick(bridge, now)
+    assert outcome.pursuit_blocked is False
+    # A persistent target (enough frames to be actionable) is chased again.
+    for _ in range(bridge.detection_filter.config.required_frames):
+        _airborne_tick(bridge, now, detection=_confident_detection_message())
+    assert bridge.logic.state in {
+        FlightState.TARGET_ACQUISITION,
+        FlightState.TARGET_FOLLOW,
+        FlightState.TARGET_PURSUIT,
+    }
+    assert bridge._mission_interruption is not None
+
+
+# -- actionable detection filter ---------------------------------------------------
+
+_TARGET_STATE_VALUES = {
+    FlightState.TARGET_ACQUISITION.value,
+    FlightState.TARGET_FOLLOW.value,
+    FlightState.TARGET_PURSUIT.value,
+    FlightState.TARGET_RETURN.value,
+}
+
+
+def _empty_detection_message() -> dict:
+    return {"detections": [], "frameWidth": 1000, "frameHeight": 1000}
+
+
+def _detection_message(**overrides) -> dict:
+    message = _confident_detection_message()
+    message["detections"][0].update(overrides)
+    return message
+
+
+def test_one_frame_false_positive_cannot_interrupt_patrol(capsys):
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    region = bridge._target_patrol_region_id
+
+    outcome = _airborne_tick(bridge, now, detection=_detection_message(confidence=0.97))
+    assert outcome.state == FlightState.PATROLLING.value
+    for _ in range(20):
+        outcome = _airborne_tick(bridge, now, detection=_empty_detection_message())
+        assert outcome.state == FlightState.PATROLLING.value
+    assert bridge._mission_interruption is None
+    assert bridge._target_patrol_region_id == region
+    assert "detection=rejected track=one reason=not_persistent frames=1/3 lastConf=0.97" in capsys.readouterr().out
+
+
+def test_isolated_false_positives_never_accumulate_into_an_interruption():
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    for _ in range(10):
+        outcome = _airborne_tick(bridge, now, detection=_confident_detection_message())
+        assert outcome.state == FlightState.PATROLLING.value
+        for _ in range(2):  # two empty frames exceed the one-frame grace
+            outcome = _airborne_tick(bridge, now, detection=_empty_detection_message())
+            assert outcome.state == FlightState.PATROLLING.value
+    assert bridge._mission_interruption is None
+
+
+@pytest.mark.parametrize(("overrides", "reason"), [
+    ({"confidence": 0.55}, "low_confidence"),
+    ({"box": [500, 500, 504, 504]}, "box_too_small"),
+    ({"box": [0, 0, 1000, 900]}, "box_too_large"),
+])
+def test_persistent_but_unactionable_detections_cannot_interrupt_patrol(overrides, reason, capsys):
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    for _ in range(30):
+        outcome = _airborne_tick(bridge, now, detection=_detection_message(**overrides))
+        assert outcome.state == FlightState.PATROLLING.value
+    assert bridge._mission_interruption is None
+    assert f"detection=rejected track=one reason={reason}" in capsys.readouterr().out
+
+
+def test_persistent_confident_detection_starts_acquisition_on_the_third_frame(capsys):
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    for _ in range(2):
+        outcome = _airborne_tick(bridge, now, detection=_confident_detection_message())
+        assert outcome.state == FlightState.PATROLLING.value
+    outcome = _airborne_tick(bridge, now, detection=_confident_detection_message())
+    assert outcome.state in _TARGET_STATE_VALUES
+    assert bridge._mission_interruption is not None
+    assert "detection=accepted track=one conf=0.90 frames=3/3" in capsys.readouterr().out
+
+
+def test_one_dropped_frame_does_not_reset_target_persistence():
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    _airborne_tick(bridge, now, detection=_confident_detection_message())
+    _airborne_tick(bridge, now, detection=_confident_detection_message())
+    _airborne_tick(bridge, now, detection=_empty_detection_message())
+    outcome = _airborne_tick(bridge, now, detection=_confident_detection_message())
+    assert outcome.state in _TARGET_STATE_VALUES
+
+
+def test_pursuit_hold_dominates_even_an_actionable_detection(capsys):
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    _queue_command(bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": True}, command_id="hold")
+    _airborne_tick(bridge, now)
+    for _ in range(30):
+        outcome = _airborne_tick(bridge, now, detection=_confident_detection_message())
+        assert outcome.state == FlightState.PATROLLING.value
+    assert bridge.detection_filter.is_actionable("one")
+    assert bridge._mission_interruption is None
+    out = capsys.readouterr().out
+    assert "detection=accepted track=one" in out
+    assert "detection=suppressed track=one reason=pursuit_hold" in out
+
+
+# -- every target exit resumes the interrupted ROI ----------------------------
+
+
+class _RoiFlight:
+    """Closed-loop ROI flight: each tick reports wherever the last commanded
+    step went, airborne, against a 0 m session home."""
+
+    def __init__(self):
+        self.now = [0.0]
+        self.bridge = _bridge_on_ground_with_home(self.now)
+        self.outcome: TickOutcome | None = None
+        roi_point = destination_point(DEFAULT_HOME, 50.0, 0.0)
+        _queue_command(
+            self.bridge, CommandName.SET_ROI.value,
+            {"center": {"lat": roi_point.lat, "lon": roi_point.lng}, "radiusM": 20.0},
+            command_id="roi-1",
+        )
+        self.tick(position=(0.0, 0.0, 5.0))  # manual takeoff to ~5 m
+        for _ in range(1500):
+            if self.tick().state == FlightState.ROI_PATROL.value:
+                break
+        assert self.bridge.logic.state is FlightState.ROI_PATROL
+        # A few sweep legs in, so "progress" is not just the first waypoint.
+        for _ in range(40):
+            self.tick()
+        assert self.bridge.logic.state is FlightState.ROI_PATROL
+        self.roi_id = self.bridge._active_roi_id
+        assert self.roi_id is not None
+
+    @property
+    def position(self):
+        assert self.outcome is not None and self.outcome.position is not None
+        return self.outcome.position
+
+    def tick(self, *, detection: dict | None = None, position=None, offset=(0.0, 0.0)) -> TickOutcome:
+        self.now[0] += 0.05
+        if position is None:
+            position = self.position
+        local = LocalPosition(x=position[0] + offset[0], y=position[1] + offset[1], z=position[2])
+        gps = local_meters_to_wgs84(local, self.bridge.session_home)
+        heading = 0.0
+        if self.outcome is not None and self.outcome.yaw_rad is not None:
+            heading = (90.0 - math.degrees(self.outcome.yaw_rad)) % 360.0
+        _feed_telemetry(self.bridge, self.now, lat=gps.lat, lng=gps.lng, altitude_m=position[2],
+                        heading_deg=heading, is_flying=True, flight_mode="GPS_NORMAL")
+        if detection is not None:
+            self.bridge.realtime_link._detections.put(detection)
+        self.outcome = self.bridge.tick(0.05, now=self.now[0])
+        return self.outcome
+
+    def interrupt(self, until: FlightState):
+        """Feed a persistent target until flight logic reaches `until`."""
+        for _ in range(400):
+            self.tick(detection=_confident_detection_message())
+            if self.bridge.logic.state is until:
+                break
+        assert self.bridge.logic.state is until
+        context = self.bridge._mission_interruption
+        assert context is not None and context.source_type.value == "ROI"
+        assert context.active_id == self.roi_id
+        return context
+
+    def carry_away(self, metres: float = 20.0) -> None:
+        """The chase carried the aircraft away, so a real return leg exists."""
+        away = (self.position[0] + metres, self.position[1], self.position[2])
+        self.tick(detection=_confident_detection_message(), position=away)
+
+    def resume(self, *, max_ticks: int = 2000, **tick_options) -> list[str]:
+        states = []
+        for _ in range(max_ticks):
+            outcome = self.tick(detection=_empty_detection_message(), **tick_options)
+            if not states or states[-1] != outcome.state:
+                states.append(outcome.state)
+            if self.bridge.logic.state is FlightState.ROI_PATROL and self.bridge._mission_interruption is None:
+                return states
+        raise AssertionError(f"never resumed the ROI; states={states}")
+
+    def assert_same_roi_resumed(self, context) -> None:
+        assert self.bridge.logic.state is FlightState.ROI_PATROL
+        assert self.bridge._active_roi_id == self.roi_id
+        assert self.bridge._mission_interruption is None
+        assert not self.bridge.logic.is_target_tracking
+        # The sweep continues from its saved checkpoint, not from scratch.
+        assert self.bridge.logic.target == context.active_waypoint
+        assert self.bridge.logic.roi_patrol_planner.snapshot().remaining_path == context.progress.remaining_path
+
+
+def test_roi_resumes_after_target_is_lost():
+    flight = _RoiFlight()
+    context = flight.interrupt(FlightState.TARGET_PURSUIT)
+    flight.carry_away()
+    states = flight.resume()  # no detections: lost -> search -> return
+    assert FlightState.TARGET_RETURN.value in states
+    flight.assert_same_roi_resumed(context)
+
+
+def test_roi_resumes_after_operator_rejects_the_target():
+    flight = _RoiFlight()
+    context = flight.interrupt(FlightState.TARGET_PURSUIT)
+    flight.carry_away()
+    _queue_command(flight.bridge, CommandName.REJECT_TARGET.value, {"trackId": "one"}, command_id="reject")
+    flight.tick()
+    assert flight.bridge.logic.state is FlightState.TARGET_RETURN
+    flight.resume()
+    flight.assert_same_roi_resumed(context)
+
+
+def test_roi_resumes_after_pursuit_hold():
+    flight = _RoiFlight()
+    context = flight.interrupt(FlightState.TARGET_PURSUIT)
+    flight.carry_away()
+    _queue_command(flight.bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": True}, command_id="hold")
+    flight.tick(detection=_confident_detection_message())
+    assert flight.bridge.logic.state is FlightState.TARGET_RETURN
+    flight.resume()
+    flight.assert_same_roi_resumed(context)
+
+
+def test_roi_resumes_after_acquisition_times_out():
+    flight = _RoiFlight()
+    context = flight.interrupt(FlightState.TARGET_ACQUISITION)
+    states = flight.resume()  # target never seen again
+    # Pursuit never started, so there is no return leg to fly.
+    assert FlightState.TARGET_RETURN.value not in states
+    flight.assert_same_roi_resumed(context)
+
+
+def test_target_return_completes_despite_gps_offset_at_the_checkpoint():
+    """The real-flight bug: 1 m of steady GPS error never let a 5 cm
+    checkpoint gate open, so TARGET_RETURN never ended."""
+    flight = _RoiFlight()
+    context = flight.interrupt(FlightState.TARGET_PURSUIT)
+    flight.carry_away()
+    _queue_command(flight.bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": True}, command_id="hold")
+    flight.tick()
+    states = flight.resume(max_ticks=600, offset=(0.7, 0.7))
+    assert states[0] == FlightState.TARGET_RETURN.value
+    flight.assert_same_roi_resumed(context)
+
+
+def test_stalled_target_return_resumes_the_roi_instead_of_hovering_forever(capsys):
+    flight = _RoiFlight()
+    context = flight.interrupt(FlightState.TARGET_PURSUIT)
+    flight.carry_away()
+    _queue_command(flight.bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": True}, command_id="hold")
+    flight.tick()
+    assert flight.bridge.logic.state is FlightState.TARGET_RETURN
+    stuck = flight.position  # e.g. wind or a refused command: no progress at all
+    stall_ticks = round(flight.bridge.logic.config.target_return_stall_s / 0.05) + 20
+    flight.resume(max_ticks=stall_ticks, position=stuck)
+    flight.assert_same_roi_resumed(context)
+    assert "TARGET_RETURN made no progress" in capsys.readouterr().out
+
+
+def test_landing_reset_clears_detection_persistence():
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    _airborne_tick(bridge, now, detection=_confident_detection_message())
+    _airborne_tick(bridge, now, detection=_confident_detection_message())
+    _grounded_ticks(bridge, now, LANDING_CONFIRM_SECONDS + 0.2)
+    assert not bridge.detection_filter._tracks

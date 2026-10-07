@@ -331,3 +331,38 @@ def test_safety_trigger_does_not_launch_rth_while_on_ground():
 
     assert state is MissionState.ON_GROUND
     assert missions.safety_rth_active is False
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        MissionState.TAKING_OFF,
+        MissionState.PATROL,
+        MissionState.TRANSIT_TO_ROI,
+        MissionState.ROI_PATROL,
+    ],
+)
+def test_touchdown_ends_any_flying_mission_and_allows_a_new_one(state):
+    missions = _missions_in_flying_state(state)
+
+    assert missions.observe_touchdown() is MissionState.ON_GROUND
+    assert missions.post_takeoff_intent is None
+    assert missions.roi is None
+    assert missions.apply(CommandName.START_PATROL, {}) is MissionState.TAKING_OFF
+
+
+def test_touchdown_after_safety_rth_clears_the_latch_that_blocks_missions():
+    missions = _missions_in_flying_state(MissionState.PATROL)
+    missions.observe_safety(SafetyRthSignal(required=True, reason="low_battery"))
+    assert missions.state is MissionState.RTH
+    with pytest.raises(InvalidMissionCommand):
+        missions.apply(CommandName.START_PATROL, {})
+
+    assert missions.observe_touchdown() is MissionState.ON_GROUND
+    assert missions.safety_rth_active is False
+    assert missions.apply(CommandName.START_PATROL, {}) is MissionState.TAKING_OFF
+
+
+def test_touchdown_on_the_ground_is_a_no_op():
+    missions = MissionCommandService()
+    assert missions.observe_touchdown() is MissionState.ON_GROUND

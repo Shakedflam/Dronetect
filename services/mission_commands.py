@@ -148,6 +148,30 @@ class MissionCommandService:
             self._safety_rth_reason = signal.reason
         return self.state
 
+    def observe_touchdown(self) -> MissionState:
+        """The aircraft reported an airborne -> grounded edge: end the mission.
+
+        A pilot can land mid-mission (or after an RTH that our autonomy does
+        not finish itself); the next mission must start from ON_GROUND, not
+        inherit the old intent, ROI or a safety latch that would refuse it.
+        Walks the existing transitions rather than adding shortcut edges.
+        """
+        self._post_takeoff_intent = None
+        self._roi = None
+        self._safety_rth_reason = None
+        if self.state in {
+            MissionState.TAKING_OFF,
+            MissionState.PATROL,
+            MissionState.TRANSIT_TO_ROI,
+            MissionState.ROI_PATROL,
+        }:
+            self._state_machine.transition_to(MissionState.RTH)
+        if self.state is MissionState.RTH:
+            self._state_machine.transition_to(MissionState.LANDING)
+        if self.state is MissionState.LANDING:
+            self._state_machine.transition_to(MissionState.ON_GROUND)
+        return self.state
+
     def observe_flight_state(self, flight_state: str) -> MissionState:
         """Advance RTH completion from normalized aircraft flight state."""
         if self.state is MissionState.RTH and flight_state in {"LANDING", "LANDED"}:

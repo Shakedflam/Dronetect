@@ -1639,3 +1639,48 @@ def test_manual_takeover_is_refused_during_safety_rth_but_release_is_not():
                 assert ack["type"] == "command_ack"
 
     asyncio.run(scenario())
+
+
+def _drone_state_telemetry(state: str, altitude_m: float = 15.0) -> dict:
+    return build_simulator_telemetry(
+        position_local=LocalPosition(0.0, 0.0, altitude_m),
+        heading_deg=0.0,
+        speed_mps=0.0,
+        state=state,
+    )
+
+
+@pytest.mark.parametrize(
+    "flying_state",
+    ["TAKING_OFF", "PATROLLING", "TARGET_ACQUISITION", "TARGET_PURSUIT", "TARGET_RETURN"],
+)
+def test_drone_landing_edge_returns_server_mission_to_ground(flying_state):
+    async def scenario():
+        realtime_server = RealtimeServer()
+        realtime_server.mission.apply(CommandName.START_PATROL, {})
+        realtime_server.mission.observe_altitude(35.0)
+        assert realtime_server.mission.state is MissionState.PATROL
+
+        await realtime_server._route_drone_telemetry(_drone_state_telemetry(flying_state))
+        assert realtime_server.mission.state is MissionState.PATROL
+        await realtime_server._route_drone_telemetry(_drone_state_telemetry("IDLE", 0.0))
+        assert realtime_server.mission.state is MissionState.ON_GROUND
+
+        # A fresh mission after the landing is accepted.
+        realtime_server.mission.apply(CommandName.START_PATROL, {})
+        assert realtime_server.mission.state is MissionState.TAKING_OFF
+
+    asyncio.run(scenario())
+
+
+def test_mission_commanded_on_the_ground_is_not_reset_by_idle_telemetry():
+    """No airborne -> grounded edge, no reset: the drone still reports IDLE
+    for a moment after the server accepted a mission on the ground."""
+    async def scenario():
+        realtime_server = RealtimeServer()
+        await realtime_server._route_drone_telemetry(_drone_state_telemetry("IDLE", 0.0))
+        realtime_server.mission.apply(CommandName.START_PATROL, {})
+        await realtime_server._route_drone_telemetry(_drone_state_telemetry("IDLE", 0.0))
+        assert realtime_server.mission.state is MissionState.TAKING_OFF
+
+    asyncio.run(scenario())

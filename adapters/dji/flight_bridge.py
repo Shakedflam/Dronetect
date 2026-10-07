@@ -130,6 +130,7 @@ from controllers.autonomous_drone.manual_input import ManualInputRouter
 from controllers.autonomous_drone.pursuit import PursuitConfig
 from controllers.autonomous_drone.roi_patrol import LawnMowerRoiPatrolPlanner
 from realtime_server.protocol import operating_config_result
+from services.actionable_detections import ActionableDetectionFilter
 from services.commands import CommandName
 from services.flight_safety import CONNECTION_LOSS_REASON
 from services.gps import DEFAULT_HOME, LocalPosition, Wgs84Point, local_meters_to_wgs84, wgs84_to_local_meters
@@ -159,6 +160,16 @@ PHASE4_PULSE_SECONDS = 5.00
 PHASE4_AUTHORITY_ACQUIRE_SECONDS = 1.50
 PHASE4_ZERO_SETTLE_SECONDS = 1.00
 PHASE4_STABLE_HOVER_SECONDS = 2.00
+
+# A landing is only accepted after the aircraft has reported isFlying=false
+# continuously for this long, so one glitched sample cannot end a sortie.
+LANDING_CONFIRM_SECONDS = 2.00
+
+# FlightConfig.checkpoint_tolerance defaults to 5 cm, which only a simulated
+# body converges to. A real aircraft reports GPS/barometric position with
+# ~1 m noise, so a 5 cm gate left TARGET_RETURN hovering near the checkpoint
+# forever and the interrupted ROI never resumed.
+REAL_CHECKPOINT_TOLERANCE_M = 1.5
 
 # States in which losing a command/telemetry link means "still in the air,
 # bring it home" rather than "already on the ground, nothing to do". Mirrors
@@ -423,6 +434,10 @@ class DjiFlightBridge:
         self._mission_return_waiting_since: float | None = None
         self._mission_return_timeout_s = self.config.mission_return_timeout_s
         self._pending_operating_config: OperatingConfig | None = None
+        # Only stable "actionable" detections may start a target interruption;
+        # the tablet still gets the raw stream straight from realtime_server.
+        self.detection_filter = ActionableDetectionFilter(
+            log=lambda line: print(f"DJI bridge: {line}"))
 
         self.logic = FlightLogic(
             config=flight_config or build_flight_config(),
@@ -433,6 +448,13 @@ class DjiFlightBridge:
             roi_patrol_planner=LawnMowerRoiPatrolPlanner(),
             patrol_waypoint_provider=self._next_patrol_waypoint,
         )
+        if flight_config is None:
+            # Survives the operating-config replace(), which keeps other fields.
+            self.logic.config = replace(
+                self.logic.config,
+                checkpoint_tolerance=max(self.logic.config.checkpoint_tolerance,
+                                         REAL_CHECKPOINT_TOLERANCE_M),
+            )
         if self.roi_single_cycle:
             # Survives the operating-config replace(), which keeps other fields.
             self.logic.config = replace(self.logic.config, roi_single_cycle=True)
@@ -457,6 +479,11 @@ class DjiFlightBridge:
         self._safety_rth_reason: str | None = None
         self._android_connection_loss_rth_active = False
         self._realtime_connection_loss_rth_active = False
+        # Landing detection: a reset needs a real airborne -> grounded edge,
+        # so a mission queued on the ground before a manual takeoff survives.
+        self._airborne_seen = False
+        self._grounded_since: float | None = None
+        self._grounded_setpoint_suppression_logged = False
 
         # No autonomous movement is possible until this is not None -- see
         # the module docstring. _apply_operating_config sets it.
@@ -590,16 +617,25 @@ class DjiFlightBridge:
 
         self._enforce_realtime_connection_loss_failsafe()
         self._enforce_android_connection_loss_failsafe(now)
+        if fresh and self._last_position is not None:
+            assert telemetry is not None
+            self._observe_landing(telemetry.is_flying, self._last_position, now)
 
         if self._last_position is not None:
             # Mission-level intent (a command, a vision detection) is safe to
             # accept even without *current* telemetry -- it only becomes an
             # actual movement setpoint once telemetry is fresh again, gated
             # below and a second time at AndroidLink.send_setpoint itself.
-            # SET_OPERATING_CONFIG is the one command allowed through even
-            # while unconfigured -- it's the only way OUT of "unconfigured".
+            # SET_OPERATING_CONFIG is allowed through even while unconfigured
+            # -- it's the only way OUT of "unconfigured". SET_PURSUIT_BLOCK is
+            # too: it can only restrict autonomy, and dropping it here lost an
+            # operator hold (including realtime_server's re-assert on connect)
+            # that then read back as OFF once the bridge was configured.
             for message in self.realtime_link.drain_commands():
-                if self.operating_config is not None or message.get("command") == CommandName.SET_OPERATING_CONFIG.value:
+                if self.operating_config is not None or message.get("command") in {
+                    CommandName.SET_OPERATING_CONFIG.value,
+                    CommandName.SET_PURSUIT_BLOCK.value,
+                }:
                     self._safe_dispatch_command(message, self._last_position)
                 else:
                     print(
@@ -876,7 +912,11 @@ class DjiFlightBridge:
         elif command == CommandName.CAMERA_TILT_DOWN:
             self.camera_gimbal.tilt_down()
         elif command == CommandName.SET_PURSUIT_BLOCK:
-            self.logic.set_pursuit_blocked(bool(message["params"]["blocked"]), position)
+            state_before = self.logic.state
+            changed = self.logic.set_pursuit_blocked(bool(message["params"]["blocked"]), position)
+            print(f"DJI bridge: pursuit_hold={'ON' if self.logic.pursuit_blocked else 'OFF'} "
+                  f"changed={changed} stateBefore={state_before.value} "
+                  f"stateAfter={self.logic.state.value}")
         elif command == CommandName.SET_MANUAL_CONTROL:
             if bool(message["params"]["engaged"]):
                 if self.logic.engage_manual_control(position):
@@ -934,6 +974,20 @@ class DjiFlightBridge:
         detections = message.get("detections")
         if detections is None:
             return
+        result = self.detection_filter.update(
+            detections,
+            frame_width=message["frameWidth"],
+            frame_height=message["frameHeight"],
+            passthrough_track_id=self.logic.tracked_target_id if self.logic.is_target_tracking else None,
+        )
+        if self.logic.pursuit_blocked:
+            # The hold is dominant: even an actionable detection never reaches
+            # flight logic. The filter above still ran, so the logs show what
+            # would have been chased.
+            for track_id in result.newly_accepted:
+                print(f"DJI bridge: detection=suppressed track={track_id} reason=pursuit_hold")
+            return
+        detections = result.actionable
         allow_landing_intercept = self.logic.state is FlightState.LANDING and not self._safety_rth_active
         if self.logic.would_intercept(
             detections,
@@ -1194,6 +1248,8 @@ class DjiFlightBridge:
         self._mission_return_waiting_since = None
 
     def _restore_mission_interruption(self, context: MissionInterruptionContext) -> None:
+        print(f"DJI bridge: mission_resume=restored source={context.source_type.value} "
+              f"id={context.active_id} state={self.logic.state.value}")
         if context.source_type is InterruptedMissionType.PATROL:
             progress = context.progress
             if isinstance(progress, PausedPatrolCoverage):
@@ -1374,6 +1430,52 @@ class DjiFlightBridge:
             candidate = self._pending_operating_config
             self._pending_operating_config = None
             self._apply_operating_config(candidate, position)
+
+    # -- landing ----------------------------------------------------------------
+
+    def _observe_landing(self, is_flying: bool | None, position: Position, now: float) -> None:
+        """Reset the sortie once the aircraft is confirmed back on the ground.
+
+        Only an airborne -> grounded edge counts: a mission requested while
+        still on the ground (before a manual takeoff) must not be wiped.
+        isFlying=None (unknown) neither confirms nor cancels a landing.
+        """
+        if is_flying is True:
+            self._airborne_seen = True
+            self._grounded_since = None
+            self._grounded_setpoint_suppression_logged = False
+            return
+        if is_flying is not False:
+            return
+        if self._grounded_since is None:
+            self._grounded_since = now
+        if self._airborne_seen and now - self._grounded_since >= LANDING_CONFIRM_SECONDS:
+            self._airborne_seen = False
+            self._reset_after_landing(position)
+
+    def _reset_after_landing(self, position: Position) -> None:
+        state_before = self.logic.state
+        if self.logic.manual_control:
+            self.manual_input.reset()
+        self.logic.reset_after_landing(position)
+        self.detection_filter.reset()
+        self._clear_patrol_progress()
+        self._active_roi_id = None
+        self._horizontal_speed_mps = 0.0
+        # Every RTH latch ends at touchdown, as the LANDED branch of the
+        # connection-loss fail-safes already does; realtime_server clears its
+        # own safety latch on the same landing edge.
+        self._safety_rth_active = False
+        self._safety_rth_reason = None
+        self._android_connection_loss_rth_active = False
+        self._realtime_connection_loss_rth_active = False
+        print(f"DJI bridge: landing=confirmed stateBefore={state_before.value} "
+              f"stateAfter={self.logic.state.value} "
+              f"pursuitHold={'ON' if self.logic.pursuit_blocked else 'OFF'}")
+
+    def _grounded(self) -> bool:
+        telemetry = self.android_link.latest_telemetry
+        return telemetry is not None and telemetry.is_flying is False
 
     # -- fail-safes -------------------------------------------------------------
 
@@ -1680,14 +1782,22 @@ class DjiFlightBridge:
                   f"altM={outcome.position[2]:.1f} "
                   f"pursuitBlocked={outcome.pursuit_blocked} "
                   f"manual={outcome.manual_control_active}")
-        await self.android_link.send_setpoint(
-            velocity_x_mps=outcome.velocity_x_mps,
-            velocity_y_mps=outcome.velocity_y_mps,
-            velocity_z_mps=outcome.velocity_z_mps,
-            yaw_deg=yaw_deg,
-            ttl_ms=self.config.setpoint_ttl_ms,
-            telemetry_timeout_s=self.config.android_telemetry_timeout_s,
-        )
+        if self._grounded():
+            # Android refuses every setpoint on the ground ("grounded"), so
+            # sending them only spams rejections. Authority is taken again by
+            # the first setpoint after the pilot's manual takeoff.
+            if not self._grounded_setpoint_suppression_logged:
+                self._grounded_setpoint_suppression_logged = True
+                print(f"DJI bridge: setpoints=suppressed reason=grounded state={outcome.state}")
+        else:
+            await self.android_link.send_setpoint(
+                velocity_x_mps=outcome.velocity_x_mps,
+                velocity_y_mps=outcome.velocity_y_mps,
+                velocity_z_mps=outcome.velocity_z_mps,
+                yaw_deg=yaw_deg,
+                ttl_ms=self.config.setpoint_ttl_ms,
+                telemetry_timeout_s=self.config.android_telemetry_timeout_s,
+            )
         await self.android_link.send_gimbal_command(
             pitch_deg=-math.degrees(outcome.gimbal_pitch_rad), ttl_ms=self.config.gimbal_command_ttl_ms
         )
