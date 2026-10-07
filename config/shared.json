@@ -1,7 +1,7 @@
 {
   "home": { "lat": 32.0853, "lng": 34.7818 },
   "homeRadiusM": 300,
-  "cruiseAltitudeM": 10,
+  "cruiseAltitudeM": 30,
   "patrolBandCount": 4,
   "legalMaxFlightRadiusM": 3900,
   "legalMaxCruiseAltitudeM": 48

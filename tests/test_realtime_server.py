@@ -340,7 +340,7 @@ def test_start_patrol_is_forwarded_and_altitude_changes_backend_state():
                 assert taking_off["state"] == "TAKING_OFF"
 
                 telemetry = build_simulator_telemetry(
-                    position_local=LocalPosition(0.0, 0.0, 15.0),
+                    position_local=LocalPosition(0.0, 0.0, 35.0),
                     heading_deg=0.0,
                     speed_mps=0.0,
                     state="HOLDING",
@@ -359,7 +359,7 @@ def test_priority_updates_apply_during_patrol_and_empty_set_clears_them():
     async def scenario():
         realtime_server = RealtimeServer()
         realtime_server.mission.apply(CommandName.START_PATROL, {})
-        realtime_server.mission.observe_altitude(15.0)
+        realtime_server.mission.observe_altitude(35.0)
         assert realtime_server.mission.state is MissionState.PATROL
 
         async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
@@ -657,7 +657,7 @@ def test_roi_arrival_updates_state_without_touching_normal_patrol_ages():
     async def scenario():
         realtime_server = RealtimeServer()
         realtime_server.mission.apply(CommandName.START_PATROL, {})
-        realtime_server.mission.observe_altitude(15.0)
+        realtime_server.mission.observe_altitude(35.0)
         realtime_server.patrol_regions.record_observation("N-1", observed_at=42.0)
 
         async with serve(realtime_server.handler, "127.0.0.1", 0) as server:
@@ -751,7 +751,7 @@ def test_low_battery_telemetry_starts_safety_rth_and_commands_drone():
     async def scenario():
         realtime_server = RealtimeServer()
         realtime_server.mission.apply(CommandName.START_PATROL, {})
-        realtime_server.mission.observe_altitude(15.0)
+        realtime_server.mission.observe_altitude(35.0)
         drone = RecordingDrone()
         realtime_server.drone = drone
 
@@ -817,7 +817,7 @@ def test_aircraft_connection_loss_rth_is_latched_by_backend():
     async def scenario():
         realtime_server = RealtimeServer()
         realtime_server.mission.apply(CommandName.START_PATROL, {})
-        realtime_server.mission.observe_altitude(15.0)
+        realtime_server.mission.observe_altitude(35.0)
         drone = RecordingDrone()
         realtime_server.drone = drone
 

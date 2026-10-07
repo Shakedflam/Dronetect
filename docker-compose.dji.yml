@@ -1,4 +1,5 @@
-# Optional DJI Phase 1 service on the existing AWS host. Port 8790 is loopback only.
+# DJI flight bridge on the existing AWS host, in full autonomous mode. Port 8790 is loopback only.
+# Phase 1-4 test flags must stay unset here; any of them forces telemetry-only.
 services:
   dji_bridge:
     build:
@@ -7,9 +8,9 @@ services:
     network_mode: host
     restart: unless-stopped
     environment:
-      DRONTECT_DJI_PHASE1_TELEMETRY_ONLY: "1"
-      DRONTECT_DJI_PHASE2_ACTIONS: "1"
-      DRONTECT_DJI_PHASE3_ZERO_STICK: "1"
+      # Explicit "0" is required: with a bridge token set, the bridge (and the
+      # Dockerfile ENV) default to telemetry-only.
+      DRONTECT_DJI_PHASE1_TELEMETRY_ONLY: "0"
       DRONTECT_DJI_LOCAL_HOST: 127.0.0.1
       DRONTECT_DJI_LOCAL_PORT: "8790"
       DRONTECT_DJI_REALTIME_WS_URL: ws://127.0.0.1:8765/ws?role=drone
