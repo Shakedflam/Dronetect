@@ -1500,7 +1500,7 @@ def test_phase2_rth_still_reachable_before_session_home_is_established(monkeypat
 
 # -- landing reset ------------------------------------------------------------
 
-from adapters.dji.flight_bridge import LANDING_CONFIRM_SECONDS  # noqa: E402
+from adapters.dji.flight_bridge import LANDING_CONFIRM_SECONDS, NATIVE_TAKEOFF_STABLE_SECONDS  # noqa: E402
 
 
 def _airborne_tick(bridge: DjiFlightBridge, now: list[float], *, altitude_m: float = 15.0,
@@ -1660,13 +1660,15 @@ def test_no_setpoints_are_sent_while_grounded_and_a_new_sortie_starts_cleanly(ca
     out = capsys.readouterr().out
     assert out.count("setpoints=suppressed reason=grounded") == 1
 
-    # Next sortie: patrol requested on the ground, then a manual takeoff to
-    # ~5 m. Setpoints resume only once airborne, and they climb.
+    # Next sortie: patrol requested on the ground lifts off on DJI's native
+    # takeoff. Setpoints resume only once that has settled, and they climb.
     _queue_command(bridge, CommandName.START_PATROL.value, command_id="patrol-2")
     _run_tick(bridge, now, recorder, is_flying=False, altitude_m=0.0)
     assert bridge.logic.state is FlightState.TAKING_OFF
     assert recorder.setpoints() == []
-    _run_tick(bridge, now, recorder, is_flying=True, altitude_m=5.0)
+    assert [m["type"] for m in recorder.messages if m["type"] == "dji_takeoff"] == ["dji_takeoff"]
+    for _ in range(round((NATIVE_TAKEOFF_STABLE_SECONDS + 0.2) / 0.05)):
+        _run_tick(bridge, now, recorder, is_flying=True, altitude_m=1.2)
     setpoints = recorder.setpoints()
     assert setpoints and setpoints[-1]["velocity"]["z"] > 0.0
     assert bridge.logic.state is FlightState.TAKING_OFF
@@ -2037,3 +2039,181 @@ def test_landing_reset_clears_detection_persistence():
     _airborne_tick(bridge, now, detection=_confident_detection_message())
     _grounded_ticks(bridge, now, LANDING_CONFIRM_SECONDS + 0.2)
     assert not bridge.detection_filter._tracks
+
+
+# -- pilot control: manual takeover releases Virtual Stick -------------------------
+
+
+def _pilot_tick(bridge: DjiFlightBridge, now: list[float], recorder: _SetpointRecorder, *,
+                is_flying: bool = True, altitude_m: float = 15.0, **sticks) -> TickOutcome:
+    """One real send cycle with the physical RC sticks at `sticks`."""
+    now[0] += 0.05
+    _feed_telemetry(bridge, now, is_flying=is_flying, altitude_m=altitude_m, flight_mode="GPS_NORMAL")
+    _feed_ground_rc(bridge, now, is_flying=is_flying, **sticks)
+    bridge.android_link._connection = recorder
+    return asyncio.run(bridge.run_tick_once())
+
+
+def _releases(recorder: _SetpointRecorder) -> list[dict]:
+    return [m for m in recorder.messages if m.get("type") == "dji_release"]
+
+
+def test_rc_takeover_releases_virtual_stick_and_pilot_lands_normally(capsys):
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    recorder = _SetpointRecorder()
+
+    # 1. Autonomous mission active: setpoints stream, stamped with the epoch.
+    _pilot_tick(bridge, now, recorder)
+    assert recorder.setpoints()
+    mission_epoch = recorder.setpoints()[-1]["controlEpoch"]
+    recorder.messages.clear()
+
+    # 2. Pilot pulls the throttle down: takeover.
+    outcome = _pilot_tick(bridge, now, recorder, up=-0.30)
+    assert outcome.state == FlightState.MANUAL.value
+    assert bridge.logic.manual_control is True
+    # 3. Setpoint stream stops on that very tick; 4. release is requested once.
+    assert recorder.setpoints() == []
+    assert [m["reason"] for m in _releases(recorder)] == ["rc_stick_up_-0.30"]
+    out = capsys.readouterr().out
+    assert "pilot_control=engaged reason=rc_stick_up_-0.30 stateBefore=PATROLLING stateAfter=MANUAL" in out
+    assert "virtual_stick=release_requested" in out
+
+    # 5. MANUAL persists and 6. nothing is reacquired -- sticks centred, holding,
+    # descending: no setpoint (not even a zero) and no second release.
+    for _ in range(100):
+        assert _pilot_tick(bridge, now, recorder).state == FlightState.MANUAL.value
+    for altitude in (3.0, 2.0, 1.0, 0.5, 0.3):
+        assert _pilot_tick(bridge, now, recorder, altitude_m=altitude, up=-0.5).state == FlightState.MANUAL.value
+    assert recorder.setpoints() == []
+    assert len(_releases(recorder)) == 1
+
+    # 8./9. The pilot lands; telemetry keeps flowing, so the landing is
+    # confirmed after 2 s grounded and FlightLogic resets to IDLE.
+    for _ in range(round((LANDING_CONFIRM_SECONDS + 0.5) / 0.05)):
+        outcome = _pilot_tick(bridge, now, recorder, is_flying=False, altitude_m=0.0)
+    assert outcome.state == FlightState.IDLE.value
+    assert bridge._pilot_control is None
+    assert recorder.setpoints() == []
+    assert "landing=confirmed stateBefore=MANUAL stateAfter=IDLE" in capsys.readouterr().out
+
+    # 7. Only an explicit new mission re-acquires, with a newer epoch.
+    _queue_command(bridge, CommandName.START_PATROL.value, command_id="patrol-2")
+    _pilot_tick(bridge, now, recorder, is_flying=False, altitude_m=0.0)
+    assert bridge.logic.state is FlightState.TAKING_OFF
+    assert recorder.setpoints() == []  # still grounded
+    for _ in range(round((NATIVE_TAKEOFF_STABLE_SECONDS + 0.2) / 0.05)):
+        _pilot_tick(bridge, now, recorder, altitude_m=1.2)  # DJI native takeoff hover
+    setpoint = recorder.setpoints()[-1]
+    assert setpoint["velocity"]["z"] > 0.0
+    assert setpoint["controlEpoch"] > mission_epoch
+
+
+def test_tablet_manual_releases_and_only_explicit_handback_reacquires():
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    recorder = _SetpointRecorder()
+    _pilot_tick(bridge, now, recorder)
+    mission_epoch = recorder.setpoints()[-1]["controlEpoch"]
+    recorder.messages.clear()
+
+    _queue_command(bridge, CommandName.SET_MANUAL_CONTROL.value, {"engaged": True}, command_id="manual-on")
+    _pilot_tick(bridge, now, recorder)
+    assert bridge.logic.state is FlightState.MANUAL
+    assert recorder.setpoints() == []
+    assert [m["reason"] for m in _releases(recorder)] == ["tablet_manual"]
+
+    # Tablet virtual sticks no longer fly the real aircraft either.
+    for _ in range(40):
+        _queue_command(bridge, CommandName.SET_MANUAL_COMMAND.value,
+                       {"forward": 1.0, "right": 0.0, "up": 0.0, "yawRate": 0.0}, command_id="stick")
+        _pilot_tick(bridge, now, recorder)
+    assert recorder.setpoints() == []
+
+    # Explicit operator hand-back resumes the mission under a new epoch.
+    _queue_command(bridge, CommandName.SET_MANUAL_CONTROL.value, {"engaged": False}, command_id="manual-off")
+    _pilot_tick(bridge, now, recorder)
+    assert bridge.logic.state is FlightState.PATROLLING
+    assert recorder.setpoints()[-1]["controlEpoch"] > mission_epoch
+
+
+def test_rc_takeover_mid_climb_stands_the_mission_down():
+    """MANUAL refuses a climb; the pilot must still get the aircraft."""
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.TAKING_OFF, now)
+    recorder = _SetpointRecorder()
+    outcome = _pilot_tick(bridge, now, recorder, altitude_m=5.0, forward=0.4)
+    assert outcome.state == FlightState.IDLE.value
+    assert bridge._pilot_control is not None
+    assert recorder.setpoints() == []
+    assert len(_releases(recorder)) == 1
+    for _ in range(60):  # no silent resume of the climb
+        assert _pilot_tick(bridge, now, recorder, altitude_m=6.0).state == FlightState.IDLE.value
+    assert recorder.setpoints() == []
+
+
+def test_rc_input_without_an_active_mission_is_not_a_takeover():
+    """Flying manually before any mission is the normal pre-ROI state."""
+    now = [0.0]
+    bridge = _bridge_on_ground_with_home(now)
+    recorder = _SetpointRecorder()
+    _pilot_tick(bridge, now, recorder, altitude_m=5.0, forward=0.8)
+    assert bridge.logic.state is FlightState.IDLE
+    assert bridge._pilot_control is None
+    assert _releases(recorder) == []
+
+
+def test_link_loss_never_seizes_the_aircraft_from_the_pilot():
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    recorder = _SetpointRecorder()
+    _pilot_tick(bridge, now, recorder, up=-0.30)
+    assert bridge._pilot_control is not None
+
+    bridge.android_link._connection = None
+    bridge.android_link._mark_disconnected()
+    now[0] += 4.0  # past android_connection_loss_rth_s
+    bridge.tick(0.05, now=now[0])
+    assert bridge._safety_rth_active is False
+    assert bridge.logic.state is FlightState.MANUAL
+
+
+def test_release_is_resent_once_after_an_android_reconnect():
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    recorder = _SetpointRecorder()
+    _pilot_tick(bridge, now, recorder, up=-0.30)
+    bridge.android_link._mark_disconnected()
+    for _ in range(5):
+        _pilot_tick(bridge, now, recorder)  # reconnects: new session generation
+    assert len(_releases(recorder)) == 2
+    assert recorder.setpoints() == []
+
+
+def test_safety_rth_under_pilot_control_uses_djis_native_rth_not_virtual_stick():
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    recorder = _SetpointRecorder()
+    _pilot_tick(bridge, now, recorder, up=-0.30)
+    epoch = bridge._control_epoch
+    message = {"type": "command", "commandId": "safety", "command": CommandName.RETURN_HOME.value,
+               "params": {}, "safetyReason": "low_battery"}
+    bridge.realtime_link._commands.put(message)
+    _pilot_tick(bridge, now, recorder)
+    assert bridge._control_epoch == epoch
+    assert recorder.setpoints() == []
+    assert [m for m in recorder.messages if m.get("type") == "dji_rth"]
+
+
+def test_pursuit_hold_and_landing_reset_survive_a_pilot_takeover():
+    now = [0.0]
+    bridge = _drive_bridge_into(FlightState.PATROLLING, now)
+    recorder = _SetpointRecorder()
+    _queue_command(bridge, CommandName.SET_PURSUIT_BLOCK.value, {"blocked": True}, command_id="hold")
+    _pilot_tick(bridge, now, recorder)
+    _pilot_tick(bridge, now, recorder, right=0.5)
+    for _ in range(round((LANDING_CONFIRM_SECONDS + 0.5) / 0.05)):
+        _pilot_tick(bridge, now, recorder, is_flying=False, altitude_m=0.0)
+    assert bridge.logic.state is FlightState.IDLE
+    assert bridge.logic.pursuit_blocked is True

@@ -78,6 +78,60 @@ class DjiSdkAircraftActions : DjiAircraftActions {
         }
     }
 
+    /**
+     * DJI's own takeoff (KeyStartTakeoff): DJI spins up and climbs to its
+     * standard hover. Requires a recorded home point so DJI's own RTH/RC-loss
+     * fail-safes have somewhere to go. Every DJI takeoff check stays in force.
+     */
+    override fun takeoff(isCurrent: () -> Boolean, complete: (CommandResult) -> Unit) {
+        read(KeyTools.createKey(FlightControllerKey.KeyConnection), isCurrent, complete) { connected ->
+            if (!connected) return@read complete(CommandResult(false, "aircraft_disconnected"))
+            read(KeyTools.createKey(FlightControllerKey.KeyIsFlying), isCurrent, complete) flying@{ flying ->
+                if (flying) return@flying complete(CommandResult(false, "takeoff_requires_grounded_aircraft"))
+                read(KeyTools.createKey(FlightControllerKey.KeyIsHomeLocationSet), isCurrent, complete) home@{ homeSet ->
+                    if (!homeSet) return@home complete(CommandResult(false, "home_location_unavailable"))
+                    perform(KeyTools.createKey(FlightControllerKey.KeyStartTakeoff), "takeoff_key_unsupported",
+                        isCurrent, complete)
+                }
+            }
+        }
+    }
+
+    /**
+     * DJI's own landing (KeyStartAutoLanding) where the aircraft is. Virtual
+     * Stick must already be released. KeyConfirmLanding is never sent: if DJI's
+     * landing protection stops to ask, that confirmation stays with the pilot.
+     */
+    override fun land(isCurrent: () -> Boolean, complete: (CommandResult) -> Unit) {
+        read(KeyTools.createKey(FlightControllerKey.KeyConnection), isCurrent, complete) { connected ->
+            if (!connected) return@read complete(CommandResult(false, "aircraft_disconnected"))
+            read(KeyTools.createKey(FlightControllerKey.KeyIsFlying), isCurrent, complete) flying@{ flying ->
+                if (!flying) return@flying complete(CommandResult(false, "land_requires_airborne_aircraft"))
+                read(KeyTools.createKey(FlightControllerKey.KeyFlightMode), isCurrent, complete) mode@{ mode ->
+                    when (mode) {
+                        FlightMode.AUTO_LANDING, FlightMode.FORCE_LANDING, FlightMode.ATTI_LANDING ->
+                            return@mode complete(CommandResult(true, "already_landing"))
+                        FlightMode.VIRTUAL_STICK ->
+                            return@mode complete(CommandResult(false, "virtual_stick_still_active"))
+                        FlightMode.GO_HOME, FlightMode.UNKNOWN ->
+                            return@mode complete(CommandResult(false, "land_blocked_by_flight_mode_$mode"))
+                        else -> perform(KeyTools.createKey(FlightControllerKey.KeyStartAutoLanding),
+                            "land_key_unsupported", isCurrent, complete)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun perform(
+        key: DJIKey.ActionKey<EmptyMsg, EmptyMsg>, unsupported: String,
+        isCurrent: () -> Boolean, complete: (CommandResult) -> Unit,
+    ) = guarded(isCurrent, complete) {
+        val manager = KeyManager.getInstance()
+        if (!manager.isKeySupported(key)) complete(CommandResult(false, unsupported))
+        else manager.performAction(key, completion(complete))
+    }
+
     override fun tiltCamera(up: Boolean, isCurrent: () -> Boolean, complete: (CommandResult) -> Unit) {
         val index = ComponentIndexType.LEFT_OR_MAIN
         read(KeyTools.createKey(GimbalKey.KeyConnection, index), isCurrent, complete) connected@{ connected ->

@@ -98,6 +98,30 @@ class DjiAutonomousMappingTest {
         assertNull(autonomousEnvelopeRejection(cruising.copy(altitudeMeters = 48.0), 32.0, 34.0))
     }
 
+    /** DJI's native takeoff hovers at ~1.2 m: only a climb may continue from there. */
+    @Test fun belowTheFloorOnlyAClimbOutFromDjisTakeoffHoverIsAccepted() {
+        val hover = cruising.copy(altitudeMeters = 1.2)
+        assertEquals("altitude_below_floor", autonomousEnvelopeRejection(hover, null, null))
+        assertEquals("altitude_below_floor", autonomousEnvelopeRejection(hover, null, null, upMps = -0.5))
+        assertNull(autonomousEnvelopeRejection(hover, null, null, upMps = 1.0))
+        assertTrue(autonomousBelowFloor(1.2))
+        // Never from right off the ground, and never once above the floor.
+        assertEquals("altitude_below_floor", autonomousEnvelopeRejection(
+            cruising.copy(altitudeMeters = 0.3), null, null, upMps = 1.0))
+        assertEquals(false, autonomousBelowFloor(AUTONOMOUS_MIN_ALTITUDE_M))
+        assertNull(autonomousEnvelopeRejection(cruising.copy(altitudeMeters = 2.0), null, null, upMps = -0.5))
+    }
+
+    @Test fun nativeTakeoffNeedsGroundCentredSticksAndStrongGps() {
+        val ground = cruising.copy(isFlying = false, altitudeMeters = 0.0)
+        assertNull(nativeTakeoffRejection(ground))
+        assertEquals("airborne", nativeTakeoffRejection(cruising))
+        assertEquals("rc_stick_moved_left_vertical_200",
+            nativeTakeoffRejection(ground.copy(rcLeftVertical = 200)))
+        assertEquals("rc_disconnected", nativeTakeoffRejection(ground.copy(rcConnected = false)))
+        assertEquals("gps_not_strong", nativeTakeoffRejection(ground.copy(gpsSignalLevel = "LEVEL_2")))
+    }
+
     @Test fun envelopeHoldsRadiusBackstopIndependentlyOfAws() {
         // ~300 m north of the origin: inside the 330 m backstop.
         val near = cruising.copy(latitude = 32.0 + 300.0 / 111_320.0)

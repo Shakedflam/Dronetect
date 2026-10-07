@@ -57,6 +57,30 @@ class DjiAutonomousLifecycleTest {
         assertEquals(true, moving)
     }
 
+    @Test fun pilotOrDjiTakeoverIsAReleaseNotATransientGuard() {
+        assertEquals(true, isControlReleaseStop("guard_rc_stick_moved_left_vertical_-200"))
+        assertEquals(true, isControlReleaseStop("bridge_release_rc_stick_up_-0.30"))
+        // DJI/RC reclaimed authority (RC_PAUSE_STOP, NEAR_BOUNDARY, low battery...).
+        assertEquals(true, isControlReleaseStop("rc_authority"))
+        // Transient guards keep the existing bounded re-arm.
+        assertEquals(false, isControlReleaseStop("guard_gps_not_strong"))
+        assertEquals(false, isControlReleaseStop("guard_altitude_below_floor"))
+        assertEquals(false, isControlReleaseStop("setpoint_timeout"))
+    }
+
+    @Test fun releasedAutonomyNeverRearmsForTheSameEpoch() {
+        // Fresh session: nothing released yet, the first mission may arm.
+        assertNull(autonomyReleaseRejection(controlEpoch = 1, releasedEpoch = -1))
+        // Released while epoch 3 was streaming: epoch 3 can never re-arm, an
+        // old bridge with no epoch (0) can never re-arm either...
+        assertEquals("released_to_pilot_awaiting_new_mission",
+            autonomyReleaseRejection(controlEpoch = 3, releasedEpoch = 3))
+        assertEquals("released_to_pilot_awaiting_new_mission",
+            autonomyReleaseRejection(controlEpoch = 0, releasedEpoch = 3))
+        // ...only an explicit new mission (epoch 4) re-acquires Virtual Stick.
+        assertNull(autonomyReleaseRejection(controlEpoch = 4, releasedEpoch = 3))
+    }
+
     @Test fun rearmCooldownIsBoundedAndNonZero() {
         // Long enough to stop a 20 Hz re-arm storm, short enough that the
         // mission recovers within a couple of seconds.

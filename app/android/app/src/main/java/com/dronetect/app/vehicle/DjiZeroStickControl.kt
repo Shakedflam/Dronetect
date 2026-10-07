@@ -39,6 +39,10 @@ interface ZeroStickControl {
     ): String? = "autonomous_unsupported"
     fun tick(snapshot: DjiTelemetrySnapshot, nowMs: Long)
     fun stop(reason: String)
+    /** The control epoch carried by the latest autonomous setpoint. */
+    fun observeControlEpoch(epoch: Long) {}
+    /** The bridge handed the aircraft to the pilot: stop, disable, stay released. */
+    fun releaseToPilot(reason: String) {}
 }
 
 /** A null reason means the aircraft is grounded and physical RC input is verified centered. */
@@ -195,6 +199,11 @@ class DjiZeroStickControl(
     private var autonomousSaturationLogged = false
     private var lastAutonomousLogMs = 0L
     private var autonomousRearmAtMs = 0L
+    // Virtual Stick is never (re-)acquired for an epoch at or below the last
+    // one released to the pilot/DJI; the bridge only advances the epoch on an
+    // explicit operator mission.
+    private var controlEpoch = 0L
+    private var releasedEpoch = -1L
     private var enableStartedMs = 0L
     private var lastSendMs = 0L
     private var listener: VirtualStickStateListener? = null
@@ -215,6 +224,19 @@ class DjiZeroStickControl(
         phase4StartAltitudeM = null
         phase4AltitudeZeroSubmitted = false
         autonomousSaturationLogged = false
+        // A new authenticated session starts a new epoch space on the bridge.
+        controlEpoch = 0L
+        releasedEpoch = -1L
+    }
+
+    override fun observeControlEpoch(epoch: Long) {
+        controlEpoch = epoch
+    }
+
+    override fun releaseToPilot(reason: String) {
+        releasedEpoch = controlEpoch
+        log("autonomy=released_to_pilot reason=$reason controlEpoch=$controlEpoch")
+        stop("bridge_release_$reason")
     }
 
     override fun acceptZero(snapshot: DjiTelemetrySnapshot, deadlineMs: Long, nowMs: Long): Boolean {
@@ -253,9 +275,11 @@ class DjiZeroStickControl(
     ): String? = when {
         !autonomousEnabled -> "autonomous_apk_opt_in_disabled"
         latched -> "latched_after_$latchReason"
+        autonomyReleaseRejection(controlEpoch, releasedEpoch) != null ->
+            autonomyReleaseRejection(controlEpoch, releasedEpoch)
         nowMs < autonomousRearmAtMs -> "autonomous_rearm_cooldown"
         else -> autonomousCommandRejection(eastMps, northMps, upMps, headingDeg)
-            ?: autonomousEnvelopeRejection(snapshot, autonomousOriginLat, autonomousOriginLng)
+            ?: autonomousEnvelopeRejection(snapshot, autonomousOriginLat, autonomousOriginLng, upMps)
             ?: if (deadlineMs <= nowMs) "setpoint_deadline_exhausted" else null
     }
 
@@ -419,8 +443,8 @@ class DjiZeroStickControl(
     override fun tick(snapshot: DjiTelemetrySnapshot, nowMs: Long) {
         if (!active) return
         val guard = when {
-            autonomousActive ->
-                autonomousEnvelopeRejection(snapshot, autonomousOriginLat, autonomousOriginLng)
+            autonomousActive -> autonomousEnvelopeRejection(
+                snapshot, autonomousOriginLat, autonomousOriginLng, if (zeroHolding) 0.0 else verticalMps)
             phase4Active -> phase4AirborneRejection(snapshot)
             else -> zeroStickGroundRejection(snapshot)
         }
@@ -463,9 +487,11 @@ class DjiZeroStickControl(
         }
         if (!enabled || !owned || nowMs - lastSendMs < 100L) return
         if (autonomousActive) {
-            // A zero hold or expiry must zero every axis, not just the vertical.
-            val east = if (zeroHolding) 0.0 else autonomousEastMps
-            val north = if (zeroHolding) 0.0 else autonomousNorthMps
+            // A zero hold or expiry must zero every axis, not just the vertical;
+            // so must a climb-out below the floor (see autonomousBelowFloor).
+            val holdHorizontal = zeroHolding || autonomousBelowFloor(snapshot.altitudeMeters)
+            val east = if (holdHorizontal) 0.0 else autonomousEastMps
+            val north = if (holdHorizontal) 0.0 else autonomousNorthMps
             val pitch = djiPitchFromEnu(east)
             val roll = djiRollFromEnu(north)
             val vertical = djiVerticalFromEnu(verticalMps)
@@ -518,7 +544,12 @@ class DjiZeroStickControl(
         latchReason = reason
         if (stoppingAutonomous) {
             autonomousRearmAtMs = System.nanoTime() / 1_000_000L + AUTONOMOUS_REARM_COOLDOWN_MS
-            log("autonomous=backoff reason=$reason rearmInMs=$AUTONOMOUS_REARM_COOLDOWN_MS")
+            if (isControlReleaseStop(reason)) {
+                releasedEpoch = maxOf(releasedEpoch, controlEpoch)
+                log("autonomous=released reason=$reason controlEpoch=$controlEpoch rearm=new_mission_only")
+            } else {
+                log("autonomous=backoff reason=$reason rearmInMs=$AUTONOMOUS_REARM_COOLDOWN_MS")
+            }
         }
         val shouldDisable = enabling || enabled
         val hadAuthority = enabled && owned

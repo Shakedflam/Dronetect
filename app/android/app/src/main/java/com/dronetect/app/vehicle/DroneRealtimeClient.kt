@@ -267,7 +267,8 @@ class DroneRealtimeClient(
 
     private fun receiveAction(message: JSONObject, receivedElapsedMs: Long) {
         val name = message.optString("type")
-        if (name !in setOf("dji_setpoint", "dji_gimbal_command", "dji_rth")) return
+        if (name !in setOf("dji_setpoint", "dji_gimbal_command", "dji_rth", "dji_release",
+                "dji_takeoff", "dji_land")) return
         val session = sessionId ?: return
         val seq = (message.opt("seq") as? Number)?.toLong()
         if (message.optString("sessionId") != session || seq == null || seq <= downlinkSequence) {
@@ -278,6 +279,14 @@ class DroneRealtimeClient(
             return
         }
         downlinkSequence = seq
+        if (name == "dji_release") {
+            // Releasing control is always safe, so unlike every other action it
+            // is honoured however late it arrives: no clock/TTL gate.
+            val reason = message.optString("reason").replace(Regex("[^A-Za-z0-9_+.-]"), "_").take(48)
+            log("bridge_action=received name=dji_release reason=$reason")
+            stick().releaseToPilot(reason.ifEmpty { "unspecified" })
+            return
+        }
         val receiveGapMs = if (name == "dji_setpoint") {
             val gap = if (lastSetpointReceivedElapsedMs == 0L) -1L else
                 receivedElapsedMs - lastSetpointReceivedElapsedMs
@@ -307,7 +316,7 @@ class DroneRealtimeClient(
         val ageMs = if (issuedAt == null) Double.POSITIVE_INFINITY else
             serverNowEstimateMs - issuedAt * 1_000.0
         val maximumTtl = when (name) {
-            "dji_rth" -> 1_500
+            "dji_rth", "dji_takeoff", "dji_land" -> 1_500
             "dji_setpoint" -> 500
             else -> 1_000
         }
@@ -333,6 +342,9 @@ class DroneRealtimeClient(
             val z = (velocity?.opt("z") as? Number)?.toDouble()
             val heading = (message.opt("yawDeg") as? Number)?.toDouble()
             if (autonomousEnabled) {
+                // Absent on an older bridge: epoch 0, which can never re-arm
+                // after a release -- the conservative reading.
+                stick().observeControlEpoch((message.opt("controlEpoch") as? Number)?.toLong() ?: 0L)
                 val invalid = autonomousCommandRejection(x, y, z, heading)
                 if (invalid != null || x == null || y == null || z == null || heading == null) {
                     val reason = invalid ?: "command_incomplete"
@@ -417,15 +429,35 @@ class DroneRealtimeClient(
             }
             return
         }
-        val command = if (name == "dji_rth") {
-            VehicleCommand("$session:$seq", "return_home")
-        } else {
-            val pitch = (message.opt("pitchDeg") as? Number)?.toDouble()
-            if (pitch == null || !pitch.isFinite()) {
-                log("bridge_action=rejected name=$name reason=invalid_pitch")
-                return
+        val command = when (name) {
+            "dji_rth" -> VehicleCommand("$session:$seq", "return_home")
+            "dji_takeoff", "dji_land" -> {
+                if (!autonomousEnabled) {
+                    log("bridge_action=rejected name=$name reason=autonomous_apk_opt_in_disabled")
+                    return
+                }
+                if (name == "dji_takeoff") {
+                    nativeTakeoffRejection(state().snapshot)?.let { reason ->
+                        log("bridge_action=rejected name=dji_takeoff reason=$reason")
+                        return
+                    }
+                    VehicleCommand("$session:$seq", DjiCommandDispatcher.NATIVE_TAKEOFF)
+                } else {
+                    // Same worker, so Virtual Stick is stopped and its epoch
+                    // released before DJI is asked to land: autonomy cannot
+                    // re-arm under DJI's descent.
+                    stick().releaseToPilot("native_landing")
+                    VehicleCommand("$session:$seq", DjiCommandDispatcher.NATIVE_LAND)
+                }
             }
-            VehicleCommand("$session:$seq", "gimbal_pitch", mapOf("pitchDeg" to pitch))
+            else -> {
+                val pitch = (message.opt("pitchDeg") as? Number)?.toDouble()
+                if (pitch == null || !pitch.isFinite()) {
+                    log("bridge_action=rejected name=$name reason=invalid_pitch")
+                    return
+                }
+                VehicleCommand("$session:$seq", "gimbal_pitch", mapOf("pitchDeg" to pitch))
+            }
         }
         log("bridge_action=received name=$name")
         adapter.handleCommand(command) { result ->

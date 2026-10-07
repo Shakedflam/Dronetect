@@ -31,10 +31,16 @@ from adapters.dji.local_protocol import (
     LocalProtocolError,
     MESSAGE_TYPE_GIMBAL_STATE,
     MESSAGE_TYPE_RC_STATE,
+    MESSAGE_TYPE_LAND,
+    MESSAGE_TYPE_TAKEOFF,
     MESSAGE_TYPE_TELEMETRY,
+    NativeFlightCommand,
+    ReleaseCommand,
     RthCommand,
     VelocitySetpoint,
     build_gimbal_command_message,
+    build_native_flight_message,
+    build_release_message,
     build_rth_message,
     build_setpoint_message,
     encode_message,
@@ -253,6 +259,24 @@ class AndroidLink:
                 all(abs(axis) <= 33 / 660 for axis in
                     (state.forward, state.right, state.up, state.yaw_rate)))
 
+    def rc_stick_deflection(self, timeout_s: float, now: float | None = None) -> tuple[str, float] | None:
+        """The first physical RC stick axis outside centre, from fresh RC state.
+
+        Same ±33/660 centre band Android's envelope guard uses, so the bridge
+        sees a pilot takeover exactly when the actuator does.
+        """
+        state = self._latest_rc_state
+        if not self.connected or state is None or self._rc_received_monotonic is None:
+            return None
+        age = (self._clock() if now is None else now) - self._rc_received_monotonic
+        if not (0.0 <= age <= timeout_s) or not state.connected:
+            return None
+        for name, value in (("forward", state.forward), ("right", state.right),
+                            ("up", state.up), ("yaw_rate", state.yaw_rate)):
+            if abs(value) > 33 / 660:
+                return name, value
+        return None
+
     def is_phase4_airborne_safety_fresh(self, timeout_s: float, now: float | None = None) -> bool:
         """Strict bridge-side gate for the isolated Phase 4 climb pulse."""
         return self.phase4_airborne_safety_rejection(timeout_s, now) is None
@@ -319,6 +343,7 @@ class AndroidLink:
         yaw_deg: float,
         ttl_ms: int,
         telemetry_timeout_s: float,
+        control_epoch: int = 0,
     ) -> bool:
         """Send a velocity/yaw setpoint. Returns False, sending nothing, if
         Android telemetry is stale or absent -- see the module docstring."""
@@ -326,7 +351,8 @@ class AndroidLink:
             return False
         return await self._send_setpoint(
             velocity_x_mps=velocity_x_mps, velocity_y_mps=velocity_y_mps,
-            velocity_z_mps=velocity_z_mps, yaw_deg=yaw_deg, ttl_ms=ttl_ms)
+            velocity_z_mps=velocity_z_mps, yaw_deg=yaw_deg, ttl_ms=ttl_ms,
+            control_epoch=control_epoch)
 
     async def send_zero_ground_test_setpoint(self, *, ttl_ms: int, safety_timeout_s: float) -> bool:
         if not self.is_zero_ground_safety_fresh(safety_timeout_s):
@@ -349,7 +375,7 @@ class AndroidLink:
 
     async def _send_setpoint(
         self, *, velocity_x_mps: float, velocity_y_mps: float,
-        velocity_z_mps: float, yaw_deg: float, ttl_ms: int,
+        velocity_z_mps: float, yaw_deg: float, ttl_ms: int, control_epoch: int = 0,
     ) -> bool:
         setpoint = VelocitySetpoint(
             issued_at=time.time(),
@@ -358,6 +384,7 @@ class AndroidLink:
             velocity_y_mps=velocity_y_mps,
             velocity_z_mps=velocity_z_mps,
             yaw_deg=yaw_deg,
+            control_epoch=control_epoch,
         )
         message = self._session_command(build_setpoint_message(setpoint))
         send_started = time.monotonic()
@@ -397,6 +424,37 @@ class AndroidLink:
             return False
         command = RthCommand(issued_at=time.time(), reason=reason)
         message = build_rth_message(command)
+        message["ttlMs"] = 1500
+        await self._send(self._session_command(message))
+        return True
+
+    async def send_release(self, *, reason: str) -> bool:
+        """Hand the aircraft to the pilot: Android stops and disables Virtual
+        Stick. Like RTH, never gated on telemetry freshness."""
+        if not self.connected:
+            return False
+        message = build_release_message(ReleaseCommand(issued_at=time.time(), reason=reason))
+        message["ttlMs"] = 1500
+        await self._send(self._session_command(message))
+        return True
+
+    async def send_native_takeoff(self, *, control_epoch: int, telemetry_timeout_s: float) -> bool:
+        """Ask DJI to take off. Unlike release/RTH this starts motion, so it is
+        gated on fresh telemetry exactly like a setpoint."""
+        return await self._send_native_flight(MESSAGE_TYPE_TAKEOFF, "mission_start",
+                                              control_epoch, telemetry_timeout_s)
+
+    async def send_native_land(self, *, control_epoch: int, telemetry_timeout_s: float) -> bool:
+        """Ask DJI to land where the aircraft is. Fresh telemetry only."""
+        return await self._send_native_flight(MESSAGE_TYPE_LAND, "landing_approach_complete",
+                                              control_epoch, telemetry_timeout_s)
+
+    async def _send_native_flight(self, kind: str, reason: str, control_epoch: int,
+                                  telemetry_timeout_s: float) -> bool:
+        if not self.is_telemetry_fresh(telemetry_timeout_s):
+            return False
+        message = build_native_flight_message(NativeFlightCommand(
+            type=kind, issued_at=time.time(), reason=reason, control_epoch=control_epoch))
         message["ttlMs"] = 1500
         await self._send(self._session_command(message))
         return True

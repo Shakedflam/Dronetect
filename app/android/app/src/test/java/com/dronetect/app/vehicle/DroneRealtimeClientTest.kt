@@ -379,4 +379,153 @@ class DroneRealtimeClientTest {
             assertEquals(listOf(1.2, -0.8, 0.4, 270.0), seen.first())
         } finally { client.stop(); server.shutdown() }
     }
+
+    /**
+     * The manual-landing bug: the pilot must get the aircraft back. A release
+     * reaches the controller even when it arrives stale (releasing is always
+     * safe), and every setpoint's control epoch is handed over first so the
+     * controller can refuse to re-arm for an epoch it already released.
+     */
+    @Test fun releaseIsHonouredEvenWhenStaleAndSetpointsCarryTheirEpoch() {
+        val server = MockWebServer()
+        val session = "d".repeat(32)
+        val released = CountDownLatch(1)
+        val epochSeenBeforeAccept = CountDownLatch(1)
+        val events = CopyOnWriteArrayList<String>()
+        val stick = object : ZeroStickControl {
+            override fun newSession() = Unit
+            override fun acceptZero(snapshot: DjiTelemetrySnapshot, deadlineMs: Long, nowMs: Long) = false
+            override fun observeControlEpoch(epoch: Long) { events.add("epoch=$epoch") }
+            override fun acceptAutonomous(
+                snapshot: DjiTelemetrySnapshot, eastMps: Double, northMps: Double, upMps: Double,
+                headingDeg: Double, deadlineMs: Long, nowMs: Long,
+            ): Boolean {
+                events.add("accept")
+                epochSeenBeforeAccept.countDown()
+                return true
+            }
+            override fun releaseToPilot(reason: String) {
+                events.add("release=$reason")
+                released.countDown()
+            }
+            override fun tick(snapshot: DjiTelemetrySnapshot, nowMs: Long) = Unit
+            override fun stop(reason: String) = Unit
+        }
+        server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                webSocket.send("""{"type":"dji_hello","sessionId":"$session"}""")
+            }
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                val probe = JSONObject(text)
+                if (probe.optString("type") != "dji_clock_probe") return
+                val time = probe.getDouble("timestamp")
+                webSocket.send(JSONObject().put("type", "dji_clock_sync")
+                    .put("sessionId", session).put("probeTimestamp", time)
+                    .put("serverReceivedAt", time).toString())
+                webSocket.send(JSONObject().put("type", "dji_setpoint")
+                    .put("sessionId", session).put("seq", 1).put("issuedAt", time)
+                    .put("ttlMs", 500).put("velocity", JSONObject()
+                        .put("x", 1.0).put("y", 0.0).put("z", 0.0))
+                    .put("yawDeg", 90.0).put("controlEpoch", 7).toString())
+                // Ten seconds old: any other action would be dropped as stale.
+                webSocket.send(JSONObject().put("type", "dji_release")
+                    .put("sessionId", session).put("seq", 2).put("issuedAt", time - 10.0)
+                    .put("ttlMs", 1500).put("reason", "rc_stick_up_-0.30").toString())
+            }
+        }))
+        server.start()
+        val snapshot = DjiTelemetrySnapshot(aircraftConnected = true, isFlying = true)
+        val client = DroneRealtimeClient("ws://127.0.0.1:${server.port}", "a".repeat(64),
+            { DjiTelemetryState("connected", snapshot, System.currentTimeMillis()) },
+            log = {}, zeroStickControl = stick, autonomousEnabled = true)
+        try {
+            client.start()
+            assertTrue(epochSeenBeforeAccept.await(5, TimeUnit.SECONDS))
+            assertTrue(released.await(5, TimeUnit.SECONDS))
+            assertEquals(listOf("epoch=7", "accept", "release=rc_stick_up_-0.30"), events.toList())
+        } finally { client.stop(); server.shutdown() }
+    }
+
+    private fun recordingAdapter(events: MutableList<String>, latch: CountDownLatch) = object : VehicleAdapter {
+        override val availability = VehicleAvailability.CONNECTED
+        override fun start() = Unit
+        override fun stop() = Unit
+        override fun onControlLinkLost() = Unit
+        override fun telemetrySnapshot(): VehicleTelemetry? = null
+        override fun latestVideoFrame(): VehicleVideoFrame? = null
+        override fun handleCommand(command: VehicleCommand, complete: (CommandResult) -> Unit) {
+            events.add("sdk=${command.name}")
+            complete(CommandResult(true, "test_success"))
+            latch.countDown()
+        }
+    }
+
+    private fun recordingStick(events: MutableList<String>) = object : ZeroStickControl {
+        override fun newSession() = Unit
+        override fun acceptZero(snapshot: DjiTelemetrySnapshot, deadlineMs: Long, nowMs: Long) = false
+        override fun releaseToPilot(reason: String) { events.add("release=$reason") }
+        override fun tick(snapshot: DjiTelemetrySnapshot, nowMs: Long) = Unit
+        override fun stop(reason: String) = Unit
+    }
+
+    private fun nativeActionServer(session: String, vararg types: String) =
+        MockWebServer().apply {
+            enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    val now = System.currentTimeMillis() / 1000.0
+                    webSocket.send("""{"type":"dji_hello","sessionId":"$session"}""")
+                    types.forEachIndexed { index, type ->
+                        webSocket.send(JSONObject().put("type", type).put("sessionId", session)
+                            .put("seq", index + 1).put("issuedAt", now).put("ttlMs", 1500)
+                            .put("reason", "test").put("controlEpoch", 4).toString())
+                    }
+                }
+            }))
+        }
+
+    private val groundedReady = DjiTelemetrySnapshot(
+        aircraftConnected = true, rcConnected = true, isFlying = false, gpsSignalLevel = "LEVEL_5",
+        rcLeftHorizontal = 0, rcLeftVertical = 0, rcRightHorizontal = 0, rcRightVertical = 0,
+    )
+
+    @Test fun nativeTakeoffReachesDjiAndNativeLandingReleasesVirtualStickFirst() {
+        val session = "e".repeat(32)
+        val server = nativeActionServer(session, "dji_takeoff", "dji_land")
+        val events = CopyOnWriteArrayList<String>()
+        val done = CountDownLatch(2)
+        server.start()
+        val client = DroneRealtimeClient("ws://127.0.0.1:${server.port}", "a".repeat(64),
+            { DjiTelemetryState("connected", groundedReady, System.currentTimeMillis()) },
+            recordingAdapter(events, done), log = {}, zeroStickControl = recordingStick(events),
+            autonomousEnabled = true)
+        try {
+            client.start()
+            assertTrue(done.await(5, TimeUnit.SECONDS))
+            assertEquals(listOf("sdk=native_takeoff", "release=native_landing", "sdk=native_land"),
+                events.toList())
+        } finally { client.stop(); server.shutdown() }
+    }
+
+    @Test fun nativeTakeoffIsRefusedLocallyUnlessGroundedCentredAndOptedIn() {
+        for ((snapshot, autonomous) in listOf(
+            groundedReady.copy(rcLeftVertical = 300) to true,  // pilot touching the throttle
+            groundedReady.copy(isFlying = true) to true,       // already airborne
+            groundedReady to false,                            // APK opt-in off
+        )) {
+            val session = "f".repeat(32)
+            val server = nativeActionServer(session, "dji_takeoff", "dji_rth")
+            val events = CopyOnWriteArrayList<String>()
+            val done = CountDownLatch(1)
+            server.start()
+            val client = DroneRealtimeClient("ws://127.0.0.1:${server.port}", "a".repeat(64),
+                { DjiTelemetryState("connected", snapshot, System.currentTimeMillis()) },
+                recordingAdapter(events, done), log = {}, zeroStickControl = recordingStick(events),
+                autonomousEnabled = autonomous)
+            try {
+                client.start()
+                assertTrue(done.await(5, TimeUnit.SECONDS))  // the RTH sent after it arrived
+                assertEquals(listOf("sdk=return_home"), events.toList())
+            } finally { client.stop(); server.shutdown() }
+        }
+    }
 }

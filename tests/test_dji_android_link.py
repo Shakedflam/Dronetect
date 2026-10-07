@@ -192,6 +192,54 @@ def test_send_rth_ignores_telemetry_freshness():
     assert sent_messages[0]["reason"] == "connection_lost"
 
 
+def test_send_release_ignores_telemetry_freshness():
+    """Handing the aircraft to the pilot must never wait on telemetry."""
+    now = [0.0]
+    link = _connected_link(now)
+    assert asyncio.run(link.send_release(reason="rc_stick_up_-0.30")) is True
+    sent = [json.loads(raw) for raw in link._connection.sent_raw]
+    assert sent[0]["type"] == "dji_release"
+    assert sent[0]["reason"] == "rc_stick_up_-0.30"
+    assert sent[0]["sessionId"] and sent[0]["seq"] == 1
+
+
+def test_native_takeoff_and_land_require_fresh_telemetry():
+    """Unlike release/RTH these start motion, so they are gated like setpoints."""
+    now = [0.0]
+    link = _connected_link(now)
+    assert asyncio.run(link.send_native_takeoff(control_epoch=3, telemetry_timeout_s=1.0)) is False
+    assert asyncio.run(link.send_native_land(control_epoch=3, telemetry_timeout_s=1.0)) is False
+    assert link._connection.sent_raw == []
+
+    link._handle_message(json.dumps(build_android_telemetry_message(
+        AndroidTelemetry(0.0, 32.0, 34.0, 10.0, 0.0, 0.0, 100.0, 0.0, "GPS_NORMAL", True)
+    )))
+    assert asyncio.run(link.send_native_takeoff(control_epoch=3, telemetry_timeout_s=1.0)) is True
+    assert asyncio.run(link.send_native_land(control_epoch=3, telemetry_timeout_s=1.0)) is True
+    sent = [json.loads(raw) for raw in link._connection.sent_raw]
+    assert [m["type"] for m in sent] == ["dji_takeoff", "dji_land"]
+    assert all(m["controlEpoch"] == 3 and m["ttlMs"] == 1500 for m in sent)
+    assert [m["seq"] for m in sent] == [1, 2]
+
+
+def test_rc_stick_deflection_uses_androids_centre_band_and_freshness():
+    now = [0.0]
+    link = _connected_link(now)
+
+    def feed(**sticks):
+        values = dict(forward=0.0, right=0.0, up=0.0, yaw_rate=0.0)
+        values.update(sticks)
+        link._handle_message(json.dumps(build_android_rc_state_message(AndroidRcState(
+            timestamp=now[0], connected=True, aircraft_connected=True, is_flying=True, **values))))
+
+    feed(up=33 / 660)  # inside the centre band Android treats as "not moved"
+    assert link.rc_stick_deflection(1.0) is None
+    feed(up=-0.30)
+    assert link.rc_stick_deflection(1.0) == ("up", -0.30)
+    now[0] += 2.0  # stale RC state never reads as a takeover
+    assert link.rc_stick_deflection(1.0) is None
+
+
 def test_send_gimbal_command_requires_connection_but_not_fresh_telemetry():
     now = [0.0]
     link = _connected_link(now)

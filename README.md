@@ -25,6 +25,7 @@ without flying.
 - [Features](#features)
 - [Validation status](#validation-status)
 - [Safety model](#safety-model)
+  - [Flight lifecycle and control ownership](#flight-lifecycle-and-control-ownership)
 - [Project structure](#project-structure)
 - [Running the project](#running-the-project)
 - [Configuration](#configuration)
@@ -117,6 +118,12 @@ are returned to both the autonomy stack and the operator UI.
   coverage** of the selected area.
 - **Single-cycle ROI mode** for demonstrations: one complete coverage cycle,
   then hold station (see [Configuration](#configuration)).
+- **Automatic takeoff and landing on the real aircraft.** Starting an ROI or
+  patrol on the ground lifts off on DJI's native takeoff; Dronetect then climbs
+  to cruise altitude and flies the mission. Return to Home is Dronetect's own
+  navigation back to the session home, ending with a hold low over home and a
+  handover to DJI's native landing. See
+  [Flight lifecycle and control ownership](#flight-lifecycle-and-control-ownership).
 - **HOLDING** station-keeping, **Return to Home**, and landing.
 - **Mission interruption and resume**, including returning to the previous
   patrol or ROI context after a detection-driven excursion.
@@ -171,6 +178,11 @@ This distinction matters and is kept deliberately conservative.
 
 ### Not yet validated anywhere
 
+- **DJI native takeoff and landing handover.** Implemented and covered by bridge
+  and Android unit tests, but not yet flown. In particular, the Mini 4 Pro's
+  takeoff hover height, pilot stick override during DJI's own takeoff/landing,
+  and DJI landing-protection behaviour must be confirmed on the aircraft.
+
 - **Horizontal axis and sign mapping on real hardware.** The ENU → DJI GROUND
   frame mapping is implemented from DJI's documented convention (positive pitch
   moves East, positive roll moves North in the GROUND frame) and covered by unit
@@ -202,6 +214,8 @@ trust the cloud for physical limits.
 | Non-finite or incomplete command | reject and zero |
 | Flight mode outside the allowed set | abort |
 
+| Below the 1.5 m floor | only a pure climb (≥ 0.5 m, horizontal zeroed) is accepted, so the climb can continue from DJI's takeoff hover |
+
 **Link and protocol safety**
 
 - Every setpoint carries an **issue timestamp and TTL**; the client measures age
@@ -220,6 +234,47 @@ trust the cloud for physical limits.
 - Return to Home is available from any airborne mission state, including
   `HOLDING` after a completed ROI cycle.
 - A safety Return to Home is triggered on prolonged link loss while airborne.
+
+### Flight lifecycle and control ownership
+
+DJI's native APIs are used only for lift-off and touchdown. Everything in
+between — climb, patrol, ROI, pursuit, target return, no-fly logic and Return to
+Home — is Dronetect's own `FlightLogic`.
+
+| Phase | Owner | What is sent to the aircraft |
+|---|---|---|
+| Grounded | nobody | no setpoints |
+| Native takeoff (`TAKING_OFF`, before stable hover) | DJI (`KeyStartTakeoff`) | one takeoff request, no setpoints |
+| Climb, patrol / ROI, pursuit, Return to Home | Dronetect | Virtual Stick setpoints with the mission's `controlEpoch` |
+| Landing approach (`LANDING`, down to 3 m above home) | Dronetect | Virtual Stick setpoints |
+| Native landing | DJI (`KeyStartAutoLanding`) | Virtual Stick released first, then one landing request; no setpoints |
+| Manual takeover | pilot | Virtual Stick released, no setpoints |
+| Touchdown (not flying for 2 s) | nobody | reset to `IDLE`, no setpoints |
+
+- **Takeoff:** a mission started on the ground sends one DJI takeoff. Setpoints
+  start only after telemetry shows the aircraft airborne in `GPS_NORMAL` /
+  `VIRTUAL_STICK` for 1.5 s. A mission started while airborne skips this.
+- **Landing handover:** DJI is asked to land only when home is known,
+  telemetry is fresh, the aircraft is within 2 m of home, at most 4 m above it,
+  slower than 1 m/s, in a normal flight mode, with no pilot control and no
+  safety RTH — all held for 1.5 s. The 3 m hold is twice the Android Virtual
+  Stick floor; 2 m covers real GPS noise. Virtual Stick must be seen released
+  before the landing request is sent.
+- **`controlEpoch`:** only an explicit new operator mission advances it.
+  Releasing Virtual Stick — for a pilot takeover or for DJI's landing — marks
+  the current epoch released on Android, so autonomy can never silently re-arm.
+- **Failures:** a takeoff not airborne and stable within 20 s aborts the
+  mission to `IDLE` without any Virtual Stick motion (handed to the pilot if
+  already off the ground). A landing DJI does not start within 6 s, or abandons
+  mid-air, is logged and handed to the pilot; it is never retried and autonomy
+  does not resume. If Return to Home cannot settle over home, the aircraft keeps
+  holding there and the bridge logs why the handover is waiting.
+- **Pilot priority:** RC stick input during takeoff, climb, mission, Return to
+  Home, landing approach or DJI's landing hands control to the pilot
+  immediately. Dronetect never cancels DJI's own takeoff or landing and never
+  confirms DJI landing protection on the pilot's behalf.
+- Safety Return to Home (link loss, low battery) still uses DJI's native
+  go-home, unchanged.
 
 **What Dronetect does not do:** it never attempts to bypass, weaken or unlock
 DJI's own FlySafe, GEO-zone or flight-limit restrictions. Where the aircraft's
@@ -388,11 +443,16 @@ Any one of these forces telemetry-only mode and disables the autonomous path.
    grounded fix before takeoff** — session home is only captured on the ground.
 3. Set the operating radius and cruise altitude in the configuration dialog.
 4. Confirm GPS quality, home point and battery on the HUD.
-5. Take off and establish a stable hover.
-6. Select a region of interest on the map, or start a patrol mission.
-7. Observe the map, live video, detections and mission state.
-8. End the mission with Return to Home, or take manual control at any time by
-   moving the RC sticks.
+5. With the aircraft still on the ground, select a region of interest on the
+   map or start a patrol mission. The aircraft takes off on DJI's native
+   takeoff, climbs to cruise altitude and flies the mission. (Starting a
+   mission while already airborne also works and skips the takeoff.)
+6. Observe the map, live video, detections and mission state.
+7. End the mission with Return to Home: the aircraft flies home, descends to a
+   low hold over home, and DJI lands it. The mission resets to `IDLE` after
+   touchdown.
+8. Take manual control at any time by moving the RC sticks. Autonomy does not
+   resume on its own; only a new mission from the tablet regains control.
 
 ---
 
@@ -443,6 +503,14 @@ in isolation. They are not part of normal operation.
   produced. The bridge now logs this explicitly rather than stalling silently.
 - ROI coverage at cruise altitude means selecting an ROI from a low hover will
   first command a climb to the configured cruise altitude.
+- **DJI takeoff/landing results are not reported back to the bridge.** Failures
+  are detected from telemetry timeouts (20 s takeoff, 6 s landing start); the
+  tablet logs DJI's own error codes.
+- **After a failed native landing the mission is `IDLE`,** and Return to Home is
+  not accepted from `IDLE`. The pilot lands manually, or the operator starts a
+  new mission.
+- If DJI's landing protection stops above the ground to ask for confirmation,
+  that confirmation is left to the pilot.
 - Detection performance has not been characterised against real airborne
   targets.
 

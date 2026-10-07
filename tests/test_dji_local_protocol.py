@@ -120,6 +120,49 @@ def test_rth_round_trips():
     assert validate_rth_message(message) == command
 
 
+def test_release_round_trips():
+    from adapters.dji.local_protocol import ReleaseCommand, build_release_message, validate_release_message
+
+    command = ReleaseCommand(issued_at=4.0, reason="rc_stick_up_-0.30")
+    message = build_release_message(command)
+    assert message["type"] == "dji_release"
+    assert validate_release_message(message) == command
+
+
+def test_setpoint_carries_control_epoch_and_defaults_it_for_older_messages():
+    from adapters.dji.local_protocol import VelocitySetpoint, build_setpoint_message, validate_setpoint_message
+
+    setpoint = VelocitySetpoint(issued_at=1.0, ttl_ms=500, velocity_x_mps=1.0, velocity_y_mps=0.0,
+                                velocity_z_mps=0.0, yaw_deg=90.0, control_epoch=4)
+    message = build_setpoint_message(setpoint)
+    assert message["controlEpoch"] == 4
+    assert validate_setpoint_message(message) == setpoint
+    del message["controlEpoch"]
+    assert validate_setpoint_message(message).control_epoch == 0
+
+
+@pytest.mark.parametrize("kind", ["dji_takeoff", "dji_land"])
+def test_native_flight_actions_round_trip_with_their_control_epoch(kind):
+    from adapters.dji.local_protocol import (
+        NativeFlightCommand, build_native_flight_message, validate_native_flight_message)
+
+    command = NativeFlightCommand(type=kind, issued_at=5.0, reason="mission_start", control_epoch=7)
+    message = build_native_flight_message(command)
+    assert message["type"] == kind and message["controlEpoch"] == 7
+    assert validate_native_flight_message(message) == command
+
+
+def test_native_flight_message_rejects_any_other_type():
+    from adapters.dji.local_protocol import (
+        NativeFlightCommand, build_native_flight_message, validate_native_flight_message)
+
+    with pytest.raises(LocalProtocolError):
+        build_native_flight_message(NativeFlightCommand(type="dji_rth", issued_at=0.0, reason="x"))
+    with pytest.raises(LocalProtocolError):
+        validate_native_flight_message({"type": "dji_setpoint", "issuedAt": 0.0,
+                                        "reason": "x", "controlEpoch": 1})
+
+
 def test_rth_requires_nonempty_reason():
     message = build_rth_message(RthCommand(0.0, "x"))
     message["reason"] = ""

@@ -165,6 +165,41 @@ PHASE4_STABLE_HOVER_SECONDS = 2.00
 # continuously for this long, so one glitched sample cannot end a sortie.
 LANDING_CONFIRM_SECONDS = 2.00
 
+# -- DJI-native takeoff and landing ---------------------------------------------
+# DJI flies only the lift-off and the touchdown; FlightLogic owns everything in
+# between, including the custom RETURNING_HOME. Ownership by phase:
+#   grounded / touchdown        nobody      no setpoints
+#   native takeoff              DJI         no setpoints (TAKING_OFF, pre-hover)
+#   climb .. RTH .. approach    Dronetect   Virtual Stick, current controlEpoch
+#   native landing              DJI         Virtual Stick released first
+#   manual takeover             pilot       Virtual Stick released, no re-arm
+#
+# Modes in which DJI accepts Virtual Stick (Android's AUTONOMOUS_ALLOWED_FLIGHT_
+# MODES): a takeoff is only "done" once DJI is back in one of these.
+VIRTUAL_STICK_READY_MODES = frozenset({"GPS_NORMAL", "VIRTUAL_STICK"})
+# Modes in which DJI itself is bringing the aircraft down.
+DJI_DESCENT_MODES = frozenset({"AUTO_LANDING", "FORCE_LANDING", "ATTI_LANDING", "GO_HOME"})
+# Android sends telemetry at 2 Hz, so 1.5 s is three consecutive samples.
+NATIVE_TAKEOFF_STABLE_SECONDS = 1.50
+# From the request: link round trip, motor spin-up and DJI's ~1.2 m climb-out.
+NATIVE_TAKEOFF_TIMEOUT_SECONDS = 20.0
+# The custom approach holds here above home before DJI takes the touchdown:
+# twice Android's 1.5 m Virtual Stick floor, so altitude noise while holding
+# can never trip that guard.
+LANDING_APPROACH_HEIGHT_M = 3.0
+NATIVE_LANDING_MAX_HEIGHT_M = LANDING_APPROACH_HEIGHT_M + 1.0
+# Real GPS noise is ~1.5 m (REAL_CHECKPOINT_TOLERANCE_M), plus margin.
+NATIVE_LANDING_MAX_HORIZONTAL_M = 2.0
+NATIVE_LANDING_MAX_SPEED_MPS = 1.0
+NATIVE_LANDING_SETTLE_SECONDS = 1.50
+# Release must be seen (flight mode leaves VIRTUAL_STICK) before DJI is asked
+# to land; then DJI must visibly start (Android's own action timeout is 5 s).
+NATIVE_LANDING_RELEASE_SETTLE_SECONDS = 0.60
+NATIVE_LANDING_RELEASE_TIMEOUT_SECONDS = 5.0
+NATIVE_LANDING_START_TIMEOUT_SECONDS = 6.0
+NATIVE_LANDING_INTERRUPT_SECONDS = 2.0
+LANDING_WAIT_LOG_SECONDS = 5.0
+
 # FlightConfig.checkpoint_tolerance defaults to 5 cm, which only a simulated
 # body converges to. A real aircraft reports GPS/barometric position with
 # ~1 m noise, so a 5 cm gate left TARGET_RETURN hovering near the checkpoint
@@ -284,6 +319,28 @@ class TickOutcome:
     manual_input_source: str = "tablet"
     pursuit_blocked: bool = False
     target_patrol_region_id: str | None = None
+
+
+@dataclass(slots=True)
+class _NativeTakeoff:
+    """A DJI takeoff for a mission started on the ground, until stable hover."""
+
+    requested_at: float
+    sent: bool = False
+    stable_since: float | None = None
+    suppression_logged: bool = False
+
+
+@dataclass(slots=True)
+class _NativeLanding:
+    """DJI's touchdown, from approach handover until isFlying=false."""
+
+    started_at: float
+    release_sent_at: float | None = None
+    release_generation: int | None = None
+    land_sent_at: float | None = None
+    descending: bool = False
+    interrupted_since: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,6 +512,9 @@ class DjiFlightBridge:
                 checkpoint_tolerance=max(self.logic.config.checkpoint_tolerance,
                                          REAL_CHECKPOINT_TOLERANCE_M),
             )
+        # Hardware, not tuning: Virtual Stick never flies the last metres, so
+        # the approach always holds for DJI's landing. Survives replace().
+        self.logic.config = replace(self.logic.config, landing_hold_height=LANDING_APPROACH_HEIGHT_M)
         if self.roi_single_cycle:
             # Survives the operating-config replace(), which keeps other fields.
             self.logic.config = replace(self.logic.config, roi_single_cycle=True)
@@ -484,6 +544,21 @@ class DjiFlightBridge:
         self._airborne_seen = False
         self._grounded_since: float | None = None
         self._grounded_setpoint_suppression_logged = False
+        # Pilot control: set on an RC takeover or the tablet's manual button.
+        # While set, no setpoint of any kind is sent and Android is told to
+        # release Virtual Stick. Only an explicit operator mission clears it.
+        self._pilot_control: str | None = None
+        self._release_sent_generation: int | None = None
+        # Stamped on every setpoint. Android never (re-)acquires Virtual Stick
+        # for an epoch it has already released, so advancing this -- only on
+        # an explicit operator mission -- is the one way autonomy comes back.
+        self._control_epoch = 1
+        # DJI-native lift-off/touchdown phases; see VIRTUAL_STICK_READY_MODES.
+        # While either is set no setpoint is sent.
+        self._native_takeoff: _NativeTakeoff | None = None
+        self._native_landing: _NativeLanding | None = None
+        self._landing_ready_since: float | None = None
+        self._last_landing_wait_log = float("-inf")
 
         # No autonomous movement is possible until this is not None -- see
         # the module docstring. _apply_operating_config sets it.
@@ -645,6 +720,9 @@ class DjiFlightBridge:
             if self.operating_config is not None:
                 for message in self.realtime_link.drain_detections():
                     self._handle_detection_message(message, self._last_position, self._last_yaw)
+            if fresh:
+                assert telemetry is not None
+                self._detect_rc_takeover(telemetry, self._last_position, now)
 
         if not fresh or self._last_position is None or self.operating_config is None:
             # No trustworthy *current* position, or no real-flight config yet:
@@ -670,6 +748,9 @@ class DjiFlightBridge:
                   f"state={self.logic.state.value}")
         self._coordinate_mission_resume(position, state_before_detection)
         self._consume_pending_operating_config(position)
+        assert telemetry is not None
+        self._supervise_native_takeoff(telemetry, position, now)
+        self._supervise_native_landing(telemetry, position, now)
         step = self._apply_kinematic_flight(position, yaw, dt)
         if dt > 0.0:
             velocity_x = (step.position[0] - position[0]) / dt
@@ -857,6 +938,14 @@ class DjiFlightBridge:
         ):
             return
 
+        if self._native_landing is not None and command in {
+            CommandName.START_PATROL, CommandName.SET_ROI, CommandName.CLEAR_ROI,
+        }:
+            # DJI owns the touchdown; a new mission would need Virtual Stick
+            # back mid-descent. The pilot's RC can still interrupt DJI.
+            print(f"DJI bridge: command={command.value} ignored reason=native_landing_in_progress")
+            return
+
         tracking_before = self.logic.state
 
         if command == CommandName.RETURN_HOME:
@@ -869,10 +958,17 @@ class DjiFlightBridge:
             if self.logic.request_return_home():
                 self._clear_patrol_progress()
                 self._active_roi_id = None
+                if not isinstance(safety_reason, str):
+                    # An operator RTH is an explicit new autonomous action. A
+                    # safety RTH is not: it never takes Virtual Stick back from
+                    # a pilot (DJI's native go-home is still requested below).
+                    self._resume_autonomy("operator_return_home")
         elif command == CommandName.START_PATROL:
             self._clear_patrol_progress()
             self._active_roi_id = None
             self.logic.request_patrol(position)
+            self._resume_autonomy("start_patrol")
+            self._request_native_takeoff_if_grounded("start_patrol")
         elif command == CommandName.SET_PATROL_PRIORITIES:
             priorities = message["params"]["priorities"]
             self.patrol_regions.replace_priorities([(entry["regionId"], entry["rank"]) for entry in priorities])
@@ -894,6 +990,8 @@ class DjiFlightBridge:
             )
             self.logic.request_roi(position, (local_center.x, local_center.y), params["radiusM"])
             self._active_roi_id = f"roi:{message['commandId']}"
+            self._resume_autonomy("set_roi")
+            self._request_native_takeoff_if_grounded("set_roi")
         elif command == CommandName.CLEAR_ROI:
             self._discard_mission_interruption()
             resume_patrol = self.logic.state in _RESUME_PATROL_ELIGIBLE_STATES
@@ -922,8 +1020,13 @@ class DjiFlightBridge:
                 if self.logic.engage_manual_control(position):
                     self.manual_input.reset()
                     self._discard_mission_interruption()
+                if self.logic.manual_control:
+                    self._hand_control_to_pilot("tablet_manual", position)
             else:
+                was_manual = self.logic.manual_control or self._pilot_control is not None
                 self._release_manual_control(position)
+                if was_manual:
+                    self._resume_autonomy("manual_released")
         elif command == CommandName.SET_MANUAL_COMMAND:
             params = message["params"]
             self.manual_input.accept_tablet_stick(
@@ -940,6 +1043,209 @@ class DjiFlightBridge:
         # yet. Mirrors autonomous_drone.py's per-command post-check exactly.
         if tracking_before is not self.logic.state and tracking_before in TARGET_TRACKING_STATES:
             self._coordinate_mission_resume(position, tracking_before)
+
+    # -- pilot control ----------------------------------------------------------
+
+    def _hand_control_to_pilot(self, reason: str, position: Position) -> None:
+        """The pilot has the real aircraft: stop all setpoints, release Virtual Stick.
+
+        FlightLogic goes to MANUAL where it allows it; mid-climb or mid-landing
+        (which MANUAL refuses) the mission is stood down to IDLE instead. Either
+        way nothing resumes until an explicit operator mission.
+        """
+        if self._pilot_control is not None:
+            return
+        state_before = self.logic.state
+        if self._native_takeoff is not None or self._native_landing is not None:
+            # The pilot wins. DJI's own takeoff/landing is not cancelled from
+            # here -- its RC already outranks it -- we only stop waiting on it.
+            phase = "takeoff" if self._native_takeoff is not None else "landing"
+            print(f"DJI bridge: {phase}=native_abandoned reason=pilot_control_{reason}")
+            self._native_takeoff = None
+            self._native_landing = None
+        self._landing_ready_since = None
+        if not self.logic.manual_control:
+            if self.logic.engage_manual_control(position):
+                self.manual_input.reset()
+                self._discard_mission_interruption()
+            else:
+                self.logic.stand_down(position)
+                self._clear_patrol_progress()
+                self._active_roi_id = None
+        self._pilot_control = reason
+        self._release_sent_generation = None
+        print(f"DJI bridge: pilot_control=engaged reason={reason} "
+              f"stateBefore={state_before.value} stateAfter={self.logic.state.value} "
+              f"controlEpoch={self._control_epoch}")
+
+    def _resume_autonomy(self, reason: str) -> None:
+        """An explicit operator mission: allow Virtual Stick to be acquired again."""
+        self._control_epoch += 1
+        if self._pilot_control is not None:
+            print(f"DJI bridge: pilot_control=released reason={reason} "
+                  f"controlEpoch={self._control_epoch}")
+        self._pilot_control = None
+        self._release_sent_generation = None
+
+    # -- DJI-native takeoff -------------------------------------------------------
+
+    def _request_native_takeoff_if_grounded(self, mission: str) -> None:
+        """A mission started on the ground lifts off on DJI's own takeoff.
+
+        FlightLogic is already in TAKING_OFF toward cruise altitude; setpoints
+        stay suppressed until DJI's climb-out settles, then that same climb
+        continues on Virtual Stick. Airborne, there is nothing to do.
+        """
+        if self.logic.state is not FlightState.TAKING_OFF:
+            return
+        if not self._grounded():
+            print(f"DJI bridge: takeoff=native_skipped reason=already_airborne mission={mission}")
+            return
+        if self._native_takeoff is None:
+            self._native_takeoff = _NativeTakeoff(requested_at=self._clock())
+            print(f"DJI bridge: takeoff=native_requested mission={mission} "
+                  f"controlEpoch={self._control_epoch}")
+
+    def _supervise_native_takeoff(self, telemetry, position: Position, now: float) -> None:
+        takeoff = self._native_takeoff
+        if takeoff is None:
+            return
+        if self.logic.state not in _AIRBORNE_STATES:
+            # The mission was stood down under it.
+            self._native_takeoff = None
+            print(f"DJI bridge: takeoff=native_abandoned reason=mission_ended "
+                  f"state={self.logic.state.value}")
+            return
+        if telemetry.is_flying is True and telemetry.flight_mode in VIRTUAL_STICK_READY_MODES:
+            if takeoff.stable_since is None:
+                takeoff.stable_since = now
+            if now - takeoff.stable_since >= NATIVE_TAKEOFF_STABLE_SECONDS:
+                self._native_takeoff = None
+                print(f"DJI bridge: takeoff=confirmed altM={position[2]:.1f} "
+                      f"mode={telemetry.flight_mode} state={self.logic.state.value} "
+                      f"controlEpoch={self._control_epoch} next=virtual_stick_climb")
+                return
+        else:
+            takeoff.stable_since = None
+        if now - takeoff.requested_at >= NATIVE_TAKEOFF_TIMEOUT_SECONDS:
+            reason = ("request_not_sent" if not takeoff.sent else
+                      "not_airborne" if telemetry.is_flying is not True else
+                      f"unstable_mode_{telemetry.flight_mode}")
+            self._fail_native_takeoff(reason, telemetry, position)
+
+    def _fail_native_takeoff(self, reason: str, telemetry, position: Position) -> None:
+        """Abort the mission. No Virtual Stick motion ever starts for it."""
+        print(f"DJI bridge: takeoff=native_failed reason={reason} "
+              f"isFlying={telemetry.is_flying} mode={telemetry.flight_mode}")
+        self._native_takeoff = None
+        if telemetry.is_flying is True:
+            # Off the ground but not in a state autonomy may fly: the pilot
+            # has it, exactly as after a takeover.
+            self._hand_control_to_pilot("native_takeoff_failed", position)
+            return
+        self.logic.stand_down(position)
+        self._clear_patrol_progress()
+        self._active_roi_id = None
+
+    # -- DJI-native landing -------------------------------------------------------
+
+    def _supervise_native_landing(self, telemetry, position: Position, now: float) -> None:
+        landing = self._native_landing
+        if landing is None:
+            self._maybe_begin_native_landing(telemetry, position, now)
+            return
+        if telemetry.is_flying is False:
+            return  # touchdown: _observe_landing confirms it after 2 s
+        mode = telemetry.flight_mode
+        if mode in DJI_DESCENT_MODES:
+            if not landing.descending:
+                landing.descending = True
+                print(f"DJI bridge: landing=native_in_progress mode={mode} altM={position[2]:.1f}")
+            landing.interrupted_since = None
+            return
+        if landing.descending:
+            # DJI left its own landing while still in the air (pilot input,
+            # landing protection...). Never resume autonomy underneath that.
+            if landing.interrupted_since is None:
+                landing.interrupted_since = now
+            if now - landing.interrupted_since >= NATIVE_LANDING_INTERRUPT_SECONDS:
+                self._fail_native_landing(f"interrupted_mode_{mode}", position)
+            return
+        if landing.land_sent_at is None:
+            if now - landing.started_at >= NATIVE_LANDING_RELEASE_TIMEOUT_SECONDS:
+                self._fail_native_landing(f"virtual_stick_release_unconfirmed_mode_{mode}", position)
+            return
+        if now - landing.land_sent_at >= NATIVE_LANDING_START_TIMEOUT_SECONDS:
+            self._fail_native_landing(f"not_started_mode_{mode}", position)
+
+    def _maybe_begin_native_landing(self, telemetry, position: Position, now: float) -> None:
+        if (self.logic.state is not FlightState.LANDING or self._pilot_control is not None
+                or self._safety_rth_active):
+            # A safety RTH is DJI's own go-home, which lands by itself.
+            self._landing_ready_since = None
+            return
+        blocker = self._native_landing_blocker(telemetry, position)
+        if blocker is not None:
+            self._landing_ready_since = None
+            if now - self._last_landing_wait_log >= LANDING_WAIT_LOG_SECONDS:
+                self._last_landing_wait_log = now
+                print(f"DJI bridge: landing=approach_waiting reason={blocker}")
+            return
+        if self._landing_ready_since is None:
+            self._landing_ready_since = now
+        if now - self._landing_ready_since < NATIVE_LANDING_SETTLE_SECONDS:
+            return
+        self._landing_ready_since = None
+        self._native_landing = _NativeLanding(started_at=now)
+        assert self.logic.home is not None
+        print(f"DJI bridge: landing=native_handover "
+              f"distM={math.dist(position[:2], self.logic.home[:2]):.1f} "
+              f"heightM={position[2] - self.logic.home[2]:.1f} mode={telemetry.flight_mode} "
+              f"controlEpoch={self._control_epoch}")
+
+    def _native_landing_blocker(self, telemetry, position: Position) -> str | None:
+        """Why DJI may not take the touchdown yet, or None when it may."""
+        home = self.logic.home
+        if home is None or self.session_home is None:
+            return "home_unavailable"
+        if telemetry.is_flying is not True:
+            return "not_airborne"
+        if telemetry.flight_mode not in VIRTUAL_STICK_READY_MODES:
+            return f"flight_mode_{telemetry.flight_mode}"
+        distance = math.dist(position[:2], home[:2])
+        if distance > NATIVE_LANDING_MAX_HORIZONTAL_M:
+            return f"horizontal_{distance:.1f}m"
+        height = position[2] - home[2]
+        if height > NATIVE_LANDING_MAX_HEIGHT_M:
+            return f"height_{height:.1f}m"
+        if not telemetry.speed_mps <= NATIVE_LANDING_MAX_SPEED_MPS:
+            return f"speed_{telemetry.speed_mps:.1f}mps"
+        return None
+
+    def _fail_native_landing(self, reason: str, position: Position) -> None:
+        """DJI did not take or keep the landing. Virtual Stick stays released;
+        the pilot has the aircraft until an explicit new mission."""
+        print(f"DJI bridge: landing=native_failed reason={reason}")
+        self._native_landing = None
+        self._hand_control_to_pilot("native_landing_failed", position)
+
+    def _virtual_stick_released(self) -> bool:
+        telemetry = self.android_link.latest_telemetry
+        return (telemetry is not None and telemetry.flight_mode != "VIRTUAL_STICK"
+                and self.android_link.is_telemetry_fresh(self.config.android_telemetry_timeout_s))
+
+    def _detect_rc_takeover(self, telemetry, position: Position, now: float) -> None:
+        """Physical RC stick input during an autonomous flight is a takeover."""
+        if self._pilot_control is not None or telemetry.is_flying is not True:
+            return
+        if self.logic.state in {FlightState.IDLE, FlightState.LANDED}:
+            return
+        deflection = self.android_link.rc_stick_deflection(
+            self.config.android_telemetry_timeout_s, now)
+        if deflection is None:
+            return
+        axis, value = deflection
+        self._hand_control_to_pilot(f"rc_stick_{axis}_{value:+.2f}", position)
 
     def _release_manual_control(self, position: Position) -> None:
         """Mirrors autonomous_drone.py's _release_manual_control exactly."""
@@ -986,6 +1292,12 @@ class DjiFlightBridge:
             # would have been chased.
             for track_id in result.newly_accepted:
                 print(f"DJI bridge: detection=suppressed track={track_id} reason=pursuit_hold")
+            return
+        if self._native_takeoff is not None or self._native_landing is not None:
+            # DJI is flying the lift-off or touchdown: a chase would need
+            # Virtual Stick in the middle of it.
+            for track_id in result.newly_accepted:
+                print(f"DJI bridge: detection=suppressed track={track_id} reason=native_flight_phase")
             return
         detections = result.actionable
         allow_landing_intercept = self.logic.state is FlightState.LANDING and not self._safety_rth_active
@@ -1459,6 +1771,10 @@ class DjiFlightBridge:
             self.manual_input.reset()
         self.logic.reset_after_landing(position)
         self.detection_filter.reset()
+        self._pilot_control = None
+        self._native_takeoff = None
+        self._native_landing = None
+        self._landing_ready_since = None
         self._clear_patrol_progress()
         self._active_roi_id = None
         self._horizontal_speed_mps = 0.0
@@ -1488,7 +1804,10 @@ class DjiFlightBridge:
                 self._safety_rth_active = False
                 self._safety_rth_reason = None
             return
-        if self._realtime_connection_loss_rth_active:
+        if self._realtime_connection_loss_rth_active or self._pilot_control is not None:
+            # Under pilot control the aircraft is flown on the RC; losing our
+            # links must not trigger an RTH that fights the pilot. DJI's own
+            # RC-loss fail-safe is unaffected.
             return
         if not self.realtime_link.connection_lost_for(self.config.realtime_connection_loss_rth_s):
             return
@@ -1513,7 +1832,7 @@ class DjiFlightBridge:
                 self._safety_rth_active = False
                 self._safety_rth_reason = None
             return
-        if self._android_connection_loss_rth_active:
+        if self._android_connection_loss_rth_active or self._pilot_control is not None:
             return
         if not self.android_link.connection_lost_for(self.config.android_connection_loss_rth_s):
             return
@@ -1781,8 +2100,32 @@ class DjiFlightBridge:
                   f"velUp={outcome.velocity_z_mps:.2f} yawDeg={yaw_deg:.1f} "
                   f"altM={outcome.position[2]:.1f} "
                   f"pursuitBlocked={outcome.pursuit_blocked} "
-                  f"manual={outcome.manual_control_active}")
-        if self._grounded():
+                  f"manual={outcome.manual_control_active} "
+                  f"pilotControl={self._pilot_control is not None}")
+        if self._pilot_control is not None:
+            # No setpoints at all -- not zeros, not relayed sticks: any of them
+            # would let Android hold Virtual Stick under the pilot. Release is
+            # re-sent once per Android session so a reconnect cannot miss it.
+            generation = self.android_link.session_generation
+            if self._release_sent_generation != generation and await self.android_link.send_release(
+                    reason=self._pilot_control):
+                self._release_sent_generation = generation
+                print(f"DJI bridge: virtual_stick=release_requested reason={self._pilot_control} "
+                      f"state={outcome.state}")
+        elif self._native_landing is not None:
+            await self._drive_native_landing(self._native_landing, outcome)
+        elif self._native_takeoff is not None:
+            # DJI flies the lift-off: not one setpoint until it has settled.
+            takeoff = self._native_takeoff
+            if not takeoff.sent and self._grounded() and await self.android_link.send_native_takeoff(
+                    control_epoch=self._control_epoch,
+                    telemetry_timeout_s=self.config.android_telemetry_timeout_s):
+                takeoff.sent = True
+                print(f"DJI bridge: takeoff=native_sent controlEpoch={self._control_epoch}")
+            if not takeoff.suppression_logged:
+                takeoff.suppression_logged = True
+                print(f"DJI bridge: setpoints=suppressed reason=native_takeoff state={outcome.state}")
+        elif self._grounded():
             # Android refuses every setpoint on the ground ("grounded"), so
             # sending them only spams rejections. Authority is taken again by
             # the first setpoint after the pilot's manual takeoff.
@@ -1797,6 +2140,7 @@ class DjiFlightBridge:
                 yaw_deg=yaw_deg,
                 ttl_ms=self.config.setpoint_ttl_ms,
                 telemetry_timeout_s=self.config.android_telemetry_timeout_s,
+                control_epoch=self._control_epoch,
             )
         await self.android_link.send_gimbal_command(
             pitch_deg=-math.degrees(outcome.gimbal_pitch_rad), ttl_ms=self.config.gimbal_command_ttl_ms
@@ -1806,6 +2150,30 @@ class DjiFlightBridge:
 
         self.realtime_link.publish_telemetry(self.build_telemetry_message(outcome))
         return outcome
+
+    async def _drive_native_landing(self, landing: _NativeLanding, outcome: TickOutcome) -> None:
+        """Release Virtual Stick, see it released, then -- once -- ask DJI to land.
+
+        No setpoint is sent from the handover on. Release is re-sent once per
+        Android session so a reconnect mid-sequence cannot miss it.
+        """
+        now = self._clock()
+        generation = self.android_link.session_generation
+        if landing.release_generation != generation:
+            if await self.android_link.send_release(reason="native_landing"):
+                landing.release_generation = generation
+                landing.release_sent_at = now
+                print(f"DJI bridge: virtual_stick=release_requested reason=native_landing "
+                      f"state={outcome.state}")
+            return
+        if (landing.land_sent_at is None and landing.release_sent_at is not None
+                and now - landing.release_sent_at >= NATIVE_LANDING_RELEASE_SETTLE_SECONDS
+                and self._virtual_stick_released()):
+            if await self.android_link.send_native_land(
+                    control_epoch=self._control_epoch,
+                    telemetry_timeout_s=self.config.android_telemetry_timeout_s):
+                landing.land_sent_at = now
+                print(f"DJI bridge: landing=native_requested controlEpoch={self._control_epoch}")
 
     async def run(self) -> None:
         self.realtime_link.start()

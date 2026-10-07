@@ -100,6 +100,10 @@ class FlightConfig:
     target_return_progress_m: float = 0.5
     landing_rate: float = 0.35
     landed_height: float = 0.12
+    # Height above home where the LANDING descent stops and holds. 0 flies the
+    # whole way down (the simulator). A real aircraft holds here instead and
+    # hands touchdown to the autopilot's own landing -- see the DJI bridge.
+    landing_hold_height: float = 0.0
     roi_arrival_tolerance: float = 10.0
     target_min_confidence: float = 0.43
     target_confirmation_hits: int = 2
@@ -652,7 +656,7 @@ class FlightLogic:
                 self.state = FlightState.LANDED
                 self.target = self.home
             else:
-                floor_altitude = self.home[2]
+                floor_altitude = self.home[2] + self.config.landing_hold_height
                 self._landing_target_altitude = max(
                     floor_altitude,
                     self._landing_target_altitude
@@ -960,6 +964,16 @@ class FlightLogic:
         rather than inherit a stale target, queued waypoint or resume point.
         Home, configuration and the operator's pursuit hold are kept: they
         describe the session, not the sortie that just ended.
+        """
+        self.stand_down(position)
+
+    def stand_down(self, position: Position) -> None:
+        """Abandon whatever mission is active and park in IDLE.
+
+        Used on a confirmed landing, and when a pilot takes the real aircraft
+        mid-climb or mid-landing (states MANUAL refuses): the computer stops
+        having a mission at all, so nothing can resume until a new one is
+        explicitly requested.
         """
         self._drop_manual_control()
         self._clear_target_tracking()

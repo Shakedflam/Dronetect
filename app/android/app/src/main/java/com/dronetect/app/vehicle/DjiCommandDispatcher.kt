@@ -6,6 +6,12 @@ interface DjiAircraftActions {
     fun tiltCamera(up: Boolean, isCurrent: () -> Boolean, complete: (CommandResult) -> Unit)
     fun setGimbalPitch(pitchDeg: Double, isCurrent: () -> Boolean, complete: (CommandResult) -> Unit) =
         complete(CommandResult(false, "absolute_gimbal_unsupported"))
+    /** DJI's own takeoff, for a bridge mission started on the ground. */
+    fun takeoff(isCurrent: () -> Boolean, complete: (CommandResult) -> Unit) =
+        complete(CommandResult(false, "native_takeoff_unsupported"))
+    /** DJI's own landing, once the bridge's approach holds low over home. */
+    fun land(isCurrent: () -> Boolean, complete: (CommandResult) -> Unit) =
+        complete(CommandResult(false, "native_land_unsupported"))
 }
 
 /**
@@ -26,6 +32,7 @@ class DjiCommandDispatcher(
     private var issuedAtMs = 0L
     private var lastActionMs = Long.MIN_VALUE
     private var lastRthMs = Long.MIN_VALUE
+    private val lastNativeFlightMs = mutableMapOf<String, Long>()
 
     @Synchronized
     fun invalidate() {
@@ -64,7 +71,8 @@ class DjiCommandDispatcher(
             "set_patrol_priorities", "set_patrol_area_types", "reject_target",
             "set_manual_control", "set_manual_command" ->
                 return reject("local_autonomy_controller_required")
-            "return_home", "camera_tilt_up", "camera_tilt_down", "gimbal_pitch" -> Unit
+            "return_home", "camera_tilt_up", "camera_tilt_down", "gimbal_pitch",
+            NATIVE_TAKEOFF, NATIVE_LAND -> Unit
             else -> return reject("unsupported_command")
         }
         val pitchTarget = if (command.name == "gimbal_pitch") {
@@ -77,23 +85,32 @@ class DjiCommandDispatcher(
             if (command.params.isNotEmpty()) return reject("unexpected_params")
             null
         }
-        if (command.name == "return_home" && pending != null && pendingName != "return_home") {
+        // Flight actions outrank the gimbal traffic the bridge sends every tick.
+        val flightAction = command.name in FLIGHT_ACTIONS
+        if (flightAction && pending != null && pendingName !in FLIGHT_ACTIONS) {
             generation++
             val interrupted = pending
             pending = null
             pendingName = null
-            interrupted?.invoke(CommandResult(false, "preempted_by_rth"))
+            interrupted?.invoke(CommandResult(false,
+                if (command.name == "return_home") "preempted_by_rth" else "preempted_by_${command.name}"))
         }
         if (pending != null) return reject("action_in_progress")
         val now = nowMs()
-        if (command.name != "return_home" && lastActionMs != Long.MIN_VALUE && now - lastActionMs < MIN_ACTION_INTERVAL_MS) {
+        if (!flightAction && lastActionMs != Long.MIN_VALUE && now - lastActionMs < MIN_ACTION_INTERVAL_MS) {
             return reject("rate_limited")
         }
         if (command.name == "return_home" && lastRthMs != Long.MIN_VALUE && now - lastRthMs < RTH_INTERVAL_MS) {
             return reject("rth_rate_limited")
         }
+        // The bridge sends each of these once per sortie; a burst is a fault.
+        val lastNative = lastNativeFlightMs[command.name]
+        if (lastNative != null && now - lastNative < NATIVE_FLIGHT_INTERVAL_MS) {
+            return reject("${command.name}_rate_limited")
+        }
         lastActionMs = now
         if (command.name == "return_home") lastRthMs = now
+        if (command.name == NATIVE_TAKEOFF || command.name == NATIVE_LAND) lastNativeFlightMs[command.name] = now
         issuedAtMs = now
         pending = complete
         pendingName = command.name
@@ -116,6 +133,8 @@ class DjiCommandDispatcher(
         try {
             when (command.name) {
                 "return_home" -> actions.returnHome(isCurrent, done)
+                NATIVE_TAKEOFF -> actions.takeoff(isCurrent, done)
+                NATIVE_LAND -> actions.land(isCurrent, done)
                 "gimbal_pitch" -> actions.setGimbalPitch(pitchTarget!!, isCurrent, done)
                 else -> actions.tiltCamera(command.name == "camera_tilt_up", isCurrent, done)
             }
@@ -129,6 +148,12 @@ class DjiCommandDispatcher(
         const val ACTION_TIMEOUT_MS = 5_000L
         const val MIN_ACTION_INTERVAL_MS = 300L
         const val RTH_INTERVAL_MS = 5_000L
+        const val NATIVE_FLIGHT_INTERVAL_MS = 5_000L
+        // Bridge-only names (DroneRealtimeClient is the sole caller); no
+        // cloud/tablet command maps to them.
+        const val NATIVE_TAKEOFF = "native_takeoff"
+        const val NATIVE_LAND = "native_land"
+        private val FLIGHT_ACTIONS = setOf("return_home", NATIVE_TAKEOFF, NATIVE_LAND)
 
         /** Same 0.03-radian step and pitch envelope as CameraGimbal, inverted for DJI. */
         fun nextPitch(current: Double, min: Double, max: Double, up: Boolean): Double? {

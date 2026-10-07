@@ -33,6 +33,17 @@ Message shapes, bridge -> Android:
       go-home/failsafe behavior. Unlike the setpoint/gimbal messages, this is
       never gated on telemetry freshness -- it must still be attempted when
       the link is degraded, since that is exactly when it matters most.
+    - MESSAGE_TYPE_RELEASE: the pilot has the aircraft (RC takeover or the
+      tablet's manual button). Android must stop and disable Virtual Stick and
+      refuse to re-arm until a setpoint carries a newer `controlEpoch` -- the
+      bridge only advances that on an explicit new operator mission. Like
+      RTH it is honoured even when stale: releasing control is always safe.
+    - MESSAGE_TYPE_TAKEOFF: DJI native takeoff (KeyStartTakeoff) for a
+      mission started on the ground. DJI flies the lift-off; the bridge sends
+      no setpoint until telemetry shows a stable hover. Fresh telemetry only.
+    - MESSAGE_TYPE_LAND: DJI native landing (KeyStartAutoLanding) once the
+      bridge's own approach holds the aircraft low above home. Android drops
+      Virtual Stick before asking DJI to land. Fresh telemetry only.
 """
 
 from __future__ import annotations
@@ -49,6 +60,9 @@ __all__ = [
     "MESSAGE_TYPE_SETPOINT",
     "MESSAGE_TYPE_GIMBAL_COMMAND",
     "MESSAGE_TYPE_RTH",
+    "MESSAGE_TYPE_RELEASE",
+    "MESSAGE_TYPE_TAKEOFF",
+    "MESSAGE_TYPE_LAND",
     "LocalProtocolError",
     "AndroidTelemetry",
     "AndroidRcState",
@@ -56,6 +70,8 @@ __all__ = [
     "VelocitySetpoint",
     "GimbalCommand",
     "RthCommand",
+    "ReleaseCommand",
+    "NativeFlightCommand",
     "encode_message",
     "parse_json_message",
     "validate_android_telemetry_message",
@@ -70,6 +86,10 @@ __all__ = [
     "validate_gimbal_command_message",
     "build_rth_message",
     "validate_rth_message",
+    "build_release_message",
+    "validate_release_message",
+    "build_native_flight_message",
+    "validate_native_flight_message",
 ]
 
 MESSAGE_TYPE_TELEMETRY = "dji_telemetry"
@@ -79,6 +99,9 @@ MESSAGE_TYPE_GIMBAL_STATE = "dji_gimbal_state"
 MESSAGE_TYPE_SETPOINT = "dji_setpoint"
 MESSAGE_TYPE_GIMBAL_COMMAND = "dji_gimbal_command"
 MESSAGE_TYPE_RTH = "dji_rth"
+MESSAGE_TYPE_RELEASE = "dji_release"
+MESSAGE_TYPE_TAKEOFF = "dji_takeoff"
+MESSAGE_TYPE_LAND = "dji_land"
 
 # Matches realtime_server.protocol.MANUAL_STICK_AXES's naming, but this is a
 # distinct wire vocabulary local to this link.
@@ -144,6 +167,9 @@ class VelocitySetpoint:
     velocity_y_mps: float
     velocity_z_mps: float
     yaw_deg: float
+    # Advanced by the bridge only on an explicit operator mission; Android
+    # will not (re-)acquire Virtual Stick for an epoch it already released.
+    control_epoch: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +183,21 @@ class GimbalCommand:
 class RthCommand:
     issued_at: float
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseCommand:
+    issued_at: float
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class NativeFlightCommand:
+    """A DJI-native takeoff or landing request (MESSAGE_TYPE_TAKEOFF/_LAND)."""
+    type: str
+    issued_at: float
+    reason: str
+    control_epoch: int = 0
 
 
 # --------------------------------------------------------------------------
@@ -265,6 +306,7 @@ def build_setpoint_message(setpoint: VelocitySetpoint) -> dict[str, Any]:
             "z": setpoint.velocity_z_mps,
         },
         "yawDeg": setpoint.yaw_deg,
+        "controlEpoch": setpoint.control_epoch,
     }
 
 
@@ -278,6 +320,7 @@ def validate_setpoint_message(message: dict[str, Any]) -> VelocitySetpoint:
         velocity_y_mps=_required_number(velocity, "y"),
         velocity_z_mps=_required_number(velocity, "z"),
         yaw_deg=_required_number(message, "yawDeg"),
+        control_epoch=_required_int(message, "controlEpoch") if "controlEpoch" in message else 0,
     )
 
 
@@ -312,6 +355,46 @@ def validate_rth_message(message: dict[str, Any]) -> RthCommand:
     return RthCommand(
         issued_at=_required_number(message, "issuedAt"),
         reason=_required_string(message, "reason"),
+    )
+
+
+def build_release_message(command: ReleaseCommand) -> dict[str, Any]:
+    return {
+        "type": MESSAGE_TYPE_RELEASE,
+        "issuedAt": command.issued_at,
+        "reason": command.reason,
+    }
+
+
+def validate_release_message(message: dict[str, Any]) -> ReleaseCommand:
+    _require_type(message, MESSAGE_TYPE_RELEASE)
+    return ReleaseCommand(
+        issued_at=_required_number(message, "issuedAt"),
+        reason=_required_string(message, "reason"),
+    )
+
+
+def build_native_flight_message(command: NativeFlightCommand) -> dict[str, Any]:
+    if command.type not in {MESSAGE_TYPE_TAKEOFF, MESSAGE_TYPE_LAND}:
+        raise LocalProtocolError("validation_error", f"Not a native flight action: {command.type!r}.")
+    return {
+        "type": command.type,
+        "issuedAt": command.issued_at,
+        "reason": command.reason,
+        "controlEpoch": command.control_epoch,
+    }
+
+
+def validate_native_flight_message(message: dict[str, Any]) -> NativeFlightCommand:
+    kind = message.get("type")
+    if kind not in {MESSAGE_TYPE_TAKEOFF, MESSAGE_TYPE_LAND}:
+        raise LocalProtocolError("validation_error", f"Not a native flight action: {kind!r}.",
+                                 details={"field": "type"})
+    return NativeFlightCommand(
+        type=kind,
+        issued_at=_required_number(message, "issuedAt"),
+        reason=_required_string(message, "reason"),
+        control_epoch=_required_int(message, "controlEpoch"),
     )
 
 

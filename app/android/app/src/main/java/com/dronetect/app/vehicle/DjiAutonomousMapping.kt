@@ -44,13 +44,42 @@ internal const val AUTONOMOUS_MAX_HORIZONTAL_MPS = 2.0
 internal const val AUTONOMOUS_MAX_VERTICAL_MPS = 2.0
 internal const val AUTONOMOUS_ALTITUDE_CEILING_M = 55.0
 internal const val AUTONOMOUS_MIN_ALTITUDE_M = 1.5
+// DJI's native takeoff settles at ~1.2 m, under that floor. From there (but
+// never from lower) only a climb is accepted, with horizontal output zeroed,
+// until the aircraft is back above AUTONOMOUS_MIN_ALTITUDE_M.
+internal const val AUTONOMOUS_CLIMB_OUT_MIN_ALTITUDE_M = 0.5
 internal const val AUTONOMOUS_RADIUS_BACKSTOP_M = 330.0
 // An autonomous guard trip releases authority but must not poison the rest of
 // the session: continuous flight has to survive a momentary RC touch or a
 // transient boundary nudge. The cooldown stops a 20 Hz re-arm storm.
 internal const val AUTONOMOUS_REARM_COOLDOWN_MS = 3_000L
 internal val AUTONOMOUS_VALID_GPS_LEVELS = setOf("LEVEL_3", "LEVEL_4", "LEVEL_5")
+
+/**
+ * Stops that mean someone else now has the aircraft -- the pilot on the RC
+ * sticks, the bridge handing it to the pilot, or DJI/RC reclaiming authority
+ * (RC_PAUSE_STOP, RC_SWITCH, RC_LOST, NEAR_BOUNDARY, low-battery go-home...).
+ * Unlike a transient guard trip, these must never be followed by a silent
+ * re-arm: only a newer control epoch (an explicit operator mission) may.
+ */
+internal fun isControlReleaseStop(reason: String): Boolean =
+    reason.startsWith("guard_rc_stick_moved") ||
+        reason.startsWith("bridge_release") ||
+        reason == "rc_authority"
+
+/** Virtual Stick is only (re-)acquired for an epoch newer than the last release. */
+internal fun autonomyReleaseRejection(controlEpoch: Long, releasedEpoch: Long): String? =
+    if (controlEpoch <= releasedEpoch) "released_to_pilot_awaiting_new_mission" else null
 internal val AUTONOMOUS_ALLOWED_FLIGHT_MODES = setOf("GPS_NORMAL", "VIRTUAL_STICK")
+
+/**
+ * Local gate on a bridge takeoff request, on top of DJI's own checks: on the
+ * ground, RC linked with its sticks centred, and GPS strong enough for the
+ * Virtual Stick climb that follows.
+ */
+internal fun nativeTakeoffRejection(s: DjiTelemetrySnapshot): String? =
+    zeroStickGroundRejection(s)
+        ?: if (s.gpsSignalLevel !in AUTONOMOUS_VALID_GPS_LEVELS) "gps_not_strong" else null
 
 /** Saturation preserves heading: both components scale by one factor. */
 internal fun saturateHorizontal(eastMps: Double, northMps: Double): Pair<Double, Double> {
@@ -87,13 +116,18 @@ internal fun horizontalDistanceMeters(
     return hypot(eastM, northM)
 }
 
+/** Below the floor: horizontal output is held at zero during a climb-out. */
+internal fun autonomousBelowFloor(altitudeM: Double?): Boolean =
+    altitudeM != null && altitudeM < AUTONOMOUS_MIN_ALTITUDE_M
+
 /**
  * Android's own envelope, evaluated every tick and independent of AWS. The
  * radius fence sits outside the 300 m operating radius on purpose: it is a
  * backstop against a runaway, not a second copy of the mission limit.
+ * `upMps` is the vertical command in force; only a climb may run below the floor.
  */
 internal fun autonomousEnvelopeRejection(
-    s: DjiTelemetrySnapshot, originLat: Double?, originLng: Double?,
+    s: DjiTelemetrySnapshot, originLat: Double?, originLng: Double?, upMps: Double = 0.0,
 ): String? {
     if (s.aircraftConnected != true) return if (s.aircraftConnected == false)
         "aircraft_disconnected" else "aircraft_connection_unavailable"
@@ -117,7 +151,8 @@ internal fun autonomousEnvelopeRejection(
     val altitude = s.altitudeMeters
     if (altitude == null || !altitude.isFinite()) return "altitude_unavailable"
     if (altitude > AUTONOMOUS_ALTITUDE_CEILING_M) return "altitude_above_ceiling"
-    if (altitude < AUTONOMOUS_MIN_ALTITUDE_M) return "altitude_below_floor"
+    if (altitude < AUTONOMOUS_MIN_ALTITUDE_M &&
+        !(upMps > 0.0 && altitude >= AUTONOMOUS_CLIMB_OUT_MIN_ALTITUDE_M)) return "altitude_below_floor"
     val latitude = s.latitude
     val longitude = s.longitude
     if (latitude == null || longitude == null || !latitude.isFinite() || !longitude.isFinite())

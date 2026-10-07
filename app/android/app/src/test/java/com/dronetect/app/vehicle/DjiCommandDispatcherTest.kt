@@ -18,6 +18,34 @@ class DjiCommandDispatcherTest {
         override fun setGimbalPitch(pitchDeg: Double, isCurrent: () -> Boolean, complete: (CommandResult) -> Unit) {
             calls++; targetPitch = pitchDeg; guard = isCurrent; done = complete
         }
+        val native = mutableListOf<String>()
+        override fun takeoff(isCurrent: () -> Boolean, complete: (CommandResult) -> Unit) {
+            calls++; native.add("takeoff"); guard = isCurrent; done = complete
+        }
+        override fun land(isCurrent: () -> Boolean, complete: (CommandResult) -> Unit) {
+            calls++; native.add("land"); guard = isCurrent; done = complete
+        }
+    }
+
+    /** The bridge streams gimbal commands every tick; they must not block a flight action. */
+    @Test fun nativeTakeoffAndLandPreemptGimbalTrafficAndCannotBurst() {
+        var time = 0L
+        val actions = Actions()
+        val dispatcher = DjiCommandDispatcher(actions, { true }, { time })
+        val results = mutableListOf<CommandResult>()
+        dispatcher.dispatch(VehicleCommand("g", "gimbal_pitch", mapOf("pitchDeg" to -20.0)), results::add)
+        dispatcher.dispatch(VehicleCommand("t", DjiCommandDispatcher.NATIVE_TAKEOFF), results::add)
+        assertEquals("preempted_by_native_takeoff", results.single().message)
+        assertEquals(listOf("takeoff"), actions.native)
+        // A gimbal command cannot preempt the takeoff in turn.
+        dispatcher.dispatch(VehicleCommand("g2", "gimbal_pitch", mapOf("pitchDeg" to -20.0)), results::add)
+        assertEquals("action_in_progress", results.last().message)
+        actions.done!!(CommandResult(true, "sdk_action_success"))
+        time = 1_000
+        dispatcher.dispatch(VehicleCommand("t2", DjiCommandDispatcher.NATIVE_TAKEOFF), results::add)
+        assertEquals("native_takeoff_rate_limited", results.last().message)
+        dispatcher.dispatch(VehicleCommand("l", DjiCommandDispatcher.NATIVE_LAND), results::add)
+        assertEquals(listOf("takeoff", "land"), actions.native)
     }
 
     @Test fun missionIntentsNeverTurnIntoSdkMovement() {
