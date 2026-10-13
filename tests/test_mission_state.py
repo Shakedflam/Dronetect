@@ -92,7 +92,7 @@ def test_accepts_valid_transition(current, requested):
         (MissionState.TRANSIT_TO_ROI, MissionState.LANDING),
         (MissionState.ROI_PATROL, MissionState.LANDING),
         (MissionState.RTH, MissionState.ON_GROUND),
-        (MissionState.LANDING, MissionState.PATROL),
+        (MissionState.LANDING, MissionState.RTH),
         (MissionState.PATROL, MissionState.PATROL),
     ],
 )

@@ -57,11 +57,19 @@ class PolygonCoveragePlanner:
         *,
         no_fly_polygons: Sequence[Sequence[Wgs84Point]] = (),
         outward_from: Wgs84Point | None = None,
+        start_from: Wgs84Point | None = None,
     ) -> tuple[Wgs84Point, ...]:
         """Return ordered geographic waypoints covering ``polygon``.
 
         Only geometry supplied through ``no_fly_polygons`` is subtracted;
         callers must deliberately omit IGNORE regions.
+
+        ``start_from`` (the aircraft) picks, among the four orientations of
+        the same sweep -- run forwards or backwards, first lane entered from
+        either end -- the one that begins nearest to it. Every orientation
+        flies exactly the same lanes, so coverage is unchanged; only the
+        approach is. It supersedes ``outward_from``, which orders lanes from a
+        fixed point (home) and ignores where the aircraft actually is.
         """
         if len(polygon) < 3:
             raise ValueError("coverage polygon must contain at least three points")
@@ -100,7 +108,7 @@ class PolygonCoveragePlanner:
         min_x, min_y, max_x, max_y = rotated.bounds
         lane_ys = _lane_offsets(min_y, max_y, self.config.lane_spacing_m)
 
-        if outward_from is not None and len(lane_ys) > 1:
+        if start_from is None and outward_from is not None and len(lane_ys) > 1:
             outward_local = Point(_to_local(outward_from, anchor))
             outward_rotated = affinity.rotate(
                 outward_local, -axis_angle, origin=rotation_origin
@@ -110,30 +118,18 @@ class PolygonCoveragePlanner:
             ):
                 lane_ys.reverse()
 
-        rotated_path: list[Point2] = []
-        for lane_index, lane_y in enumerate(lane_ys):
-            scan = LineString(
-                [(min_x - 1.0, lane_y), (max_x + 1.0, lane_y)]
-            )
-            segments = sorted(
-                _line_segments(rotated.intersection(scan)),
-                key=lambda segment: segment.bounds[0],
-            )
-            if not segments:
-                continue
-            left_to_right = lane_index % 2 == 0
-            if not left_to_right:
-                segments.reverse()
-            for segment in segments:
-                coordinates = list(segment.coords)
-                start = coordinates[0] if left_to_right else coordinates[-1]
-                end = coordinates[-1] if left_to_right else coordinates[0]
-                if rotated_path:
-                    connector = _safe_connector(rotated_path[-1], start, rotated)
-                    _extend_unique(rotated_path, connector[1:])
-                else:
-                    rotated_path.append(start)
-                _extend_unique(rotated_path, [end])
+        rotated_path = _sweep(rotated, lane_ys, min_x, max_x, first_left_to_right=True)
+        if start_from is not None and rotated_path:
+            start_rotated = affinity.rotate(
+                Point(_to_local(start_from, anchor)), -axis_angle, origin=rotation_origin
+            ).coords[0]
+            candidates: list[list[Point2]] = []
+            for first_left_to_right in (True, False):
+                path = (rotated_path if first_left_to_right else
+                        _sweep(rotated, lane_ys, min_x, max_x, first_left_to_right=False))
+                candidates.extend([path, path[::-1]])
+            # Strict min keeps the default orientation on a tie.
+            rotated_path = min(candidates, key=lambda path: math.dist(path[0], start_rotated))
 
         if not rotated_path:
             raise CoveragePathUnavailable("coverage polygon produced no usable lanes")
@@ -151,6 +147,38 @@ class PolygonCoveragePlanner:
             local_meters_to_wgs84(LocalPosition(x=x, y=y, z=0.0), anchor)
             for x, y in local_path
         )
+
+
+def _sweep(
+    rotated: BaseGeometry, lane_ys: Sequence[float], min_x: float, max_x: float,
+    *, first_left_to_right: bool,
+) -> list[Point2]:
+    """One boustrophedon pass over ``lane_ys``, alternating direction per lane."""
+    rotated_path: list[Point2] = []
+    for lane_index, lane_y in enumerate(lane_ys):
+        scan = LineString(
+            [(min_x - 1.0, lane_y), (max_x + 1.0, lane_y)]
+        )
+        segments = sorted(
+            _line_segments(rotated.intersection(scan)),
+            key=lambda segment: segment.bounds[0],
+        )
+        if not segments:
+            continue
+        left_to_right = (lane_index % 2 == 0) == first_left_to_right
+        if not left_to_right:
+            segments.reverse()
+        for segment in segments:
+            coordinates = list(segment.coords)
+            start = coordinates[0] if left_to_right else coordinates[-1]
+            end = coordinates[-1] if left_to_right else coordinates[0]
+            if rotated_path:
+                connector = _safe_connector(rotated_path[-1], start, rotated)
+                _extend_unique(rotated_path, connector[1:])
+            else:
+                rotated_path.append(start)
+            _extend_unique(rotated_path, [end])
+    return rotated_path
 
 
 def _geographic_centroid(points: Sequence[Wgs84Point]) -> Wgs84Point:

@@ -357,13 +357,30 @@ def test_native_landing_waits_for_fresh_telemetry():
     assert flight.bridge._native_landing is None
 
 
-def test_safety_rth_leaves_the_landing_to_djis_go_home():
+def test_a_safety_rth_also_ends_in_djis_native_landing():
+    """Dronetect's RTH owns a safety RTH too; before, the handover was skipped
+    and the aircraft hovered at the 3 m hold until DJI's battery protection."""
     flight = _landing_approach()
     flight.bridge._safety_rth_active = True
     flight.bridge._safety_rth_reason = "low_battery"
-    flight.hold(5.0, alt=LANDING_APPROACH_HEIGHT_M, mode="VIRTUAL_STICK")
-    assert flight.bridge._native_landing is None
-    assert flight.sent("dji_land") == []
+    flight.hold(NATIVE_LANDING_SETTLE_SECONDS + 0.2, alt=LANDING_APPROACH_HEIGHT_M, mode="VIRTUAL_STICK")
+    assert flight.bridge._native_landing is not None
+    flight.hold(1.0, alt=LANDING_APPROACH_HEIGHT_M, mode="GPS_NORMAL")
+    assert len(flight.sent("dji_land")) == 1
+    assert flight.sent("dji_rth") == [], "Virtual Stick is ours: no DJI go-home"
+
+
+def test_when_dji_flies_its_own_go_home_dronetect_stands_back(capsys):
+    flight = _cruising()
+    flight.follow(20)
+    flight.clear()
+    flight.bridge._safety_rth_active = True
+    flight.bridge._safety_rth_reason = "aircraft_safety_rth"
+    flight.bridge.logic.request_return_home()
+    flight.hold(5.0, alt=CRUISE, mode="GO_HOME")
+    assert flight.sent("dji_setpoint") == []
+    assert flight.sent("dji_land") == [] and flight.bridge._native_landing is None
+    assert capsys.readouterr().out.count("setpoints=suppressed reason=dji_go_home") == 1
 
 
 # -- native landing ------------------------------------------------------------------

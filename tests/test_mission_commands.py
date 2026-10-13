@@ -196,8 +196,13 @@ def test_manual_return_home_can_be_overridden_with_patrol_before_landing():
     assert missions.apply(CommandName.START_PATROL, {}) is MissionState.PATROL
 
 
-@pytest.mark.parametrize("command", [CommandName.START_PATROL, CommandName.SET_ROI])
-def test_manual_return_home_cannot_be_overridden_after_landing_starts(command):
+@pytest.mark.parametrize(("command", "expected"), [
+    (CommandName.START_PATROL, MissionState.PATROL),
+    (CommandName.SET_ROI, MissionState.TRANSIT_TO_ROI),
+])
+def test_a_new_mission_can_abort_the_landing_approach(command, expected):
+    """LANDING is the aircraft's own approach, still airborne. The aircraft
+    refuses once DJI owns the touchdown; the server then adopts its state."""
     missions = _missions_in_flying_state(MissionState.PATROL)
     missions.apply(CommandName.RETURN_HOME, {})
     missions.observe_flight_state("LANDING")
@@ -207,8 +212,30 @@ def test_manual_return_home_cannot_be_overridden_after_landing_starts(command):
         else {}
     )
 
+    assert missions.apply(command, params) is expected
+
+
+def test_a_safety_rth_still_cannot_be_overridden_during_the_landing():
+    missions = _missions_in_flying_state(MissionState.PATROL)
+    missions.observe_safety(SafetyRthSignal(required=True, reason="low_battery"))
+    missions.observe_flight_state("LANDING")
     with pytest.raises(InvalidMissionCommand):
-        missions.apply(command, params)
+        missions.apply(CommandName.START_PATROL, {})
+
+
+def test_adopting_the_aircraft_state_follows_a_refused_command():
+    missions = _missions_in_flying_state(MissionState.PATROL)
+    missions.apply(CommandName.RETURN_HOME, {})
+    missions.observe_flight_state("LANDING")
+    missions.apply(CommandName.START_PATROL, {})  # DJI already owned the landing
+    assert missions.adopt_aircraft_state(MissionState.LANDING) is MissionState.LANDING
+
+
+def test_adoption_never_releases_a_safety_rth():
+    missions = _missions_in_flying_state(MissionState.PATROL)
+    missions.observe_safety(SafetyRthSignal(required=True, reason="low_battery"))
+    assert missions.adopt_aircraft_state(MissionState.PATROL) is MissionState.RTH
+    assert missions.safety_rth_active
 
 
 def _missions_in_flying_state(state: MissionState) -> MissionCommandService:

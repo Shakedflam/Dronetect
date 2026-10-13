@@ -1181,6 +1181,9 @@ class FlightLogic:
         self.target_decisions.update_visibility(detections, self._elapsed_time, project)
         interruptible_states = {
             FlightState.TAKING_OFF,
+            # Station-keeping (e.g. after a completed ROI cycle) is still a
+            # watch: a target seen from the hold is chased, then the hold resumes.
+            FlightState.HOLDING,
             FlightState.TRANSITING_TO_ROI,
             FlightState.ROI_PATROL,
             FlightState.PATROLLING,
@@ -1235,6 +1238,7 @@ class FlightLogic:
         track_id = str(selected["trackId"])
         interception_start_states = {
             FlightState.TAKING_OFF,
+            FlightState.HOLDING,
             FlightState.TRANSITING_TO_ROI,
             FlightState.ROI_PATROL,
             FlightState.PATROLLING,
@@ -1684,6 +1688,7 @@ class FlightLogic:
             return False
         states = {
             FlightState.TAKING_OFF,
+            FlightState.HOLDING,
             FlightState.TRANSITING_TO_ROI,
             FlightState.ROI_PATROL,
             FlightState.PATROLLING,

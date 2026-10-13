@@ -79,6 +79,21 @@ DJI_TELEMETRY_SOURCE = "dji"
 # home. flight_bridge.py's kinematic step already treats the pair identically.
 DJI_GROUNDED_STATES = frozenset({"IDLE", "LANDED"})
 
+# Aircraft flight states that name a mission unambiguously. Target chases,
+# manual, holding and repositioning do not: the mission underneath is
+# unchanged, so they never re-synchronise the server.
+AIRCRAFT_MISSION_STATES: dict[str, MissionState] = {
+    "TAKING_OFF": MissionState.TAKING_OFF,
+    "PATROLLING": MissionState.PATROL,
+    "TRANSITING_TO_ROI": MissionState.TRANSIT_TO_ROI,
+    "ROI_PATROL": MissionState.ROI_PATROL,
+    "RETURNING_HOME": MissionState.RTH,
+    "LANDING": MissionState.LANDING,
+}
+# Longer than a command's round trip and a telemetry sample in flight, so a
+# just-forwarded command is never undone by telemetry that predates it.
+MISSION_RESYNC_AFTER_S = 1.0
+
 
 class RealtimeServer:
     """Routes telemetry from one drone source to one connected tablet client."""
@@ -154,6 +169,9 @@ class RealtimeServer:
         # Last flight state the drone reported, for the airborne -> grounded
         # touchdown edge. None on a fresh drone connection.
         self._drone_reported_state: str | None = None
+        # Mission/aircraft disagreement timer -- see _resync_mission_with_aircraft.
+        self._mission_mismatch_since: float | None = None
+        self._clock = time.monotonic
         # The operator hold. Held here so a reconnecting drone is told about
         # it -- a hold that silently lapsed into "pursuing" when the link
         # blinked would be the worst possible failure for this control.
@@ -416,6 +434,7 @@ class RealtimeServer:
         gps = data["gps"]
         self.mission.observe_position(Wgs84Point(lat=gps["lat"], lng=gps["lng"]))
         self.mission.observe_flight_state(data["state"])
+        self._resync_mission_with_aircraft(data["state"])
         if (
             self._session_home is None
             and telemetry.get("source") == DJI_TELEMETRY_SOURCE
@@ -433,6 +452,25 @@ class RealtimeServer:
             self.patrol_regions, self.patrol_planner = store, planner
         await self._send_to_tablet(encode_message(self._mission_status()))
         await self._send_to_tablet(encode_message(telemetry))
+
+    def _resync_mission_with_aircraft(self, reported_state: str) -> None:
+        """Follow the aircraft's mission when it persistently disagrees."""
+        observed = AIRCRAFT_MISSION_STATES.get(reported_state)
+        if observed is None or observed is self.mission.state:
+            self._mission_mismatch_since = None
+            return
+        now = self._clock()
+        if self._mission_mismatch_since is None:
+            self._mission_mismatch_since = now
+            return
+        if now - self._mission_mismatch_since < MISSION_RESYNC_AFTER_S:
+            return
+        before = self.mission.state
+        after = self.mission.adopt_aircraft_state(observed)
+        self._mission_mismatch_since = None
+        if after is not before:
+            print(f"realtime_server mission_resync aircraft={reported_state} "
+                  f"mission={before.value}->{after.value}")
 
     async def _forward_to_drone(self, command: dict) -> None:
         """Pass a validated command through to the aircraft, if one is linked."""

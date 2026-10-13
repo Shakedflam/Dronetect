@@ -98,11 +98,6 @@ class MissionCommandService:
             CommandName.RETURN_HOME,
         }:
             raise ValueError(f"Not a mission command: {command.value}")
-        if (
-            command in {CommandName.START_PATROL, CommandName.SET_ROI}
-            and self.state is MissionState.LANDING
-        ):
-            raise InvalidMissionCommand(command, self.state)
 
     def observe_altitude(self, altitude_m: float) -> MissionState:
         """Complete a commanded takeoff after telemetry reaches its target."""
@@ -181,6 +176,24 @@ class MissionCommandService:
             self._safety_rth_reason = None
         return self.state
 
+    def adopt_aircraft_state(self, observed: MissionState) -> MissionState:
+        """Follow the aircraft when it is demonstrably doing something else.
+
+        A forwarded command can still be refused on the aircraft (DJI owns
+        the landing, a latch the server cannot see, an unconfigured bridge),
+        and the aircraft can change mission on its own (a pilot hand-back
+        resuming a mission). The caller only adopts a persistent disagreement.
+        A safety RTH latch is never adopted away from RTH/LANDING.
+        """
+        if observed is self.state:
+            return self.state
+        if self.safety_rth_active and observed not in {MissionState.RTH, MissionState.LANDING}:
+            return self.state
+        self._post_takeoff_intent = None
+        if observed in {MissionState.PATROL, MissionState.RTH, MissionState.LANDING}:
+            self._roi = None
+        return self._state_machine.adopt(observed)
+
     def _request_operating_state(
         self,
         command: CommandName,
@@ -199,6 +212,7 @@ class MissionCommandService:
             MissionState.TRANSIT_TO_ROI,
             MissionState.ROI_PATROL,
             MissionState.RTH,
+            MissionState.LANDING,
         }:
             self._post_takeoff_intent = None
             self._state_machine.transition_to(requested)

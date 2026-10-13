@@ -93,6 +93,15 @@ function createInMemoryPatrolService(): PatrolService {
   });
 
   realtimeServerConnection.subscribeMissionStatus((status) => {
+    // The server's confirmed radius is what the aircraft patrols: it is pushed
+    // to the bridge on every drone (re)connect and arrives here on every
+    // tablet (re)connect, so a reload no longer reverts the polygons and
+    // priority badges to the shared.json default.
+    const confirmedRadiusM = status.operatingConfig.maxFlightRadiusM;
+    if (confirmedRadiusM !== currentRadiusM) {
+      currentRadiusM = confirmedRadiusM;
+      patrolRegions = generatePatrolRegions(currentHome, currentRadiusM);
+    }
     authoritativePriorityOrder = status.patrol.priorities
       .slice()
       .sort((left, right) => left.rank - right.rank)

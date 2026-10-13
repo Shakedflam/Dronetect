@@ -101,7 +101,7 @@ import math
 import os
 import time
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from adapters.dji.android_link import DEFAULT_HOST, DEFAULT_PORT, AndroidLink
@@ -137,7 +137,7 @@ from services.gps import DEFAULT_HOME, LocalPosition, Wgs84Point, local_meters_t
 from services.mission_interruption import InterruptedMissionType, MissionInterruptionContext
 from services.no_fly_router import NoFlyRouteUnavailable, NoFlyRouter
 from services.operating_config_apply import plan_operating_config_transition
-from services.patrol_planner import PatrolPlanner
+from services.patrol_planner import PatrolDecision, PatrolPlanner, describe_patrol_plan
 from services.patrol_progress import PausedPatrolCoverage
 from services.patrol_regions import PatrolAreaType, PatrolRegion, PatrolRegionStore, patrol_region_polygon_points
 from services.polygon_coverage import CoveragePathUnavailable, PolygonCoverageConfig, PolygonCoveragePlanner
@@ -147,9 +147,13 @@ DJI_TELEMETRY_SOURCE = "dji"
 
 ANDROID_LINK_LOSS_REASON = "android_link_lost"
 
-# Matches autonomous_drone.py's PolygonCoverageConfig(lane_spacing_m=...)
-# default (DRONTECT_PATROL_LANE_SPACING_M's fallback there).
+# Matches autonomous_drone.py's PolygonCoverageConfig(lane_spacing_m=...):
+# the same DRONTECT_PATROL_LANE_SPACING_M override, the same 75 m fallback.
 DEFAULT_PATROL_LANE_SPACING_M = 75.0
+
+
+def _patrol_lane_spacing_from_env() -> float:
+    return float(os.getenv("DRONTECT_PATROL_LANE_SPACING_M", str(DEFAULT_PATROL_LANE_SPACING_M)))
 # Matches autonomous_drone.py's DRONTECT_MISSION_RETURN_TIMEOUT_S fallback.
 DEFAULT_MISSION_RETURN_TIMEOUT_S = 10.0
 
@@ -199,6 +203,9 @@ NATIVE_LANDING_RELEASE_TIMEOUT_SECONDS = 5.0
 NATIVE_LANDING_START_TIMEOUT_SECONDS = 6.0
 NATIVE_LANDING_INTERRUPT_SECONDS = 2.0
 LANDING_WAIT_LOG_SECONDS = 5.0
+# Under pilot control a safety RTH can only be DJI's own go-home; Android
+# rate-limits that action to one per 5 s, so asking more often is noise.
+DJI_RTH_REQUEST_INTERVAL_SECONDS = 5.0
 
 # FlightConfig.checkpoint_tolerance defaults to 5 cm, which only a simulated
 # body converges to. A real aircraft reports GPS/barometric position with
@@ -283,7 +290,7 @@ class BridgeConfig:
     gimbal_command_ttl_ms: int = 1000
     manual_stick_command_timeout_s: float = 0.5
     mission_return_timeout_s: float = DEFAULT_MISSION_RETURN_TIMEOUT_S
-    patrol_lane_spacing_m: float = DEFAULT_PATROL_LANE_SPACING_M
+    patrol_lane_spacing_m: float = field(default_factory=_patrol_lane_spacing_from_env)
     tick_interval_s: float = 0.05  # 20 Hz
     # How long phase1_telemetry_only keeps reporting the last-drained
     # detection in targetFollowDiagnostics after a tick drains none -- purely
@@ -559,6 +566,8 @@ class DjiFlightBridge:
         self._native_landing: _NativeLanding | None = None
         self._landing_ready_since: float | None = None
         self._last_landing_wait_log = float("-inf")
+        self._last_dji_rth_request = float("-inf")
+        self._dji_go_home_logged = False
 
         # No autonomous movement is possible until this is not None -- see
         # the module docstring. _apply_operating_config sets it.
@@ -771,14 +780,28 @@ class DjiFlightBridge:
             velocity_z_mps=velocity_z,
             gimbal_pitch_rad=self.camera_gimbal.pitch,
             battery_percent=battery_percent,
-            state=self.logic.state.value,
+            state=self._reported_state(telemetry),
             safety_rth_active=self._safety_rth_active,
             safety_rth_reason=self._safety_rth_reason,
-            manual_control_active=self.logic.manual_control,
+            # The pilot holding the aircraft is manual control, whether it
+            # began on the tablet button or on the RC sticks.
+            manual_control_active=self.logic.manual_control or self._pilot_control is not None,
             manual_input_source=self.manual_input.source,
             pursuit_blocked=self.logic.pursuit_blocked,
             target_patrol_region_id=self._target_patrol_region_id,
         )
+
+    def _reported_state(self, telemetry) -> str:
+        """FlightLogic's state, except that an airborne IDLE is reported MANUAL.
+
+        IDLE in the air happens when the pilot flies with no mission (before
+        the first mission, or after a takeover the computer stood down from).
+        realtime_server reads IDLE/LANDED as "on the ground": reporting IDLE
+        here ended the mission and cleared its safety-RTH latch mid-flight.
+        """
+        if self.logic.state is FlightState.IDLE and telemetry is not None and telemetry.is_flying is True:
+            return FlightState.MANUAL.value
+        return self.logic.state.value
 
     def _maybe_establish_session_home(self, telemetry) -> None:
         """Capture session_home once, from the first grounded, complete fix.
@@ -994,7 +1017,10 @@ class DjiFlightBridge:
             self._request_native_takeoff_if_grounded("set_roi")
         elif command == CommandName.CLEAR_ROI:
             self._discard_mission_interruption()
-            resume_patrol = self.logic.state in _RESUME_PATROL_ELIGIBLE_STATES
+            resume_patrol = self.logic.state in _RESUME_PATROL_ELIGIBLE_STATES or (
+                # Holding after a completed single-cycle ROI: the ROI is still
+                # the mission, so clearing it moves on to patrol like mid-ROI.
+                self.logic.state is FlightState.HOLDING and self._active_roi_id is not None)
             self.logic.clear_roi(position)
             self._active_roi_id = None
             if resume_patrol:
@@ -1020,7 +1046,11 @@ class DjiFlightBridge:
                 if self.logic.engage_manual_control(position):
                     self.manual_input.reset()
                     self._discard_mission_interruption()
-                if self.logic.manual_control:
+                telemetry = self.android_link.latest_telemetry
+                if self.logic.manual_control or (telemetry is not None and telemetry.is_flying is True):
+                    # Mid-climb or mid-landing (states MANUAL refuses) this is
+                    # the same hand-over an RC takeover gets: the mission is
+                    # stood down and Virtual Stick released.
                     self._hand_control_to_pilot("tablet_manual", position)
             else:
                 was_manual = self.logic.manual_control or self._pilot_control is not None
@@ -1179,9 +1209,9 @@ class DjiFlightBridge:
             self._fail_native_landing(f"not_started_mode_{mode}", position)
 
     def _maybe_begin_native_landing(self, telemetry, position: Position, now: float) -> None:
-        if (self.logic.state is not FlightState.LANDING or self._pilot_control is not None
-                or self._safety_rth_active):
-            # A safety RTH is DJI's own go-home, which lands by itself.
+        if self.logic.state is not FlightState.LANDING or self._pilot_control is not None:
+            # A safety RTH lands the same way as an operator one; if DJI is
+            # flying its own go-home instead, the GO_HOME mode blocks below.
             self._landing_ready_since = None
             return
         blocker = self._native_landing_blocker(telemetry, position)
@@ -1228,6 +1258,14 @@ class DjiFlightBridge:
         print(f"DJI bridge: landing=native_failed reason={reason}")
         self._native_landing = None
         self._hand_control_to_pilot("native_landing_failed", position)
+
+    def _dji_flying_go_home(self) -> bool:
+        telemetry = self.android_link.latest_telemetry
+        flying_home = (telemetry is not None and telemetry.flight_mode == "GO_HOME"
+                       and self.android_link.is_telemetry_fresh(self.config.android_telemetry_timeout_s))
+        if not flying_home:
+            self._dji_go_home_logged = False
+        return flying_home
 
     def _virtual_stick_released(self) -> bool:
         telemetry = self.android_link.latest_telemetry
@@ -1369,12 +1407,25 @@ class DjiFlightBridge:
 
         paused = self._paused_patrol_coverage
         if paused is not None and paused.region_id == decision.region.id and self._resume_paused_patrol(position):
-            return self._patrol_route_waypoints.popleft()
+            first = self._patrol_route_waypoints.popleft()
+            self._log_patrol_plan(decision, "resumed_checkpoint", position, first,
+                                  1 + len(self._patrol_route_waypoints))
+            return first
 
         self._target_patrol_region_id = decision.region.id
         ordered = candidate_waypoints[decision.region.id]
         self._patrol_route_waypoints = deque(ordered[1:])
+        self._log_patrol_plan(decision, "new_coverage", position, ordered[0], len(ordered))
         return ordered[0]
+
+    def _log_patrol_plan(self, decision: PatrolDecision, source: str, position: Position,
+                         first_waypoint: Position, waypoint_count: int) -> None:
+        print("DJI bridge: " + describe_patrol_plan(
+            decision, source=source, position=position, first_waypoint=first_waypoint,
+            waypoint_count=waypoint_count,
+            patrol_radius_m=self.logic.pursuit.config.geofence_radius_m,
+            planner_uptime_s=self.patrol_planner.uptime_s,
+        ))
 
     def _coverage_route_waypoints(
         self, position: Position, region: PatrolRegion, no_fly_polygons: list[tuple[Wgs84Point, ...]]
@@ -1383,7 +1434,10 @@ class DjiFlightBridge:
         coverage = self.polygon_coverage_planner.plan(
             patrol_region_polygon_points(region, self.session_home),
             no_fly_polygons=no_fly_polygons,
-            outward_from=self.session_home,
+            # Enter the sweep at the end nearest the aircraft, not the one
+            # nearest home: patrol is often started mid-air (e.g. from an ROI).
+            start_from=local_meters_to_wgs84(
+                LocalPosition(x=position[0], y=position[1], z=0.0), self.session_home),
         )
         local_coverage = [
             wgs84_to_local_meters(waypoint, self.session_home, altitude_m=self.logic.config.takeoff_altitude)
@@ -2125,6 +2179,13 @@ class DjiFlightBridge:
             if not takeoff.suppression_logged:
                 takeoff.suppression_logged = True
                 print(f"DJI bridge: setpoints=suppressed reason=native_takeoff state={outcome.state}")
+        elif self._dji_flying_go_home():
+            # DJI started its own go-home (e.g. aircraft-side low battery).
+            # Android refuses Virtual Stick in GO_HOME anyway; streaming into
+            # it only fights DJI and spams rejections.
+            if not self._dji_go_home_logged:
+                self._dji_go_home_logged = True
+                print(f"DJI bridge: setpoints=suppressed reason=dji_go_home state={outcome.state}")
         elif self._grounded():
             # Android refuses every setpoint on the ground ("grounded"), so
             # sending them only spams rejections. Authority is taken again by
@@ -2145,8 +2206,15 @@ class DjiFlightBridge:
         await self.android_link.send_gimbal_command(
             pitch_deg=-math.degrees(outcome.gimbal_pitch_rad), ttl_ms=self.config.gimbal_command_ttl_ms
         )
-        if outcome.safety_rth_active and outcome.state in {FlightState.RETURNING_HOME.value, FlightState.LANDING.value}:
-            await self.android_link.send_rth(reason=outcome.safety_rth_reason or "safety_rth")
+        if (outcome.safety_rth_active and self._pilot_control is not None
+                and outcome.state in {FlightState.RETURNING_HOME.value, FlightState.LANDING.value}):
+            # Dronetect's own RTH flies a safety RTH whenever it holds Virtual
+            # Stick. Under pilot control it cannot, so DJI's go-home is asked
+            # for instead -- the pilot's RC still outranks it.
+            now = self._clock()
+            if now - self._last_dji_rth_request >= DJI_RTH_REQUEST_INTERVAL_SECONDS:
+                if await self.android_link.send_rth(reason=outcome.safety_rth_reason or "safety_rth"):
+                    self._last_dji_rth_request = now
 
         self.realtime_link.publish_telemetry(self.build_telemetry_message(outcome))
         return outcome

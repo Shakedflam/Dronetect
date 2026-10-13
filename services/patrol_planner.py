@@ -159,6 +159,12 @@ class PatrolPlanner:
             ),
         )
 
+    @property
+    def uptime_s(self) -> float:
+        """Seconds since this planner's baseline -- the age every unobserved
+        region starts from, and so how strongly ranks currently dominate."""
+        return max(0.0, self._resolve_time(None) - self.started_at)
+
     def record_observation(
         self,
         region_id: str,
@@ -190,3 +196,39 @@ def _validated_distance(value: float) -> float:
     if not math.isfinite(distance) or distance < 0.0:
         raise ValueError("travel_distance_m must be a finite non-negative number")
     return distance
+
+
+def describe_patrol_plan(
+    decision: PatrolDecision,
+    *,
+    source: str,
+    position: tuple[float, float, float],
+    first_waypoint: tuple[float, float, float],
+    waypoint_count: int,
+    patrol_radius_m: float,
+    planner_uptime_s: float,
+) -> str:
+    """One log line per patrol plan, shared by the simulator and DJI bridge.
+
+    Positions are local ENU metres from home (x=East, y=North); the bearing is
+    a compass bearing from the aircraft to the first waypoint, so the line
+    reads directly against the tablet map.
+    """
+    region = decision.region
+    score = decision.score
+    dx = first_waypoint[0] - position[0]
+    dy = first_waypoint[1] - position[1]
+    bearing_deg = math.degrees(math.atan2(dx, dy)) % 360.0
+    return (
+        f"patrol_plan source={source} region={region.id} "
+        f"rank={region.priority if region.priority is not None else '-'} "
+        f"score={score.total:.1f} ageS={score.age_seconds:.0f} "
+        f"priorityX={score.priority_multiplier:.2f} travelM={score.distance_m:.0f} "
+        f"radiusM={patrol_radius_m:.0f} "
+        f"bandM={region.inner_radius_m:.0f}-{region.outer_radius_m:.0f} "
+        f"sectorDeg={region.start_bearing_deg:.1f}-{region.end_bearing_deg:.1f} "
+        f"pos=({position[0]:.1f},{position[1]:.1f},{position[2]:.1f}) "
+        f"firstWp=({first_waypoint[0]:.1f},{first_waypoint[1]:.1f},{first_waypoint[2]:.1f}) "
+        f"bearingDeg={bearing_deg:.0f} legM={math.hypot(dx, dy):.0f} "
+        f"waypoints={waypoint_count} plannerUptimeS={planner_uptime_s:.0f}"
+    )

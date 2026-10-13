@@ -82,7 +82,7 @@ from services.polygon_coverage import (
     PolygonCoveragePlanner,
 )
 from services.operating_config_apply import plan_operating_config_transition
-from services.patrol_planner import PatrolPlanner
+from services.patrol_planner import PatrolPlanner, describe_patrol_plan
 from services.patrol_progress import PausedPatrolCoverage
 from services.patrol_regions import (
     PatrolAreaType,
@@ -450,7 +450,11 @@ class AutonomousDrone(Supervisor):
                     FlightState.TAKING_OFF,
                     FlightState.TRANSITING_TO_ROI,
                     FlightState.ROI_PATROL,
-                }
+                } or (
+                    # Holding after a completed single-cycle ROI.
+                    self.logic.state is FlightState.HOLDING
+                    and self._active_roi_id is not None
+                )
                 self.logic.clear_roi(position)
                 self._active_roi_id = None
                 if resume_patrol:
@@ -1514,7 +1518,14 @@ class AutonomousDrone(Supervisor):
             and self._resume_paused_patrol(position)
         ):
             print(f"Resuming paused patrol region: {decision.region.id}")
-            return self._patrol_route_waypoints.popleft()
+            first = self._patrol_route_waypoints.popleft()
+            print(describe_patrol_plan(
+                decision, source="resumed_checkpoint", position=position, first_waypoint=first,
+                waypoint_count=1 + len(self._patrol_route_waypoints),
+                patrol_radius_m=self.logic.pursuit.config.geofence_radius_m,
+                planner_uptime_s=self.patrol_planner.uptime_s,
+            ))
+            return first
 
         self._target_patrol_region_id = decision.region.id
         ordered = candidate_waypoints[decision.region.id]
@@ -1523,6 +1534,12 @@ class AutonomousDrone(Supervisor):
             f"Patrol target region: {decision.region.id} "
             f"(safe route {decision.score.distance_m:.1f} m)"
         )
+        print(describe_patrol_plan(
+            decision, source="new_coverage", position=position, first_waypoint=ordered[0],
+            waypoint_count=len(ordered),
+            patrol_radius_m=self.logic.pursuit.config.geofence_radius_m,
+            planner_uptime_s=self.patrol_planner.uptime_s,
+        ))
         return ordered[0]
 
     def _coverage_route_waypoints(
@@ -1534,7 +1551,9 @@ class AutonomousDrone(Supervisor):
         coverage = self.polygon_coverage_planner.plan(
             patrol_region_polygon_points(region),
             no_fly_polygons=no_fly_polygons,
-            outward_from=DEFAULT_HOME,
+            # Same as the DJI bridge: enter the sweep nearest the aircraft.
+            start_from=local_meters_to_wgs84(
+                LocalPosition(x=position[0], y=position[1], z=0.0), DEFAULT_HOME),
         )
         local_coverage = [
             wgs84_to_local_meters(

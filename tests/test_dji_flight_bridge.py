@@ -2144,12 +2144,17 @@ def test_rc_takeover_mid_climb_stands_the_mission_down():
     bridge = _drive_bridge_into(FlightState.TAKING_OFF, now)
     recorder = _SetpointRecorder()
     outcome = _pilot_tick(bridge, now, recorder, altitude_m=5.0, forward=0.4)
-    assert outcome.state == FlightState.IDLE.value
+    assert bridge.logic.state is FlightState.IDLE
+    # Stood down but still flying: reported MANUAL, never the "on the
+    # ground" IDLE that realtime_server would read as a touchdown.
+    assert outcome.state == FlightState.MANUAL.value
+    assert outcome.manual_control_active is True
     assert bridge._pilot_control is not None
     assert recorder.setpoints() == []
     assert len(_releases(recorder)) == 1
     for _ in range(60):  # no silent resume of the climb
-        assert _pilot_tick(bridge, now, recorder, altitude_m=6.0).state == FlightState.IDLE.value
+        assert _pilot_tick(bridge, now, recorder, altitude_m=6.0).state == FlightState.MANUAL.value
+        assert bridge.logic.state is FlightState.IDLE
     assert recorder.setpoints() == []
 
 

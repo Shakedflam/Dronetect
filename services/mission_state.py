@@ -51,7 +51,16 @@ VALID_MISSION_TRANSITIONS: dict[MissionState, frozenset[MissionState]] = {
             MissionState.LANDING,
         }
     ),
-    MissionState.LANDING: frozenset({MissionState.ON_GROUND}),
+    # LANDING here is the aircraft's own landing approach, still airborne: a
+    # new mission may take it back up. The aircraft refuses once DJI owns the
+    # touchdown, and the server then follows it back (adopt()).
+    MissionState.LANDING: frozenset(
+        {
+            MissionState.ON_GROUND,
+            MissionState.PATROL,
+            MissionState.TRANSIT_TO_ROI,
+        }
+    ),
 }
 
 
@@ -83,6 +92,16 @@ class MissionStateMachine:
 
     def can_transition_to(self, requested: MissionState) -> bool:
         return requested in VALID_MISSION_TRANSITIONS[self._state]
+
+    def adopt(self, observed: MissionState) -> MissionState:
+        """Take the state the aircraft reports, whatever the edge.
+
+        Only for re-synchronising with the aircraft, which is authoritative
+        about what it is actually doing; operator requests go through
+        transition_to() and its validation.
+        """
+        self._state = observed
+        return self._state
 
     def transition_to(self, requested: MissionState) -> MissionState:
         if not self.can_transition_to(requested):
