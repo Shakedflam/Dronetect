@@ -300,12 +300,27 @@ class DroneRealtimeClient(
         // uplink transit, so every age was inflated by ~RTT and healthy field
         // commands expired. Half the measured round trip removes that bias
         // without weakening the staleness test itself.
-        val serverNowEstimateMs = if (name == "dji_setpoint") {
-            clockServerReceivedAtMs?.takeIf {
-                processingElapsedMs - lastClockSyncElapsedMs <= 5_000L
-            }?.plus(processingElapsedMs - syncProbeSentElapsedMs)
-                ?.minus(lastClockRoundTripMs / 2.0)
-        } else System.currentTimeMillis().toDouble()
+        // Every timed action is aged on the synced AWS clock. The tablet's
+        // wall clock drifts: a field tablet ran ~1.8 s ahead of AWS, and
+        // every takeoff (TTL 1.5 s) and gimbal command (1 s) expired on
+        // arrival. Without a fresh sync (e.g. a degraded link whose probe
+        // replies exceed 500 ms):
+        //  - setpoints and takeoff are refused: motion never starts on a guess;
+        //  - RTH and native landing are honoured unaged: late is safe, refused
+        //    is not, and session/replay checks plus DJI's own preconditions
+        //    still apply;
+        //  - gimbal falls back to the wall clock.
+        val syncedServerNowMs = clockServerReceivedAtMs?.takeIf {
+            processingElapsedMs - lastClockSyncElapsedMs <= 5_000L
+        }?.plus(processingElapsedMs - syncProbeSentElapsedMs)
+            ?.minus(lastClockRoundTripMs / 2.0)
+        val safetyAction = name == "dji_rth" || name == "dji_land"
+        val unagedSafetyAction = safetyAction && syncedServerNowMs == null
+        val serverNowEstimateMs = when {
+            syncedServerNowMs != null -> syncedServerNowMs
+            name == "dji_setpoint" || name == "dji_takeoff" -> null
+            else -> System.currentTimeMillis().toDouble()
+        }
         if (serverNowEstimateMs == null) {
             log("bridge_action=rejected name=$name reason=clock_sync_unavailable")
             if (phase4PulseEnabled && name == "dji_setpoint") {
@@ -321,7 +336,7 @@ class DroneRealtimeClient(
             else -> 1_000
         }
         if (issuedAt == null || !issuedAt.isFinite() || ttlMs == null || ttlMs !in 1..maximumTtl ||
-            ageMs < -1_000.0 || ageMs > ttlMs) {
+            (!unagedSafetyAction && (ageMs < -1_000.0 || ageMs > ttlMs))) {
             val nowMs = System.currentTimeMillis()
             if (name != "dji_setpoint" || nowMs - lastExpiredLogMs >= 2_000L) {
                 lastExpiredLogMs = nowMs
@@ -334,6 +349,10 @@ class DroneRealtimeClient(
                 zeroStick?.stop("stale_or_invalid_setpoint")
             }
             return
+        }
+        if (unagedSafetyAction) {
+            log("bridge_action=accepted_without_clock_sync name=$name seq=$seq " +
+                "syncAgeMs=${processingElapsedMs - lastClockSyncElapsedMs}")
         }
         if (name == "dji_setpoint") {
             val velocity = message.optJSONObject("velocity")

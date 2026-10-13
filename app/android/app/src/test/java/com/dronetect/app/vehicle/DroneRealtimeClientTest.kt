@@ -468,12 +468,22 @@ class DroneRealtimeClientTest {
         override fun stop(reason: String) = Unit
     }
 
+    /** Answers the first clock probe (a real sync, as in the field), then sends `types`. */
     private fun nativeActionServer(session: String, vararg types: String) =
         MockWebServer().apply {
             enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                private var sent = false
                 override fun onOpen(webSocket: WebSocket, response: Response) {
-                    val now = System.currentTimeMillis() / 1000.0
                     webSocket.send("""{"type":"dji_hello","sessionId":"$session"}""")
+                }
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    val probe = JSONObject(text)
+                    if (probe.optString("type") != "dji_clock_probe" || sent) return
+                    sent = true
+                    val now = probe.getDouble("timestamp")
+                    webSocket.send(JSONObject().put("type", "dji_clock_sync")
+                        .put("sessionId", session).put("probeTimestamp", now)
+                        .put("serverReceivedAt", now).toString())
                     types.forEachIndexed { index, type ->
                         webSocket.send(JSONObject().put("type", type).put("sessionId", session)
                             .put("seq", index + 1).put("issuedAt", now).put("ttlMs", 1500)
@@ -527,5 +537,108 @@ class DroneRealtimeClientTest {
                 assertEquals(listOf("sdk=return_home"), events.toList())
             } finally { client.stop(); server.shutdown() }
         }
+    }
+
+    /** Field failure: tablet clock ~1.8 s ahead of AWS expired every takeoff and gimbal command. */
+    @Test fun timedActionsAreAgedOnTheSyncedClockNotTheTabletClock() {
+        val session = "9".repeat(32)
+        val events = CopyOnWriteArrayList<String>()
+        val logs = CopyOnWriteArrayList<String>()
+        val done = CountDownLatch(2)
+        val server = MockWebServer().apply {
+            enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    webSocket.send("""{"type":"dji_hello","sessionId":"$session"}""")
+                }
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    val probe = JSONObject(text)
+                    if (probe.optString("type") != "dji_clock_probe") return
+                    val tabletTime = probe.getDouble("timestamp")
+                    val awsTime = tabletTime - 1.8 // the measured field skew
+                    webSocket.send(JSONObject().put("type", "dji_clock_sync")
+                        .put("sessionId", session).put("probeTimestamp", tabletTime)
+                        .put("serverReceivedAt", awsTime).toString())
+                    fun send(seq: Int, type: String, issued: Double, ttl: Int) {
+                        webSocket.send(JSONObject().put("type", type).put("sessionId", session)
+                            .put("seq", seq).put("issuedAt", issued).put("ttlMs", ttl)
+                            .put("reason", "test").put("controlEpoch", 2).put("pitchDeg", -20.0).toString())
+                    }
+                    send(1, "dji_takeoff", awsTime - 2.0, 1500)    // genuinely stale: still refused
+                    send(2, "dji_rth", awsTime - 2.0, 1500)        // stale with a sync: refused
+                    send(3, "dji_land", awsTime - 2.0, 1500)       // stale with a sync: refused
+                    send(4, "dji_takeoff", awsTime, 1500)          // fresh on AWS time
+                    send(5, "dji_gimbal_command", awsTime, 1000)   // fresh on AWS time
+                }
+            }))
+        }
+        server.start()
+        val snapshot = DjiTelemetrySnapshot(
+            aircraftConnected = true, rcConnected = true, isFlying = false, gpsSignalLevel = "LEVEL_5",
+            rcLeftHorizontal = 0, rcLeftVertical = 0, rcRightHorizontal = 0, rcRightVertical = 0,
+        )
+        val client = DroneRealtimeClient("ws://127.0.0.1:${server.port}", "a".repeat(64),
+            { DjiTelemetryState("connected", snapshot, System.currentTimeMillis()) },
+            recordingAdapter(events, done), log = { logs.add(it) },
+            zeroStickControl = recordingStick(events), autonomousEnabled = true)
+        try {
+            client.start()
+            assertTrue(done.await(8, TimeUnit.SECONDS))
+            assertEquals(listOf("sdk=native_takeoff", "sdk=gimbal_pitch"), events.toList())
+            for (stale in listOf("dji_takeoff reason=expired_or_invalid seq=1 ",
+                    "dji_rth reason=expired_or_invalid seq=2 ", "dji_land reason=expired_or_invalid seq=3 ")) {
+                assertTrue(stale, logs.any { it.contains("name=$stale") })
+            }
+            assertTrue(logs.none { it.contains("accepted_without_clock_sync") })
+        } finally { client.stop(); server.shutdown() }
+    }
+
+    /**
+     * No clock sync at all (probe replies lost, e.g. RTT > 500 ms): emergency
+     * RTH and native landing still reach DJI -- even when their timestamps look
+     * 10 s old on the drifting tablet clock -- while takeoff is refused.
+     */
+    @Test fun withoutClockSyncRthAndLandingStillReachDjiButTakeoffDoesNot() {
+        val session = "8".repeat(32)
+        val events = CopyOnWriteArrayList<String>()
+        val logs = CopyOnWriteArrayList<String>()
+        val done = CountDownLatch(3)
+        val server = MockWebServer().apply {
+            enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    // Never answers dji_clock_probe: no sync is ever established.
+                    val wall = System.currentTimeMillis() / 1000.0
+                    webSocket.send("""{"type":"dji_hello","sessionId":"$session"}""")
+                    fun send(seq: Int, type: String, issued: Double, ttl: Int) {
+                        webSocket.send(JSONObject().put("type", type).put("sessionId", session)
+                            .put("seq", seq).put("issuedAt", issued).put("ttlMs", ttl)
+                            .put("reason", "test").put("controlEpoch", 2).put("pitchDeg", -20.0).toString())
+                    }
+                    send(1, "dji_takeoff", wall, 1500)          // fresh, but motion needs a sync
+                    send(2, "dji_rth", wall - 10.0, 1500)       // honoured unaged
+                    send(3, "dji_land", wall - 10.0, 1500)      // honoured unaged, VS released first
+                    send(4, "dji_gimbal_command", wall, 1000)   // wall-clock fallback
+                    send(5, "dji_rth", wall, 9_999)             // malformed TTL: still refused
+                }
+            }))
+        }
+        server.start()
+        val snapshot = DjiTelemetrySnapshot(
+            aircraftConnected = true, rcConnected = true, isFlying = false, gpsSignalLevel = "LEVEL_5",
+            rcLeftHorizontal = 0, rcLeftVertical = 0, rcRightHorizontal = 0, rcRightVertical = 0,
+        )
+        val client = DroneRealtimeClient("ws://127.0.0.1:${server.port}", "a".repeat(64),
+            { DjiTelemetryState("connected", snapshot, System.currentTimeMillis()) },
+            recordingAdapter(events, done), log = { logs.add(it) },
+            zeroStickControl = recordingStick(events), autonomousEnabled = true)
+        try {
+            client.start()
+            assertTrue(done.await(8, TimeUnit.SECONDS))
+            assertEquals(listOf("sdk=return_home", "release=native_landing", "sdk=native_land",
+                "sdk=gimbal_pitch"), events.toList())
+            assertTrue(logs.any { it.contains("name=dji_takeoff reason=clock_sync_unavailable") })
+            assertTrue(logs.any { it.contains("accepted_without_clock_sync name=dji_rth seq=2") })
+            assertTrue(logs.any { it.contains("accepted_without_clock_sync name=dji_land seq=3") })
+            assertTrue(logs.any { it.contains("name=dji_rth reason=expired_or_invalid seq=5 ") })
+        } finally { client.stop(); server.shutdown() }
     }
 }

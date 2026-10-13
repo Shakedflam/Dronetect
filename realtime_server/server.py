@@ -93,6 +93,10 @@ AIRCRAFT_MISSION_STATES: dict[str, MissionState] = {
 # Longer than a command's round trip and a telemetry sample in flight, so a
 # just-forwarded command is never undone by telemetry that predates it.
 MISSION_RESYNC_AFTER_S = 1.0
+# How long the aircraft must keep reporting "on the ground" (with no aircraft
+# safety RTH) before a stuck RTH/safety latch is released. Matches the
+# bridge's own LANDING_CONFIRM_SECONDS.
+GROUNDED_LATCH_CLEAR_AFTER_S = 2.0
 
 
 class RealtimeServer:
@@ -171,6 +175,9 @@ class RealtimeServer:
         self._drone_reported_state: str | None = None
         # Mission/aircraft disagreement timer -- see _resync_mission_with_aircraft.
         self._mission_mismatch_since: float | None = None
+        # Unbroken "grounded, no aircraft RTH" reports -- see
+        # _clear_safety_latch_if_aircraft_grounded.
+        self._grounded_report_since: float | None = None
         self._clock = time.monotonic
         # The operator hold. Held here so a reconnecting drone is told about
         # it -- a hold that silently lapsed into "pursuing" when the link
@@ -396,6 +403,8 @@ class RealtimeServer:
             print(f"realtime_server touchdown reported={self._drone_reported_state}->"
                   f"{reported_state} mission={before.value}->{self.mission.state.value}")
         self._drone_reported_state = reported_state
+        self._clear_safety_latch_if_aircraft_grounded(
+            reported_state, bool(data["aircraftSafetyRthActive"]))
         reported_block = data.get("pursuitBlocked")
         if isinstance(reported_block, bool):
             self.pursuit_blocked = reported_block
@@ -452,6 +461,33 @@ class RealtimeServer:
             self.patrol_regions, self.patrol_planner = store, planner
         await self._send_to_tablet(encode_message(self._mission_status()))
         await self._send_to_tablet(encode_message(telemetry))
+
+    def _clear_safety_latch_if_aircraft_grounded(self, reported_state: str, aircraft_rth_active: bool) -> None:
+        """End an RTH/safety latch the aircraft has been on the ground for.
+
+        The touchdown edge (airborne -> grounded) never fires for an aircraft
+        that never left the ground -- e.g. a takeoff refused, then a link blip
+        latching a safety RTH -- and the latch then refused every mission. An
+        aircraft still reporting its own safety RTH, or anything but a
+        grounded state, is never cleared here.
+        """
+        stuck = self.mission.safety_rth_active or self.mission.state in {
+            MissionState.RTH, MissionState.LANDING}
+        if not stuck or aircraft_rth_active or reported_state not in DJI_GROUNDED_STATES:
+            self._grounded_report_since = None
+            return
+        now = self._clock()
+        if self._grounded_report_since is None:
+            self._grounded_report_since = now
+            return
+        if now - self._grounded_report_since < GROUNDED_LATCH_CLEAR_AFTER_S:
+            return
+        before = self.mission.state
+        reason = self.mission.safety_rth_reason
+        self.mission.observe_touchdown()
+        self._grounded_report_since = None
+        print(f"realtime_server safety_rth=cleared reason=aircraft_confirmed_grounded "
+              f"latch={reason} mission={before.value}->{self.mission.state.value}")
 
     def _resync_mission_with_aircraft(self, reported_state: str) -> None:
         """Follow the aircraft's mission when it persistently disagrees."""

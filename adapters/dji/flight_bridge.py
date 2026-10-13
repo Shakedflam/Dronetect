@@ -567,6 +567,12 @@ class DjiFlightBridge:
         self._landing_ready_since: float | None = None
         self._last_landing_wait_log = float("-inf")
         self._last_dji_rth_request = float("-inf")
+        # Flight status for the link-loss fail-safes. AndroidLink forgets its
+        # observations on a disconnect, which is exactly when these are read,
+        # so the bridge keeps the last one it saw.
+        self._last_known_is_flying: bool | None = None
+        # Start of an unbroken run of fresh "not flying" samples, or None.
+        self._grounded_confirmed_since: float | None = None
         self._dji_go_home_logged = False
 
         # No autonomous movement is possible until this is not None -- see
@@ -699,6 +705,7 @@ class DjiFlightBridge:
                 if self.logic.home is None:
                     self.logic.initialize_home(position)
 
+        self._observe_flight_status(now)
         self._enforce_realtime_connection_loss_failsafe()
         self._enforce_android_connection_loss_failsafe(now)
         if fresh and self._last_position is not None:
@@ -760,6 +767,7 @@ class DjiFlightBridge:
         assert telemetry is not None
         self._supervise_native_takeoff(telemetry, position, now)
         self._supervise_native_landing(telemetry, position, now)
+        self._clear_safety_latch_if_confirmed_grounded(position, now)
         step = self._apply_kinematic_flight(position, yaw, dt)
         if dt > 0.0:
             velocity_x = (step.position[0] - position[0]) / dt
@@ -799,7 +807,9 @@ class DjiFlightBridge:
         realtime_server reads IDLE/LANDED as "on the ground": reporting IDLE
         here ended the mission and cleared its safety-RTH latch mid-flight.
         """
-        if self.logic.state is FlightState.IDLE and telemetry is not None and telemetry.is_flying is True:
+        if self.logic.state is FlightState.IDLE and (telemetry is None or telemetry.is_flying is not False):
+            # Unknown counts as flying: realtime_server reads IDLE as "on
+            # the ground" and clears safety latches on it.
             return FlightState.MANUAL.value
         return self.logic.state.value
 
@@ -1867,6 +1877,9 @@ class DjiFlightBridge:
             return
         if self.logic.state not in _AIRBORNE_STATES:
             return
+        if self._known_on_the_ground():
+            self._cancel_grounded_mission(CONNECTION_LOSS_REASON)
+            return
         self._realtime_connection_loss_rth_active = True
         self._safety_rth_active = True
         self._safety_rth_reason = CONNECTION_LOSS_REASON
@@ -1892,6 +1905,9 @@ class DjiFlightBridge:
             return
         if self.logic.state not in _AIRBORNE_STATES:
             return
+        if self._known_on_the_ground():
+            self._cancel_grounded_mission(ANDROID_LINK_LOSS_REASON)
+            return
         self._android_connection_loss_rth_active = True
         self._safety_rth_active = True
         self._safety_rth_reason = ANDROID_LINK_LOSS_REASON
@@ -1900,6 +1916,73 @@ class DjiFlightBridge:
             self.manual_input.reset()
         if self.logic.state not in {FlightState.RETURNING_HOME, FlightState.LANDING}:
             self.logic.request_return_home()
+
+    def _observe_flight_status(self, now: float) -> None:
+        status = self.android_link.latest_flight_status(now)
+        if status is None:
+            # Link down or nothing received: the last known value stands, but
+            # nothing here is fresh evidence of being on the ground.
+            self._grounded_confirmed_since = None
+            return
+        is_flying, age = status
+        self._last_known_is_flying = is_flying
+        if is_flying is False and age <= self.config.android_telemetry_timeout_s:
+            if self._grounded_confirmed_since is None:
+                self._grounded_confirmed_since = now
+        else:
+            self._grounded_confirmed_since = None
+
+    def _known_on_the_ground(self) -> bool:
+        """Whether a link-loss fail-safe may treat the aircraft as grounded.
+
+        Only an explicit isFlying=false counts, and never once a DJI takeoff
+        has been requested: DJI may be lifting off while we cannot see it.
+        Anything uncertain is treated as airborne -- the conservative side.
+        """
+        if self._last_known_is_flying is not False:
+            return False
+        return self._native_takeoff is None or not self._native_takeoff.sent
+
+    def _cancel_grounded_mission(self, reason: str) -> None:
+        """Link lost with the aircraft still on the ground: no RTH to fly, so
+        stand the pending mission (and any unsent takeoff) down instead."""
+        position = self._last_position or self.logic.home or (0.0, 0.0, 0.0)
+        print(f"DJI bridge: failsafe=link_lost_on_ground reason={reason} "
+              f"action=mission_cancelled stateBefore={self.logic.state.value}")
+        self._native_takeoff = None
+        self.logic.stand_down(position)
+        self._clear_patrol_progress()
+        self._active_roi_id = None
+
+    def _clear_safety_latch_if_confirmed_grounded(self, position: Position, now: float) -> None:
+        """Release a safety-RTH latch the aircraft can no longer act on.
+
+        A latch set while the aircraft never left the ground has no landing
+        edge to end it, and it otherwise blocks every mission until the bridge
+        restarts. Cleared only on an unbroken run of fresh isFlying=false, with
+        no DJI takeoff/landing underway and nothing active but the RTH itself.
+        An airborne latch cannot meet this short of a real landing, which the
+        landing reset already ends the same way.
+        """
+        if not self._safety_rth_active or self._grounded_confirmed_since is None:
+            return
+        if now - self._grounded_confirmed_since < LANDING_CONFIRM_SECONDS:
+            return
+        if self._native_takeoff is not None or self._native_landing is not None:
+            return
+        if self.logic.state not in {FlightState.IDLE, FlightState.LANDED,
+                                    FlightState.RETURNING_HOME, FlightState.LANDING}:
+            return
+        reason = self._safety_rth_reason
+        if self.logic.state is not FlightState.IDLE:
+            self.logic.stand_down(position)
+        self._clear_patrol_progress()
+        self._active_roi_id = None
+        self._safety_rth_active = False
+        self._safety_rth_reason = None
+        self._android_connection_loss_rth_active = False
+        self._realtime_connection_loss_rth_active = False
+        print(f"DJI bridge: safety_rth=cleared reason=confirmed_grounded latch={reason}")
 
     # -- outbound telemetry -------------------------------------------------
     # phase1_telemetry_only's targetFollowDiagnostics: a pure, read-only

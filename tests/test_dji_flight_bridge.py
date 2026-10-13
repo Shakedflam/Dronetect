@@ -959,7 +959,7 @@ def test_android_link_loss_triggers_rth_while_airborne():
     bridge.tick(0.05, now=now[0])
     _queue_command(bridge, CommandName.START_PATROL.value)
     now[0] += 0.05
-    _feed_telemetry(bridge, now)
+    _feed_telemetry(bridge, now, is_flying=True, flight_mode="GPS_NORMAL")
     bridge.tick(0.05, now=now[0])
     assert bridge.logic.state is not FlightState.IDLE
 
@@ -982,13 +982,13 @@ def test_realtime_link_loss_triggers_rth_while_airborne():
     bridge.tick(0.05, now=now[0])
     _queue_command(bridge, CommandName.START_PATROL.value)
     now[0] += 0.05
-    _feed_telemetry(bridge, now)
+    _feed_telemetry(bridge, now, is_flying=True, flight_mode="GPS_NORMAL")
     bridge.tick(0.05, now=now[0])
 
     bridge.realtime_link._mark_connected()
     bridge.realtime_link._mark_disconnected()
     now[0] += 4.0  # past realtime_connection_loss_rth_s=3.0
-    _feed_telemetry(bridge, now)
+    _feed_telemetry(bridge, now, is_flying=True, flight_mode="GPS_NORMAL")
 
     outcome = bridge.tick(0.05, now=now[0])
 

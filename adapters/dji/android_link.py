@@ -163,6 +163,24 @@ class AndroidLink:
         self._rc_received_monotonic = None
         self._latest_gimbal_state = None
 
+    def latest_flight_status(self, now: float | None = None) -> tuple[bool | None, float] | None:
+        """isFlying from the most recently received telemetry *or* RC state,
+        with its age. RC state carries isFlying even without a GPS fix, so this
+        survives a GPS dropout. None when neither has been received (or since
+        a disconnect cleared them)."""
+        samples = [
+            (received, observation.is_flying)
+            for received, observation in (
+                (self._telemetry_received_monotonic, self._latest_telemetry),
+                (self._rc_received_monotonic, self._latest_rc_state),
+            )
+            if received is not None and observation is not None
+        ]
+        if not samples:
+            return None
+        received, is_flying = max(samples, key=lambda sample: sample[0])
+        return is_flying, (self._clock() if now is None else now) - received
+
     def connection_lost_for(self, timeout_s: float) -> bool:
         """Return true once a previously-established Android link has been down this long.
 
