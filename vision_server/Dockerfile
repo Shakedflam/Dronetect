@@ -14,6 +14,9 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
+COPY LICENSE LICENSING.md ./
+COPY licenses/ ./licenses/
+
 # ultralytics pulls in opencv-python, whose compiled extension dynamically
 # links against a handful of X11/GL shared libraries at import time even
 # though nothing here ever opens a window -- python:3.13-slim's Debian base

@@ -8,6 +8,9 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
+COPY LICENSE LICENSING.md ./
+COPY licenses/ ./licenses/
+
 COPY requirements-realtime.txt ./
 RUN pip install --no-cache-dir -r requirements-realtime.txt
 

@@ -34,6 +34,7 @@ without flying.
 - [Development and test modes](#development-and-test-modes)
 - [Known issues and limitations](#known-issues-and-limitations)
 - [Attribution](#attribution)
+- [Licensing](#licensing)
 
 ---
 
@@ -515,6 +516,13 @@ in isolation. They are not part of normal operation.
   targets.
 
 ---
+
+## Licensing
+
+Original project code is licensed under AGPL-3.0-only, with original `app/` code
+under MIT and identified third-party exceptions. See [LICENSING.md](LICENSING.md)
+for scope, full license texts, dependency notices, and outstanding model provenance
+checks. Adding these texts does not by itself clear the custom models for redistribution.
 
 ## Attribution
 

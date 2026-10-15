@@ -1,6 +1,8 @@
 FROM python:3.13-slim
 
 WORKDIR /app
+COPY LICENSE LICENSING.md ./
+COPY licenses/ ./licenses/
 RUN pip install --no-cache-dir websockets==15.0.1 Shapely==2.1.2
 
 COPY config/ ./config/
