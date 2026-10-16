@@ -34,11 +34,14 @@ does not substitute for the source of the version actually deployed.
 
 ## Publication review status
 
-License texts do not establish ownership or resolve unknown provenance. The original
-download pages and author/distribution notices for the two custom drone checkpoints
-have not been identified. Confirm those before treating their redistribution as
-cleared. Any additional upstream terms or required corresponding source must be
-included as applicable.
+The two custom drone checkpoints have been matched by SHA-256 to their upstream
+Hugging Face repositories; see `models/README.md` for pinned sources and credits.
+The default `drone.pt` model's upstream and embedded declarations agree on AGPL-3.0.
+The comparison model `best.pt` has conflicting Apache-2.0 model-card and AGPL-3.0
+checkpoint declarations; that discrepancy remains unresolved. The root `yolo11n.pt`
+has not been matched to a specific upstream release asset. License texts and byte
+identity do not independently verify ownership or complete every redistribution
+obligation; include additional upstream notices and corresponding source as required.
 
 The Android client and the cloud services have separate license grants. This does
 not assert that every possible combined distribution is compatible with DJI's SDK

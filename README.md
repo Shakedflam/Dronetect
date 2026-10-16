@@ -522,7 +522,7 @@ in isolation. They are not part of normal operation.
 Original project code is licensed under AGPL-3.0-only, with original `app/` code
 under MIT and identified third-party exceptions. See [LICENSING.md](LICENSING.md)
 for scope, full license texts, dependency notices, and outstanding model provenance
-checks. Adding these texts does not by itself clear the custom models for redistribution.
+checks, including a license discrepancy in the optional comparison model `best.pt`.
 
 ## Attribution
 
