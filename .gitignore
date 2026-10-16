@@ -122,3 +122,6 @@ naming
 resolve
 transferring
 unpacking
+
+# Removed comparison checkpoint with inconsistent upstream license declarations
+/models/best.pt

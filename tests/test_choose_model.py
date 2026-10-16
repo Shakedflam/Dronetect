@@ -1,4 +1,4 @@
-"""Opt-in model comparison tests for simulator drone detection fixtures."""
+"""Opt-in model regression test for simulator drone detection fixtures."""
 
 from __future__ import annotations
 
@@ -30,13 +30,12 @@ class ModelConfig:
 
 MODEL_CONFIGS = [
     ModelConfig("drone_960_conf025", REPO_ROOT / "models" / "drone.pt", 960, 0.25),
-    ModelConfig("best_960_conf025", REPO_ROOT / "models" / "best.pt", 960, 0.25),
 ]
 
 
-def test_drone_model_is_best_current_simulator_choice():
+def test_drone_model_has_no_false_positives_on_negative_fixtures():
     if os.getenv("DRONTECT_RUN_MODEL_SELECTION_TESTS") != "1":
-        pytest.skip("Set DRONTECT_RUN_MODEL_SELECTION_TESTS=1 to run YOLO model comparison.")
+        pytest.skip("Set DRONTECT_RUN_MODEL_SELECTION_TESTS=1 to run YOLO model regression.")
 
     pytest.importorskip("ultralytics")
     from ultralytics import YOLO
@@ -102,10 +101,6 @@ def test_drone_model_is_best_current_simulator_choice():
     REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     chosen = report["drone_960_conf025"]
-    challenger = report["best_960_conf025"]
-    assert chosen["false_positive_images"] <= challenger["false_positive_images"]
-    assert chosen["total_error"] <= challenger["total_error"]
-    assert chosen["average_ms"] <= challenger["average_ms"]
     assert chosen["false_positive_images"] == 0
 
 

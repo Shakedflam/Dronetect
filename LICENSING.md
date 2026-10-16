@@ -17,7 +17,7 @@ respective contributions. These grants cover only rights held by the contributor
 | --- | --- | --- |
 | `controllers/autonomous_drone/autonomous_drone.py` | Apache-2.0 | Adapted from Cyberbotics Webots R2025a; existing copyright and adaptation notices remain in the file. See `licenses/Apache-2.0.txt`. |
 | `app/android/gradle/wrapper/gradle-wrapper.jar`, `app/android/gradlew`, `app/android/gradlew.bat` | Apache-2.0 | Gradle wrapper; see script headers and `licenses/Apache-2.0.txt`. |
-| `models/best.pt`, `models/drone.pt`, `yolo11n.pt` | Embedded metadata declares AGPL-3.0 | See `models/README.md` for provenance limitations. This is not a new license grant by Dronetect for these files. |
+| `models/drone.pt`, `yolo11n.pt` | Embedded metadata declares AGPL-3.0 | See `models/README.md` for provenance limitations. This is not a new license grant by Dronetect for these files. |
 | Ultralytics Python dependency | AGPL-3.0, unless separately licensed | https://www.ultralytics.com/license |
 | DJI Mobile SDK | DJI SDK EULA | Downloaded as a Gradle dependency, not licensed under this project's AGPL or MIT grant. See `app/NOTICE.md`. |
 | Webots PROTO assets | Upstream asset-specific terms | Referenced by URL in `worlds/`; obtain licenses with the referenced upstream assets. |
@@ -34,11 +34,10 @@ does not substitute for the source of the version actually deployed.
 
 ## Publication review status
 
-The two custom drone checkpoints have been matched by SHA-256 to their upstream
-Hugging Face repositories; see `models/README.md` for pinned sources and credits.
-The default `drone.pt` model's upstream and embedded declarations agree on AGPL-3.0.
-The comparison model `best.pt` has conflicting Apache-2.0 model-card and AGPL-3.0
-checkpoint declarations; that discrepancy remains unresolved. The root `yolo11n.pt`
+The runtime checkpoint `models/drone.pt` has been matched by SHA-256 to Marie
+Kjelberg's upstream Hugging Face repository; see `models/README.md` for its pinned
+source and credits. Its upstream and embedded declarations agree on AGPL-3.0.
+The root `yolo11n.pt`
 has not been matched to a specific upstream release asset. License texts and byte
 identity do not independently verify ownership or complete every redistribution
 obligation; include additional upstream notices and corresponding source as required.
