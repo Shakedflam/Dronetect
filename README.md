@@ -1,5 +1,10 @@
 # Dronetect
 
+> **Project status:** This repository preserves the implementation and validation
+> work for Dronetect. The AWS infrastructure was terminated on October 13, 2026;
+> there is currently no hosted live service. The role-scoped server authentication
+> added afterward was tested locally and was not deployed to that infrastructure.
+
 Dronetect is an autonomous aerial surveillance system built around a **DJI Mini 4 Pro**.
 An Android tablet application provides the operator interface and the link to the
 aircraft over the DJI Mobile SDK, while autonomy, computer vision and realtime
@@ -119,8 +124,8 @@ are returned to both the autonomy stack and the operator UI.
   coverage** of the selected area.
 - **Single-cycle ROI mode** for demonstrations: one complete coverage cycle,
   then hold station (see [Configuration](#configuration)).
-- **Automatic takeoff and landing on the real aircraft.** Starting an ROI or
-  patrol on the ground lifts off on DJI's native takeoff; Dronetect then climbs
+- **Automatic takeoff and landing integration (implemented; real-flight validation
+  pending).** Starting an ROI or patrol on the ground lifts off on DJI's native takeoff; Dronetect then climbs
   to cruise altitude and flies the mission. Return to Home is Dronetect's own
   navigation back to the session home, ending with a hold low over home and a
   handover to DJI's native landing. See
@@ -214,7 +219,6 @@ trust the cloud for physical limits.
 | GPS below the required signal level | abort |
 | Non-finite or incomplete command | reject and zero |
 | Flight mode outside the allowed set | abort |
-
 | Below the 1.5 m floor | only a pure climb (≥ 0.5 m, horizontal zeroed) is accepted, so the climb can continue from DJI's takeoff hover |
 
 **Link and protocol safety**
@@ -318,10 +322,10 @@ own limits block a manoeuvre, Dronetect aborts and reports it.
 ### Prerequisites
 
 - Python 3.11+ and a virtual environment
-- Node.js 20+ for the operator UI
+- Node.js 20.19+ within the 20.x line, or 22.12+ for the operator UI
 - Docker (for the cloud services)
 - Webots R2025a (simulator only)
-- Android Studio / JDK 17+ and an Android tablet (real hardware only)
+- Android Studio / JDK 21 and an Android tablet (real hardware only)
 
 ### 1. Python environment
 

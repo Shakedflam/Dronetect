@@ -25,22 +25,23 @@ respective contributions. These grants cover only rights held by the contributor
 
 ## Source availability
 
-Project source is at https://github.com/Shakedflam/Drontect. When distributing
+Project source is at https://github.com/Shakedflam/Dronetect. When distributing
 AGPL-covered builds, provide the corresponding source for that build, including
 required build and installation material, and retain license and copyright notices.
 Where AGPL section 13 applies to a modified network service, prominently offer its
 users access to its corresponding source. A link to an unrelated or newer revision
 does not substitute for the source of the version actually deployed.
 
-## Publication review status
+## Model provenance
 
 The runtime checkpoint `models/drone.pt` has been matched by SHA-256 to Marie
 Kjelberg's upstream Hugging Face repository; see `models/README.md` for its pinned
 source and credits. Its upstream and embedded declarations agree on AGPL-3.0.
-The root `yolo11n.pt`
-has not been matched to a specific upstream release asset. License texts and byte
-identity do not independently verify ownership or complete every redistribution
-obligation; include additional upstream notices and corresponding source as required.
+The root `yolo11n.pt` also matches the official Ultralytics assets v8.3.0 release
+by SHA-256; its source link and hash are recorded in `models/README.md`.
+License texts and byte identity do not independently verify ownership or complete
+every redistribution obligation; include additional upstream notices and
+corresponding source as required.
 
 The Android client and the cloud services have separate license grants. This does
 not assert that every possible combined distribution is compatible with DJI's SDK

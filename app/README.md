@@ -1,32 +1,15 @@
-# React + TypeScript + Vite
+# Dronetect operator application
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+React and TypeScript operator interface, built with Vite and Leaflet and packaged
+for Android with Capacitor. The Kotlin integration connects to DJI MSDK, publishes
+telemetry and video, and applies aircraft-side command validation and safety limits.
 
-Currently, two official plugins are available:
+See the [project README](../README.md) for architecture, features, prerequisites,
+setup instructions, and the distinction between simulator and hardware validation.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- [Android setup](../docs/android.md)
+- [Server authentication and private configuration](../docs/server-access.md)
+- [Licensing](../LICENSING.md)
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
-```
-
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Access keys belong in ignored local configuration. Do not put them in `VITE_*`
+variables or publish generated APKs containing private credentials.
