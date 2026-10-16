@@ -20,6 +20,15 @@ def djiBridgeToken = localProperties.getProperty('DRONTECT_DJI_BRIDGE_TOKEN', ''
 if (djiBridgeToken && !(djiBridgeToken ==~ /[A-Fa-f0-9]{64}/)) {
     throw new GradleException('DRONTECT_DJI_BRIDGE_TOKEN must be 64 hex characters in app/android/local.properties')
 }
+def serverAccessKeys = [:]
+['DRONTECT_OPERATOR_TOKEN', 'DRONTECT_VIEWER_TOKEN', 'DRONTECT_VIDEO_INGEST_TOKEN'].each { name ->
+    def value = localProperties.getProperty(name, '').trim()
+    if (!(value ==~ /[a-f0-9]{64}/)) {
+        throw new GradleException(name + ' must be 64 lowercase hex characters in app/android/local.properties; run tools/configure_auth.py')
+    }
+    serverAccessKeys[name] = value
+}
+
 def phase4PulseEnabledRaw = localProperties.getProperty(
     'DRONTECT_DJI_PHASE4_VERTICAL_PULSE_ENABLED', 'false'
 ).trim().toLowerCase()
@@ -101,6 +110,9 @@ android {
         // Phase 4 actuator path.
         buildConfigField "boolean", "DRONTECT_DJI_PHASE4_VERTICAL_PULSE_ENABLED", phase4PulseEnabledRaw
         buildConfigField "boolean", "DRONTECT_DJI_AUTONOMOUS_ENABLED", autonomousEnabledRaw
+        serverAccessKeys.each { name, value ->
+            buildConfigField 'String', name, '"' + value + '"'
+        }
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.

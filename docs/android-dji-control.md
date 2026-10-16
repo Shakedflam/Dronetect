@@ -34,8 +34,9 @@ Other existing server limitations, left unchanged:
   correctly say rejected. Do not use that acknowledgement as permission to fly.
 - ROI/radius checks still use configured `DEFAULT_HOME`, not DJI's recorded home.
   This must be reconciled before enabling real patrol/ROI execution.
-- The inspected server authenticates by role only and supports one drone and one
-  tablet. WSS transport alone does not pair or authorize an operator/aircraft.
+- The server requires role-scoped credentials and supports one drone and one
+  tablet. See [Server access](server-access.md). WSS transport alone does not
+  authorize an operator or aircraft.
   This is another prerequisite for operational remote flight control.
 
 ## Native behavior

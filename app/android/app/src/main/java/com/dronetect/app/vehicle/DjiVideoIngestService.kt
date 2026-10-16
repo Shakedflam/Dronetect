@@ -124,7 +124,7 @@ class DjiVideoIngestService {
             lastCadenceLogMs = SystemClock.elapsedRealtime()
         }
 
-        client = VideoIngestClient(ingestUrl).also { it.start() }
+        client = VideoIngestClient(ingestUrl, BuildConfig.DRONTECT_VIDEO_INGEST_TOKEN).also { it.start() }
 
         encoderThread = Thread(Runnable { encodeLoop() }, "dronetect-video-encoder").apply {
             isDaemon = true

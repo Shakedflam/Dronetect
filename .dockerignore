@@ -21,3 +21,15 @@ models/
 .env
 .env.*
 !.env.example
+
+# Private Android configuration and generated binaries never enter backend builds.
+app/
+*.pem
+*.key
+*.jks
+*.keystore
+*.apk
+**/local.properties
+**/signing.properties
+**/key.properties
+.claude/

@@ -1,5 +1,10 @@
 # Cloud deployment (scaffolding)
 
+Current authentication, private key provisioning, and localhost port bindings are
+documented in [Server access](server-access.md). The historical deployment notes
+below do not replace those requirements.
+
+
 This documents preparing `realtime_server` and `vision_server` to run in the
 cloud (target: AWS ECS Fargate behind an Application Load Balancer) while the
 Webots simulator, the tablet app, and a future real drone stay outside the
@@ -46,7 +51,8 @@ Setting `DRONTECT_ALLOWED_ORIGINS` only restricts requests that *do* send an
 `Origin` header -- requests with none are always still accepted, so the
 simulator and a future drone adapter are unaffected either way. This matches
 the actual threat model (Cross-Site WebSocket Hijacking is a browser-only
-concern); it is not a general auth mechanism, and none is added here.
+concern); it is not an authentication mechanism. Role-scoped access keys are now
+required separately; see [Server access](server-access.md).
 
 ## Health checks
 
@@ -155,5 +161,6 @@ of which `.env` file is active when you build, not a code change:
 
 - Actually pushing images to ECR / deploying to ECS Fargate / ALB+ACM setup.
 - TURN relay.
-- Any auth beyond the Origin allowlist (no tokens, no accounts).
+- User-account management. Role-scoped access keys are implemented; see
+  [Server access](server-access.md).
 - GPU inference for vision_server (CPU-only, per current scope).

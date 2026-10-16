@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from services.access_control import client_auth_headers
+
 import asyncio
 from dataclasses import dataclass
 from io import BytesIO
@@ -130,7 +132,7 @@ class SimulatorVideoClient:
         while not self._stop.is_set():
             try:
                 assert connect is not None
-                async with connect(self.url) as websocket:
+                async with connect(self.url, additional_headers=client_auth_headers("ingest", self.url)) as websocket:
                     await self._send_frames(websocket)
             except Exception:
                 if not self._stop.is_set():

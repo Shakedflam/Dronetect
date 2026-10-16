@@ -26,6 +26,7 @@ pnpm-debug.log*
 lerna-debug.log*
 
 # Environment and secrets
+# Generated server access keys belong in ignored .env and Android local.properties.
 .env
 .env.*
 !.env.example

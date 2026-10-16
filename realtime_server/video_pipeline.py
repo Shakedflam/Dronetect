@@ -29,6 +29,7 @@ from realtime_server.protocol import (
     validate_detection_message,
     validate_role,
 )
+from services.access_control import client_auth_headers
 from services.video import (
     JPEG_ENCODING,
     LatestFrameBuffer,
@@ -132,7 +133,8 @@ class VisionFrameForwarder:
                 if connector is None:
                     await asyncio.sleep(RECONNECT_DELAY_S)
                     continue
-                async with connector(self.frames_url) as websocket:
+                options = {} if self._connect_factory else {"additional_headers": client_auth_headers("vision", self.frames_url)}
+                async with connector(self.frames_url, **options) as websocket:
                     await self._exchange_frames_and_detections(websocket)
             except asyncio.CancelledError:
                 raise

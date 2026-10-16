@@ -1,3 +1,4 @@
+import { accessProtocols } from './accessCredentials';
 import type { MissionState } from '../../types/missionState';
 import type { TargetFollowDiagnostics } from '../../types/drone';
 import type { OperatingConfig } from '../../types/operatingConfig';
@@ -457,7 +458,7 @@ function createRealtimeServerConnection(): RealtimeServerConnection {
 
   function connect(): void {
     try {
-      socket = new WebSocket(resolveRealtimeServerUrl());
+      socket = new WebSocket(resolveRealtimeServerUrl(), accessProtocols('operator'));
     } catch (error) {
       console.warn('[realtimeServerConnection] failed to open WebSocket, retrying', error);
       scheduleReconnect();

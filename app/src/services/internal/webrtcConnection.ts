@@ -1,3 +1,4 @@
+import { accessProtocols } from './accessCredentials';
 import type { Unsubscribe } from './unsubscribe';
 import { realtimeServerUrl } from './runtimeConfig';
 
@@ -146,7 +147,7 @@ function createWebrtcConnection() {
     };
 
     try {
-      socket = new WebSocket(resolveWebrtcSignalingUrl());
+      socket = new WebSocket(resolveWebrtcSignalingUrl(), accessProtocols('viewer'));
     } catch (error) {
       console.warn('[webrtcConnection] failed to open signaling WebSocket, retrying', error);
       teardownAndReconnect();

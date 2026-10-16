@@ -11,6 +11,7 @@ from websockets.asyncio.server import ServerConnection, serve
 from config.deployment import DeploymentConfig, load_vision_deployment_config
 from config.video import VideoConfig, load_video_config
 from realtime_server.protocol import build_detection_message, encode_message
+from services.access_control import AccessControl
 from services.video import VIDEO_MAX_PACKET_BYTES, VideoFrame, VideoPacketError, decode_video_frame
 from vision_server.detector import Detection, DroneDetector, create_drone_detector
 from vision_server.diagnostics import VisionDiagnostics
@@ -27,7 +28,9 @@ class VisionServer:
         self,
         config: VideoConfig | None = None,
         detector: DroneDetector | None = None,
+        access: AccessControl | None = None,
     ) -> None:
+        self.access = access or AccessControl.from_env()
         self.config = config or load_video_config()
         self.detector = detector or create_drone_detector()
         self.tracker = DroneTracker(
@@ -42,6 +45,10 @@ class VisionServer:
         self._last_log_count = 0
 
     async def frame_handler(self, websocket: ServerConnection) -> None:
+        peer = websocket.remote_address
+        if not self.access.authorized(websocket.request, "vision", peer[0] if peer else ""):
+            await websocket.close(code=1008, reason="Unauthorized")
+            return
         request = websocket.request
         if request is None or request.path != FRAMES_PATH:
             await websocket.close(code=1008, reason="invalid_path")
@@ -143,7 +150,15 @@ async def run_vision_server(
     deployment: DeploymentConfig | None = None,
 ) -> None:
     deployment = deployment or DeploymentConfig()
-    vision_server = VisionServer()
+    access = AccessControl.from_env()
+    access.validate_listener(frame_host, ("vision",))
+    vision_server = VisionServer(access=access)
+
+    def admit(connection, request):
+        peer = connection.remote_address
+        if request.path != FRAMES_PATH or not access.authorized(request, "vision", peer[0] if peer else ""):
+            return connection.respond(401, "Unauthorized\n")
+        return None
     diagnostics_server = await asyncio.start_server(
         vision_server.diagnostics_handler,
         vision_server.config.vision_server_diagnostics_host,
@@ -157,6 +172,7 @@ async def run_vision_server(
             frame_port,
             max_size=VIDEO_MAX_PACKET_BYTES,
             origins=deployment.origins,
+            process_request=admit,
         ),
     ):
         print(f"Drontect vision server receiving frames on ws://{frame_host}:{frame_port}{FRAMES_PATH}")

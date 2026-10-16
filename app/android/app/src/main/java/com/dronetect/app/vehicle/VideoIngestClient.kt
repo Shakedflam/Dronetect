@@ -23,7 +23,7 @@ import okio.ByteString
  * frame is worth less than the next one, so frames are dropped when the
  * socket is down or the send queue is already backed up.
  */
-class VideoIngestClient(private val url: String) {
+class VideoIngestClient(private val url: String, private val authToken: String = "") {
     private val client = OkHttpClient.Builder()
         // A websocket carries no response body; the read timeout must not
         // close an idle-but-healthy link. Pings keep Cloudflare's tunnel and
@@ -103,7 +103,9 @@ class VideoIngestClient(private val url: String) {
         if (!running.get()) return
         val httpUrl = toHttpUrl(url)
         Log.i(DjiSdkRuntime.TAG, "video=ingest_connecting url=$url")
-        val request = Request.Builder().url(httpUrl).build()
+        val request = Request.Builder().url(httpUrl).apply {
+            if (authToken.isNotEmpty()) header("Authorization", "Bearer $authToken")
+        }.build()
         webSocket = client.newWebSocket(request, Listener())
     }
 

@@ -219,6 +219,10 @@ trust the cloud for physical limits.
 
 **Link and protocol safety**
 
+- Operator, drone, video upload, video viewer, and internal vision connections
+  require separate access keys. See [Server access](docs/server-access.md) for
+  private configuration and coordinated server/client deployment.
+
 - Every setpoint carries an **issue timestamp and TTL**; the client measures age
   against a clock estimate synchronised with the server and rejects stale
   commands.
@@ -324,13 +328,16 @@ own limits block a manoeuvre, Dronetect aborts and reports it.
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+python tools/configure_auth.py
 ```
 
 ### 2. Simulator
 
 Open `worlds/drone_poc.wbt` in Webots R2025a and start the simulation. The
 controller in `controllers/autonomous_drone/` runs the same `FlightLogic` used
-in real flight. Keyboard controls are shown in the on-screen HUD.
+in real flight. Launch Webots with the drone and video-upload keys in its
+environment, or use the explicit loopback-only development mode described in
+[Server access](docs/server-access.md). Keyboard controls are shown in the HUD.
 
 ### 3. Operator UI (development)
 
@@ -360,10 +367,12 @@ DRONTECT_DJI_BRIDGE_TOKEN=<64 hex characters>
 DRONTECT_DJI_AUTONOMOUS_ENABLED=<true|false>
 ```
 
-Generate a bridge token with
-`python -c "import secrets; print(secrets.token_hex(32))"` and set the **same**
-value in the AWS host's private Compose `.env`. The DJI application key is
-supplied through the Android manifest placeholder and must never be committed.
+Run `python tools/configure_auth.py` from the repository root to generate missing
+role keys without printing them. It preserves an existing bridge key and writes
+matching client settings into ignored `local.properties`. The AWS host must receive
+the matching private `.env` configuration. See [Server access](docs/server-access.md)
+for browser credentials, direct Python launch commands, and coordinated deployment.
+The DJI application key must also be set in `local.properties` and never committed.
 
 ```powershell
 cd app

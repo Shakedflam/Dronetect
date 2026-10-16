@@ -24,9 +24,10 @@ services:
     volumes:
       - ./models:/app/models:ro
     ports:
-      - "8870:8870"
-      - "8871:8871"
+      - "127.0.0.1:8870:8870"
+      - "127.0.0.1:8871:8871"
     environment:
+      DRONTECT_VISION_TOKEN: ${DRONTECT_VISION_TOKEN:?Run tools/configure_auth.py}
       DRONTECT_ALLOWED_ORIGINS: ${DRONTECT_ALLOWED_ORIGINS:-}
 
   realtime_server:
@@ -36,10 +37,15 @@ services:
     depends_on:
       - vision_server
     ports:
-      - "8765:8765"
+      - "127.0.0.1:8765:8765"
     environment:
       # Compose's built-in DNS resolves the vision_server hostname to that
       # container -- this is the cross-host override added in config/video.py.
       DRONTECT_VISION_FRAMES_URL: ws://vision_server:8870/frames
+      DRONTECT_OPERATOR_TOKEN: ${DRONTECT_OPERATOR_TOKEN:?Run tools/configure_auth.py}
+      DRONTECT_DRONE_TOKEN: ${DRONTECT_DRONE_TOKEN:?Run tools/configure_auth.py}
+      DRONTECT_VIDEO_INGEST_TOKEN: ${DRONTECT_VIDEO_INGEST_TOKEN:?Run tools/configure_auth.py}
+      DRONTECT_VIEWER_TOKEN: ${DRONTECT_VIEWER_TOKEN:?Run tools/configure_auth.py}
+      DRONTECT_VISION_TOKEN: ${DRONTECT_VISION_TOKEN:?Run tools/configure_auth.py}
       DRONTECT_ALLOWED_ORIGINS: ${DRONTECT_ALLOWED_ORIGINS:-}
       DRONTECT_WEBRTC_STUN_URLS: ${DRONTECT_WEBRTC_STUN_URLS:-}

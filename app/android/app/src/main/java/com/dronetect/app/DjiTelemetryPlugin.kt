@@ -29,6 +29,14 @@ class DjiTelemetryPlugin : Plugin() {
     }
 
     @PluginMethod
+    fun getServerCredentials(call: PluginCall) {
+        call.resolve(JSObject().apply {
+            put("operator", BuildConfig.DRONTECT_OPERATOR_TOKEN)
+            put("viewer", BuildConfig.DRONTECT_VIEWER_TOKEN)
+        })
+    }
+
+    @PluginMethod
     fun getSnapshot(call: PluginCall) {
         call.resolve(DjiSdkRuntime.telemetryState().toJsObject())
     }

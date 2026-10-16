@@ -40,6 +40,7 @@ from realtime_server.video_pipeline import (
 )
 from realtime_server.video_source import VideoSourceConnection, WebSocketVideoSourceAdapter
 from services.video import VIDEO_MAX_PACKET_BYTES, VideoPacketError
+from services.access_control import AccessControl, request_role
 from services.commands import CommandName, MISSION_COMMANDS
 from services.mission_commands import (
     InvalidMissionCommand,
@@ -107,7 +108,9 @@ class RealtimeServer:
         video_config: VideoConfig | None = None,
         mission_config: MissionCommandConfig | None = None,
         safety_rth_policy: SafetyRthPolicy | None = None,
+        access: AccessControl | None = None,
     ) -> None:
+        self.access = access or AccessControl.from_env()
         self.drone: DroneSdkConnection | None = None
         self.video_source: VideoSourceConnection | None = None
         self.video_pipeline = VideoPipeline(
@@ -192,7 +195,21 @@ class RealtimeServer:
         self.manual_input_source = MANUAL_INPUT_TABLET
         self._target_patrol_region_id: str | None = None
 
+    def process_request(self, connection: ServerConnection, request: Request) -> Response | None:
+        health = _process_health_check(connection, request)
+        if health is not None:
+            return health
+        peer = connection.remote_address
+        if not self.access.authorized(request, request_role(request.path), peer[0] if peer else ""):
+            return connection.respond(401, "Unauthorized\n")
+        return None
+
     async def handler(self, websocket: ServerConnection) -> None:
+        peer = websocket.remote_address
+        role = request_role(websocket.request.path) if websocket.request else None
+        if not self.access.authorized(websocket.request, role, peer[0] if peer else ""):
+            await websocket.close(code=1008, reason="Unauthorized")
+            return
         try:
             request_path = self._request_path(websocket)
         except ProtocolError as exc:
@@ -1100,14 +1117,17 @@ async def run_realtime_server(
     deployment: DeploymentConfig | None = None,
 ) -> None:
     deployment = deployment or DeploymentConfig()
-    realtime_server = RealtimeServer()
+    access = AccessControl.from_env()
+    access.validate_listener(host, ("operator", "drone", "ingest", "viewer", "vision"))
+    realtime_server = RealtimeServer(access=access)
+
     realtime_server.start_background_tasks()
     async with serve(
         realtime_server.handler,
         host,
         port,
         max_size=VIDEO_MAX_PACKET_BYTES,
-        process_request=_process_health_check,
+        process_request=realtime_server.process_request,
         origins=deployment.origins,
         ssl=build_ssl_context(deployment.tls),
     ):

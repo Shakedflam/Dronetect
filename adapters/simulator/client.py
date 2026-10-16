@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from services.access_control import client_auth_headers
+
 import asyncio
 import os
 from queue import Empty, Queue
@@ -124,7 +126,7 @@ class SimulatorRealtimeClient:
         while not self._stop.is_set():
             try:
                 assert connect is not None
-                async with connect(self.url) as websocket:
+                async with connect(self.url, additional_headers=client_auth_headers("drone", self.url)) as websocket:
                     self._mark_connected()
                     try:
                         print(f"Realtime command link connected: {self.url}")
